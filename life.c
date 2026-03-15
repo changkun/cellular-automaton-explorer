@@ -513,10 +513,14 @@ static void viewport_update(void) {
         /* half-block: 1 char per cell wide, 2 cells per row tall */
         view_w = term_cols;
         view_h = usable_rows * 2;
-    } else { /* zoom == 4 */
+    } else if (zoom == 4) {
         /* quarter: 2 cells per char wide, 2 cells per row tall */
         view_w = term_cols * 2;
         view_h = usable_rows * 2;
+    } else { /* zoom == 8 */
+        /* braille: 2 cells per char wide, 4 cells per row tall */
+        view_w = term_cols * 2;
+        view_h = usable_rows * 4;
     }
 
     if (view_w > MAX_W) view_w = MAX_W;
@@ -537,7 +541,7 @@ static void viewport_center(void) {
 }
 
 static void viewport_pan(int dx, int dy) {
-    int step = (zoom == 1) ? 4 : (zoom == 2) ? 8 : 16;
+    int step = (zoom == 1) ? 4 : (zoom == 2) ? 8 : (zoom == 4) ? 16 : 32;
     view_x += dx * step;
     view_y += dy * step;
     if (view_x + view_w > W) view_x = W - view_w;
@@ -3067,7 +3071,7 @@ static void render(int running, int speed_ms, int draw_mode) {
             }
             *p++ = '\033'; *p++ = '['; *p++ = 'K'; *p++ = '\n';
         }
-    } else { /* zoom == 4 */
+    } else if (zoom == 4) {
         /* ── Quarter zoom: 2 cells per char wide, 2 cells per row tall ── */
         /* Use quadrant block chars: ▘▝▀▖▌▞▛▗▚▐▜▄▙▟█ */
         /* Encoding: bit0=TL, bit1=TR, bit2=BL, bit3=BR */
@@ -3154,6 +3158,66 @@ static void render(int running, int speed_ms, int draw_mode) {
 
                 if (bits) {
                     p += sprintf(p, "\033[0m");
+                }
+            }
+            *p++ = '\033'; *p++ = '['; *p++ = 'K'; *p++ = '\n';
+        }
+    } else { /* zoom == 8 */
+        /* ── Braille ultra-density: 2 cells wide × 4 cells tall per char ── */
+        /* Unicode Braille U+2800-U+28FF encodes 8 dots in a 2×4 grid:
+         * dot1(0,0)=0x01 dot4(1,0)=0x08
+         * dot2(0,1)=0x02 dot5(1,1)=0x10
+         * dot3(0,2)=0x04 dot6(1,2)=0x20
+         * dot7(0,3)=0x40 dot8(1,3)=0x80 */
+        int vis_w = (view_w + 1) / 2;
+        if (vis_w > term_cols) vis_w = term_cols;
+        for (int row = 0; row < usable_rows; row++) {
+            int gy0 = view_y + row * 4;
+            for (int col = 0; col < vis_w; col++) {
+                int gx0 = view_x + col * 2;
+                int gx1 = gx0 + 1;
+
+                /* Sample 8 cells in the 2×4 block */
+                int coords_x[8] = {gx0, gx0, gx0, gx1, gx1, gx1, gx0, gx1};
+                int coords_y[8] = {gy0, gy0+1, gy0+2, gy0, gy0+1, gy0+2, gy0+3, gy0+3};
+                int braille_bits[8] = {0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80};
+
+                unsigned char dots = 0;
+                int rr = 0, gg = 0, bb = 0, cnt = 0;
+                for (int d = 0; d < 8; d++) {
+                    int cx = coords_x[d], cy = coords_y[d];
+                    if (cx >= W || cy >= H) continue;
+                    RGB c;
+                    int t = cell_color(cx, cy, &c);
+                    int solid = (t == 1 || t >= 4);
+                    int ghost_dot = (t == 2);
+                    int zone_bg = (t == 3);
+                    if (solid) {
+                        dots |= braille_bits[d];
+                        rr += c.r; gg += c.g; bb += c.b; cnt++;
+                    } else if (ghost_dot) {
+                        dots |= braille_bits[d];
+                        rr += c.r; gg += c.g; bb += c.b; cnt++;
+                    } else if (zone_enabled && zone_mode && zone_bg) {
+                        dots |= braille_bits[d];
+                        rr += c.r; gg += c.g; bb += c.b; cnt++;
+                    }
+                }
+
+                if (dots) {
+                    if (cnt) {
+                        p += sprintf(p, "\033[38;2;%d;%d;%dm", rr/cnt, gg/cnt, bb/cnt);
+                    } else {
+                        p += sprintf(p, "\033[92m");
+                    }
+                    /* Encode braille character: U+2800 + dots */
+                    /* UTF-8: E2, A0+(dots>>6), 80+(dots&0x3F) */
+                    *p++ = '\xe2';
+                    *p++ = (char)(0xa0 + (dots >> 6));
+                    *p++ = (char)(0x80 + (dots & 0x3f));
+                    p += sprintf(p, "\033[0m");
+                } else {
+                    *p++ = ' ';
                 }
             }
             *p++ = '\033'; *p++ = '['; *p++ = 'K'; *p++ = '\n';
@@ -3742,7 +3806,7 @@ int main(void) {
         }
         else if (key == 'x' || key == 'X') {
             /* Zoom out */
-            if (zoom < 4) {
+            if (zoom < 8) {
                 int cx = view_x + view_w / 2;
                 int cy = view_y + view_h / 2;
                 zoom *= 2;
@@ -3798,7 +3862,7 @@ int main(void) {
                     printf("\033[2J"); fflush(stdout);
                 }
             } else if (m->type == 1 && btn == 65) {
-                if (zoom < 4) {
+                if (zoom < 8) {
                     int cx = view_x + view_w / 2;
                     int cy = view_y + view_h / 2;
                     zoom *= 2;
@@ -3817,9 +3881,12 @@ int main(void) {
                 } else if (zoom == 2) {
                     gx = view_x + (m->x - 1);
                     gy = view_y + (m->y - 3) * 2;
-                } else { /* zoom == 4 */
+                } else if (zoom == 4) {
                     gx = view_x + (m->x - 1) * 2;
                     gy = view_y + (m->y - 3) * 2;
+                } else { /* zoom == 8 */
+                    gx = view_x + (m->x - 1) * 2;
+                    gy = view_y + (m->y - 3) * 4;
                 }
 
                 if (stamp_mode) {

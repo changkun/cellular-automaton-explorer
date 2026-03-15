@@ -1,5 +1,5 @@
 # Life-like Cellular Automaton Explorer
-# https://github.com/changkun/null-claude3
+# https://github.com/changkun/cellular-automaton-explorer
 
 PREFIX   ?= /usr/local
 BINDIR   ?= $(PREFIX)/bin

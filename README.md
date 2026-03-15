@@ -58,6 +58,7 @@ Requires only `gcc` and a POSIX terminal.
 | `!` | Toggle prediction surprise field (per-cell transition surprisal heatmap) |
 | `@` | Toggle mutual information network (inter-region coupling map) |
 | `#` | Toggle composite complexity index (edge-of-chaos heatmap) |
+| `$` | Toggle topological feature map (connected components + holes, β₀/β₁) |
 | `+`/`-` (in cone) | Adjust forward cone depth |
 | `G` | Genetic rule explorer — evolve interesting rulesets |
 | `G` (in overlay) | Breed next generation of candidate rules |
@@ -458,6 +459,24 @@ The `4·raw·(1-raw)` term peaks at raw=0.5, rewarding balanced moderate signals
 **Color map:** deep blue (simple/dead) → teal-green (periodic) → bright gold (edge-of-chaos sweet spot) → red (fully chaotic). The gold band at 0.4–0.7 marks regions where interesting structures — gliders, long transients, localized computation — tend to live.
 
 The overlay panel displays mean complexity, max complexity, counts of simple/edge/chaotic cells, percentage of alive cells in the edge band, and a color legend gradient.
+
+Recomputes every 4 generations while running.
+
+### Topological Feature Map
+
+Toggle with `$`. Computes **connected component labeling** and **enclosed hole detection** via 4-connected flood fill, providing a purely geometric/topological lens on the pattern — fundamentally different from all information-theoretic overlays.
+
+**β₀ (Betti number 0):** Number of distinct connected live-cell components. Each component is colored with a unique hue (golden-ratio spacing in HSV for maximum visual separation).
+
+**β₁ (Betti number 1):** Number of enclosed holes — dead-cell regions completely surrounded by live cells. Highlighted in magenta/violet. These correspond to topological "loops" in the pattern.
+
+The sidebar panel displays:
+- β₀ and β₁ counts
+- Largest component size and mean component size
+- Total hole cells
+- β₀ and β₁ sparkline history (30-frame rolling window)
+
+This overlay reveals **percolation transitions** (when many small components suddenly merge into one large connected cluster), **topological genus** of patterns (how many holes structures like ponds and beehives contain), and the fragmentation/coalescence dynamics invisible to other analyzers.
 
 Recomputes every 4 generations while running.
 

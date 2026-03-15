@@ -59,6 +59,9 @@
  *   !           Toggle prediction surprise field (per-cell surprisal heatmap)
  *   @           Toggle mutual information network (inter-region coupling map)
  *   #           Toggle composite complexity index (edge-of-chaos heatmap)
+ *   $           Toggle topological feature map (connected components + holes)
+ *                 Colors each component uniquely, highlights enclosed holes
+ *                 Sidebar shows β₀ (components), β₁ (holes), sparklines
  *   Ctrl-E      Export current grid as RLE file (auto-numbered export_NNN.rle)
  *   Arrow keys  Pan viewport across the full 400×200 grid
  *   0           Re-center viewport on grid center
@@ -355,6 +358,40 @@ static int   cplx_n_simple = 0;        /* cells with score < 0.2 */
 static int   cplx_n_complex = 0;       /* cells in edge-of-chaos band 0.4–0.7 */
 static int   cplx_n_chaotic = 0;       /* cells with score > 0.8 */
 static float cplx_edge_frac = 0.0f;    /* fraction of alive cells in edge band */
+
+/* ── Topological Feature Map ──────────────────────────────────────────────── */
+/* Connected component labeling and hole detection via flood fill.
+   β₀ = number of distinct connected live-cell components (4-connected).
+   β₁ = number of enclosed dead-cell regions (holes/voids bounded by live cells).
+   Each component gets a unique hue; holes are highlighted in magenta/violet.
+   Sidebar sparkline tracks β₀ and β₁ over time. */
+#define TOPO_MAX_COMPONENTS 1024   /* max distinct components to label */
+#define TOPO_HIST_LEN 64           /* sparkline history length */
+
+static unsigned short topo_label[MAX_H][MAX_W];  /* component label per cell (0=dead/unlabeled) */
+static unsigned char  topo_hole[MAX_H][MAX_W];    /* 1=cell is inside a hole */
+static int   topo_mode = 0;              /* 0=off, 1=on */
+static int   topo_stale = 1;             /* 1=needs recomputation */
+static int   topo_beta0 = 0;             /* β₀: connected components */
+static int   topo_beta1 = 0;             /* β₁: enclosed holes */
+static int   topo_largest_comp = 0;      /* size of largest component */
+static int   topo_n_holes_cells = 0;     /* total dead cells inside holes */
+static float topo_mean_comp_size = 0.0f; /* mean component size */
+
+/* Per-component hue (assigned via golden ratio for max visual separation) */
+static unsigned short topo_comp_hue[TOPO_MAX_COMPONENTS]; /* hue 0-359 */
+static int   topo_comp_size[TOPO_MAX_COMPONENTS];         /* cells per component */
+
+/* Sparkline history */
+static int   topo_hist_b0[TOPO_HIST_LEN];  /* β₀ history */
+static int   topo_hist_b1[TOPO_HIST_LEN];  /* β₁ history */
+static int   topo_hist_idx = 0;             /* write index */
+static int   topo_hist_count = 0;           /* entries filled */
+
+/* Flood-fill queue (shared workspace) */
+#define TOPO_QUEUE_SIZE (MAX_W * MAX_H)
+static int topo_qx[TOPO_QUEUE_SIZE];
+static int topo_qy[TOPO_QUEUE_SIZE];
 
 /* ── Pattern Census ───────────────────────────────────────────────────────── */
 static int census_mode = 0;    /* 0=off, 1=on */
@@ -1238,6 +1275,7 @@ static void grid_step(void) {
     surp_stale = 1;
     mi_stale = 1;
     cplx_stale = 1;
+    topo_stale = 1;
 
     /* Always record frames for surprise field (cheap memcpy) */
     surp_record_frame();
@@ -4035,6 +4073,156 @@ static RGB cplx_to_rgb(float c) {
     }
 }
 
+/* ── Topological Feature Map computation ──────────────────────────────────── */
+/* Flood-fill connected component labeling (4-connected for live cells),
+   then flood-fill dead cells to find bounded holes (β₁). */
+
+static void topo_compute(void) {
+    memset(topo_label, 0, sizeof(unsigned short) * H * MAX_W);
+    memset(topo_hole, 0, sizeof(unsigned char) * H * MAX_W);
+    memset(topo_comp_size, 0, sizeof(topo_comp_size));
+
+    int n_comp = 0;
+
+    /* Phase 1: Label connected components of live cells (4-connected BFS) */
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            if (grid[y][x] > 0 && topo_label[y][x] == 0) {
+                if (n_comp >= TOPO_MAX_COMPONENTS) goto done_comp;
+                n_comp++;
+                unsigned short lbl = (unsigned short)n_comp;
+                /* BFS flood fill */
+                int qh = 0, qt = 0;
+                topo_qx[qt] = x; topo_qy[qt] = y; qt++;
+                topo_label[y][x] = lbl;
+                int sz = 0;
+                while (qh < qt) {
+                    int cx = topo_qx[qh], cy = topo_qy[qh]; qh++;
+                    sz++;
+                    /* 4-connected neighbors */
+                    const int dx4[4] = {1, -1, 0, 0};
+                    const int dy4[4] = {0, 0, 1, -1};
+                    for (int d = 0; d < 4; d++) {
+                        int nx = cx + dx4[d], ny = cy + dy4[d];
+                        if (nx >= 0 && nx < W && ny >= 0 && ny < H &&
+                            grid[ny][nx] > 0 && topo_label[ny][nx] == 0) {
+                            topo_label[ny][nx] = lbl;
+                            if (qt < TOPO_QUEUE_SIZE) {
+                                topo_qx[qt] = nx; topo_qy[qt] = ny; qt++;
+                            }
+                        }
+                    }
+                }
+                topo_comp_size[n_comp - 1] = sz;
+                /* Assign hue via golden ratio for maximal visual separation */
+                topo_comp_hue[n_comp - 1] = (unsigned short)((n_comp * 137) % 360);
+            }
+        }
+    }
+done_comp:
+    topo_beta0 = n_comp;
+
+    /* Phase 2: Find enclosed holes — flood-fill dead cells.
+       Any dead-cell region that does NOT touch the grid boundary is a hole. */
+    /* Use topo_label high bits: mark visited dead cells with a temp value */
+    static unsigned char dead_visited[MAX_H][MAX_W];
+    memset(dead_visited, 0, sizeof(unsigned char) * H * MAX_W);
+
+    int n_holes = 0;
+    int total_hole_cells = 0;
+
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            if (grid[y][x] == 0 && dead_visited[y][x] == 0) {
+                /* BFS flood fill of dead region */
+                int qh = 0, qt = 0;
+                topo_qx[qt] = x; topo_qy[qt] = y; qt++;
+                dead_visited[y][x] = 1;
+                int touches_boundary = 0;
+                int region_size = 0;
+
+                while (qh < qt) {
+                    int cx = topo_qx[qh], cy = topo_qy[qh]; qh++;
+                    region_size++;
+                    if (cx == 0 || cx == W - 1 || cy == 0 || cy == H - 1)
+                        touches_boundary = 1;
+                    const int dx4[4] = {1, -1, 0, 0};
+                    const int dy4[4] = {0, 0, 1, -1};
+                    for (int d = 0; d < 4; d++) {
+                        int nx = cx + dx4[d], ny = cy + dy4[d];
+                        if (nx >= 0 && nx < W && ny >= 0 && ny < H &&
+                            grid[ny][nx] == 0 && dead_visited[ny][nx] == 0) {
+                            dead_visited[ny][nx] = 1;
+                            if (qt < TOPO_QUEUE_SIZE) {
+                                topo_qx[qt] = nx; topo_qy[qt] = ny; qt++;
+                            }
+                        }
+                    }
+                }
+
+                if (!touches_boundary && region_size > 0 && region_size < W * H / 2) {
+                    /* This is a hole — mark all cells from the BFS queue */
+                    n_holes++;
+                    total_hole_cells += region_size;
+                    for (int i = 0; i < qh; i++) {
+                        topo_hole[topo_qy[i]][topo_qx[i]] = 1;
+                    }
+                }
+            }
+        }
+    }
+
+    topo_beta1 = n_holes;
+    topo_n_holes_cells = total_hole_cells;
+
+    /* Compute stats */
+    int largest = 0;
+    long total_size = 0;
+    for (int i = 0; i < n_comp; i++) {
+        if (topo_comp_size[i] > largest) largest = topo_comp_size[i];
+        total_size += topo_comp_size[i];
+    }
+    topo_largest_comp = largest;
+    topo_mean_comp_size = n_comp > 0 ? (float)total_size / n_comp : 0.0f;
+
+    /* Record history */
+    topo_hist_b0[topo_hist_idx] = topo_beta0;
+    topo_hist_b1[topo_hist_idx] = topo_beta1;
+    topo_hist_idx = (topo_hist_idx + 1) % TOPO_HIST_LEN;
+    if (topo_hist_count < TOPO_HIST_LEN) topo_hist_count++;
+
+    topo_stale = 0;
+}
+
+/* Convert component label to RGB — each component gets its own hue */
+static RGB topo_comp_to_rgb(int comp_idx) {
+    if (comp_idx < 0 || comp_idx >= TOPO_MAX_COMPONENTS) return (RGB){80, 80, 80};
+    int hue = topo_comp_hue[comp_idx];
+    /* HSV to RGB with S=0.8, V=0.9 */
+    float h = hue / 60.0f;
+    float s = 0.8f, v = 0.9f;
+    int hi = (int)h % 6;
+    float f = h - (int)h;
+    float p = v * (1.0f - s);
+    float q = v * (1.0f - s * f);
+    float t = v * (1.0f - s * (1.0f - f));
+    float r, g, b;
+    switch (hi) {
+        case 0: r = v; g = t; b = p; break;
+        case 1: r = q; g = v; b = p; break;
+        case 2: r = p; g = v; b = t; break;
+        case 3: r = p; g = q; b = v; break;
+        case 4: r = t; g = p; b = v; break;
+        default: r = v; g = p; b = q; break;
+    }
+    return (RGB){(unsigned char)(r * 255), (unsigned char)(g * 255), (unsigned char)(b * 255)};
+}
+
+/* Hole cells get a magenta/violet glow */
+static RGB topo_hole_rgb(void) {
+    return (RGB){160, 50, 200};
+}
+
 /* ── Mutual Information Network computation ──────────────────────────────── */
 
 /* Draw a Bresenham line on mi_overlay, keeping max MI at each cell */
@@ -5827,6 +6015,24 @@ static int cell_color(int x, int y, RGB *out) {
         return 0;
     }
 
+    /* Topological feature map overlay: colored components + hole highlighting */
+    if (topo_mode) {
+        if (topo_hole[y][x]) {
+            *out = topo_hole_rgb();
+            return 20; /* hole ghost cell */
+        }
+        if (grid[y][x] && topo_label[y][x] > 0) {
+            *out = topo_comp_to_rgb(topo_label[y][x] - 1);
+            return 1;
+        }
+        /* Ghost: show faint component color for recently-dead cells with ghost trails */
+        if (ghost[y][x] > 0) {
+            out->r = 30; out->g = 20; out->b = 40;
+            return 20;
+        }
+        return 0;
+    }
+
     /* Composite complexity index overlay: edge-of-chaos heatmap */
     if (cplx_mode) {
         float c = cplx_grid[y][x];
@@ -6064,6 +6270,13 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(cplx_str, sizeof(cplx_str),
                  " \033[38;2;235;210;30m\xe2\x9c\xa6" "CPLX:%.3f\033[0m", cplx_global);
 
+    /* Topological feature map indicator */
+    char topo_str2[96] = "";
+    if (topo_mode)
+        snprintf(topo_str2, sizeof(topo_str2),
+                 " \033[38;2;180;100;240m\xe2\x97\x86TOPO:\xce\xb2\xe2\x82\x80=%d \xce\xb2\xe2\x82\x81=%d\033[0m",
+                 topo_beta0, topo_beta1);
+
     /* Genetic explorer indicator */
     char gene_str[64] = "";
     if (gene_mode == 1)
@@ -6184,9 +6397,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, surp_str, mi_str, cplx_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
+                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, surp_str, mi_str, cplx_str, topo_str2, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -6211,7 +6424,7 @@ static void render(int running, int speed_ms, int draw_mode) {
     /* status bar line 2: compact help */
     p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
                      "[1-5]pre [d]draw [k]sym [g]graph [y]dash [w]topo [h]heat [T]trace [f]freq [i]ent [L]lyap [u]fft "
-                     "[X]temp [C]class [O]flow [9]cone [!]surp [@]mi [/]rule [m]mut [b]edit [G]evolve [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
+                     "[X]temp [C]class [O]flow [9]cone [!]surp [@]mi [#]cplx [$]topo [/]rule [m]mut [b]edit [G]evolve [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
                      "[S]stamp [v]census [z/x]zoom [n]map [<>]time [t]tbar [P]snap C-p:seq "
                      "C-s:save C-o:load C-e:rle [q]quit\033[0m\033[K\n");
 
@@ -8151,6 +8364,152 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", xrst);
     }
 
+    /* ── Topological Feature Map overlay panel ─────────────────────────────── */
+    if (topo_mode) {
+        int tp_w = 44;
+        int tp_col = term_cols - tp_w - 2;
+        /* Stack below other active panels */
+        int tp_row = 3;
+        if (entropy_mode)   tp_row += 8;
+        if (temp_mode)      tp_row += 9;
+        if (lyapunov_mode)  tp_row += 8;
+        if (fourier_mode)   tp_row += 18;
+        if (fractal_mode)   tp_row += 11;
+        if (wolfram_mode)   tp_row += 14;
+        if (flow_mode)      tp_row += 9;
+        if (attractor_mode) tp_row += 8;
+        if (cone_mode >= 1) tp_row += 8;
+        if (surp_mode)      tp_row += 8;
+        if (mi_mode)        tp_row += 12;
+        if (cplx_mode)      tp_row += 11;
+        if (tp_col < 1) tp_col = 1;
+
+        const char *tbdr = "\033[38;2;180;100;240;48;2;12;6;20m";
+        const char *tbg  = "\033[48;2;12;6;20m";
+        const char *trst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 Topology \xe2\x97\x86 ",
+                     tp_row, tp_col, tbdr);
+        for (int i = 16; i < tp_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", trst);
+
+        /* Row 1: β₀ (components) */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     tp_row + 1, tp_col, tbdr, tbg);
+        p += sprintf(p, " \033[38;2;180;160;220m\xce\xb2\xe2\x82\x80 Components: \033[1;38;2;220;180;255m%d",
+                     topo_beta0);
+        { int used = 22 + (topo_beta0 >= 10 ? 1 : 0) + (topo_beta0 >= 100 ? 1 : 0)
+                       + (topo_beta0 >= 1000 ? 1 : 0);
+          for (int i = used; i < tp_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", tbdr, trst);
+
+        /* Row 2: β₁ (holes) */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     tp_row + 2, tp_col, tbdr, tbg);
+        p += sprintf(p, " \033[38;2;180;160;220m\xce\xb2\xe2\x82\x81 Holes:      \033[1;38;2;160;50;200m%d",
+                     topo_beta1);
+        { int used = 22 + (topo_beta1 >= 10 ? 1 : 0) + (topo_beta1 >= 100 ? 1 : 0)
+                       + (topo_beta1 >= 1000 ? 1 : 0);
+          for (int i = used; i < tp_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", tbdr, trst);
+
+        /* Row 3: Largest component */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     tp_row + 3, tp_col, tbdr, tbg);
+        p += sprintf(p, " \033[38;2;140;130;180mLargest: \033[38;2;200;200;255m%d cells",
+                     topo_largest_comp);
+        { int used = 18 + (topo_largest_comp >= 10 ? 1 : 0) + (topo_largest_comp >= 100 ? 1 : 0)
+                       + (topo_largest_comp >= 1000 ? 1 : 0) + (topo_largest_comp >= 10000 ? 1 : 0);
+          for (int i = used; i < tp_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", tbdr, trst);
+
+        /* Row 4: Mean component size */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     tp_row + 4, tp_col, tbdr, tbg);
+        p += sprintf(p, " \033[38;2;140;130;180mMean sz: \033[38;2;200;200;255m%.1f",
+                     topo_mean_comp_size);
+        { int used = 16; for (int i = used; i < tp_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", tbdr, trst);
+
+        /* Row 5: Hole cells */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     tp_row + 5, tp_col, tbdr, tbg);
+        p += sprintf(p, " \033[38;2;140;130;180mHole cells: \033[38;2;160;50;200m%d",
+                     topo_n_holes_cells);
+        { int used = 17 + (topo_n_holes_cells >= 10 ? 1 : 0) + (topo_n_holes_cells >= 100 ? 1 : 0)
+                       + (topo_n_holes_cells >= 1000 ? 1 : 0) + (topo_n_holes_cells >= 10000 ? 1 : 0);
+          for (int i = used; i < tp_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", tbdr, trst);
+
+        /* Row 6: β₀ sparkline */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     tp_row + 6, tp_col, tbdr, tbg);
+        p += sprintf(p, " \033[38;2;100;100;160m\xce\xb2\xe2\x82\x80 ");
+        if (topo_hist_count > 1) {
+            int n = topo_hist_count < 30 ? topo_hist_count : 30;
+            int mx = 1;
+            for (int i = 0; i < n; i++) {
+                int idx = (topo_hist_idx - n + i + TOPO_HIST_LEN) % TOPO_HIST_LEN;
+                if (topo_hist_b0[idx] > mx) mx = topo_hist_b0[idx];
+            }
+            const char *spark_chars[] = {"\xe2\x96\x81","\xe2\x96\x82","\xe2\x96\x83",
+                                         "\xe2\x96\x84","\xe2\x96\x85","\xe2\x96\x86",
+                                         "\xe2\x96\x87","\xe2\x96\x88"};
+            for (int i = 0; i < n; i++) {
+                int idx = (topo_hist_idx - n + i + TOPO_HIST_LEN) % TOPO_HIST_LEN;
+                int lvl = mx > 0 ? (topo_hist_b0[idx] * 7) / mx : 0;
+                if (lvl > 7) lvl = 7;
+                p += sprintf(p, "\033[38;2;180;140;255m%s", spark_chars[lvl]);
+            }
+        }
+        p += sprintf(p, "%s", tbg);
+        { int used = 5 + (topo_hist_count < 30 ? topo_hist_count : 30) * 1;
+          /* Each sparkline char is 3 bytes but 1 column */
+          for (int i = used; i < tp_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", tbdr, trst);
+
+        /* Row 7: β₁ sparkline */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     tp_row + 7, tp_col, tbdr, tbg);
+        p += sprintf(p, " \033[38;2;100;100;160m\xce\xb2\xe2\x82\x81 ");
+        if (topo_hist_count > 1) {
+            int n = topo_hist_count < 30 ? topo_hist_count : 30;
+            int mx = 1;
+            for (int i = 0; i < n; i++) {
+                int idx = (topo_hist_idx - n + i + TOPO_HIST_LEN) % TOPO_HIST_LEN;
+                if (topo_hist_b1[idx] > mx) mx = topo_hist_b1[idx];
+            }
+            const char *spark_chars[] = {"\xe2\x96\x81","\xe2\x96\x82","\xe2\x96\x83",
+                                         "\xe2\x96\x84","\xe2\x96\x85","\xe2\x96\x86",
+                                         "\xe2\x96\x87","\xe2\x96\x88"};
+            for (int i = 0; i < n; i++) {
+                int idx = (topo_hist_idx - n + i + TOPO_HIST_LEN) % TOPO_HIST_LEN;
+                int lvl = mx > 0 ? (topo_hist_b1[idx] * 7) / mx : 0;
+                if (lvl > 7) lvl = 7;
+                p += sprintf(p, "\033[38;2;160;50;200m%s", spark_chars[lvl]);
+            }
+        }
+        p += sprintf(p, "%s", tbg);
+        { int used = 5 + (topo_hist_count < 30 ? topo_hist_count : 30) * 1;
+          for (int i = used; i < tp_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", tbdr, trst);
+
+        /* Row 8: Toggle hint */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     tp_row + 8, tp_col, tbdr, tbg);
+        p += sprintf(p, " \033[38;2;100;100;80m[$]toggle  4-connected flood fill");
+        { int used = 37; for (int i = used; i < tp_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", tbdr, trst);
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", tp_row + 9, tp_col, tbdr);
+        for (int i = 0; i < tp_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", trst);
+    }
+
     /* ── Population Dynamics Dashboard overlay ─────────────────────────────── */
     if (dashboard_mode && hist_count > 1) {
         int db_w = 62;      /* panel width */
@@ -8671,6 +9030,12 @@ int main(int argc, char **argv) {
                 cplx_compute(); /* compute on toggle-on */
             }
         }
+        else if (key == '$') {
+            topo_mode = !topo_mode;
+            if (topo_mode) {
+                topo_compute(); /* compute on toggle-on */
+            }
+        }
         else if (key == ']') {
             if (temp_mode) {
                 temp_brush_radius = temp_brush_radius < 20 ? temp_brush_radius + 1 : 20;
@@ -9122,6 +9487,11 @@ int main(int argc, char **argv) {
         /* Auto-refresh complexity index every 4 generations */
         if (cplx_mode && cplx_stale && (generation % 4 == 0 || !running)) {
             cplx_compute();
+        }
+
+        /* Auto-refresh topological feature map every 4 generations */
+        if (topo_mode && topo_stale && (generation % 4 == 0 || !running)) {
+            topo_compute();
         }
 
         render(running, speed_ms, draw_mode);

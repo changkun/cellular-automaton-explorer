@@ -25,6 +25,7 @@ Requires only `gcc` and a POSIX terminal.
 | `w` | Toggle toroidal wrapping (∞ indicator) |
 | `d` | Toggle draw mode (mouse painting) |
 | `g` | Toggle population sparkline graph |
+| `y` | Toggle population dynamics dashboard (graph + stats overlay) |
 | `h` | Toggle heatmap mode (age coloring + ghost trails) |
 | `[` / `]` | Cycle through rule presets (or zone brush in zone mode) |
 | `m` | Mutate — randomly flip one birth/survival bit |

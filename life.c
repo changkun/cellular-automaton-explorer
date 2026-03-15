@@ -12,6 +12,7 @@
  *   +/-         Speed up / slow down
  *   d           Toggle draw mode (left-click=place, right-click=erase)
  *   g           Toggle population sparkline graph
+ *   y           Toggle population dynamics dashboard overlay
  *   w           Cycle topology: flat → torus → Klein bottle → Möbius strip → projective plane
  *   h           Toggle heatmap mode (age coloring + ghost trails)
  *   [ / ]       Cycle through rule presets (or zone brush in zone mode)
@@ -644,12 +645,30 @@ static void viewport_pan(int dx, int dy) {
 
 #define HIST_LEN 120
 static int pop_history[HIST_LEN];
+static int pop_history_a[HIST_LEN]; /* species A population history */
+static int pop_history_b[HIST_LEN]; /* species B population history */
 static int hist_pos = 0;
 static int hist_count = 0;
 static int show_graph = 1;
+static int dashboard_mode = 0; /* 0=off, 1=population dynamics dashboard */
 
 static void hist_push(int pop) {
     pop_history[hist_pos] = pop;
+    /* Count per-species populations */
+    if (ecosystem_mode) {
+        int ca = 0, cb = 0;
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++)
+                if (grid[y][x]) {
+                    if (species[y][x] == 1) ca++;
+                    else if (species[y][x] == 2) cb++;
+                }
+        pop_history_a[hist_pos] = ca;
+        pop_history_b[hist_pos] = cb;
+    } else {
+        pop_history_a[hist_pos] = 0;
+        pop_history_b[hist_pos] = 0;
+    }
     hist_pos = (hist_pos + 1) % HIST_LEN;
     if (hist_count < HIST_LEN) hist_count++;
 }
@@ -658,6 +677,16 @@ static int hist_get(int age) {
     /* age=0 is most recent */
     int idx = (hist_pos - 1 - age + HIST_LEN * 2) % HIST_LEN;
     return pop_history[idx];
+}
+
+static int hist_get_a(int age) {
+    int idx = (hist_pos - 1 - age + HIST_LEN * 2) % HIST_LEN;
+    return pop_history_a[idx];
+}
+
+static int hist_get_b(int age) {
+    int idx = (hist_pos - 1 - age + HIST_LEN * 2) % HIST_LEN;
+    return pop_history_b[idx];
 }
 
 /* ── Rule system (B/S notation via bitmasks) ───────────────────────────────── */
@@ -3534,7 +3563,7 @@ static void render(int running, int speed_ms, int draw_mode) {
 
     /* status bar line 2: compact help */
     p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
-                     "[1-5]pre [d]draw [k]sym [g]graph [w]topo [h]heat [T]trace [f]freq "
+                     "[1-5]pre [d]draw [k]sym [g]graph [y]dash [w]topo [h]heat [T]trace [f]freq "
                      "[/]rule [m]mut [b]edit [G]evolve [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
                      "[S]stamp [v]census [z/x]zoom [n]map [<>]time [t]tbar [P]snap C-p:seq "
                      "C-s:save C-o:load C-e:rle [q]quit\033[0m\033[K\n");
@@ -4038,6 +4067,200 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", rst2);
     }
 
+    /* ── Population Dynamics Dashboard overlay ─────────────────────────────── */
+    if (dashboard_mode && hist_count > 1) {
+        int db_w = 62;      /* panel width */
+        int graph_h = 16;   /* graph rows */
+        int db_h = graph_h + 6; /* border + title + stats + graph + legend + border */
+        int db_col = (term_cols - db_w) / 2;
+        int db_row = (term_rows - db_h) / 2;
+        if (db_col < 1) db_col = 1;
+        if (db_row < 3) db_row = 3;
+
+        const char *bdr = "\033[38;2;80;180;255;48;2;8;12;20m";
+        const char *bg  = "\033[48;2;8;12;20m";
+        const char *rst3 = "\033[0m";
+
+        /* Compute stats over history */
+        int n = hist_count;
+        int mn = hist_get(0), mx = hist_get(0);
+        long long sum = 0;
+        for (int i = 0; i < n; i++) {
+            int v = hist_get(i);
+            if (v < mn) mn = v;
+            if (v > mx) mx = v;
+            sum += v;
+        }
+        int avg = (int)(sum / n);
+        int delta = (n >= 2) ? hist_get(0) - hist_get(1) : 0;
+
+        /* Growth rate over last 10 generations */
+        int rate_window = (n > 10) ? 10 : n - 1;
+        int growth = (rate_window > 0) ? hist_get(0) - hist_get(rate_window) : 0;
+        float growth_per_gen = (rate_window > 0) ? (float)growth / rate_window : 0.0f;
+
+        /* Trend indicator */
+        const char *trend;
+        if (growth_per_gen > 2.0f)       trend = "\033[38;2;80;255;80m\xe2\x96\xb2 growing";
+        else if (growth_per_gen > 0.2f)  trend = "\033[38;2;80;255;80m\xe2\x86\x97 rising";
+        else if (growth_per_gen > -0.2f) trend = "\033[38;2;200;200;200m\xe2\x86\x92 stable";
+        else if (growth_per_gen > -2.0f) trend = "\033[38;2;255;200;80m\xe2\x86\x98 falling";
+        else                             trend = "\033[38;2;255;80;80m\xe2\x96\xbc dying";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 Population Dynamics ",
+                     db_row, db_col, bdr);
+        for (int i = 22; i < db_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", rst3);
+
+        /* Stats row 1 */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     db_row + 1, db_col, bdr, bg);
+        p += sprintf(p, " \033[38;2;80;200;255mPop:\033[38;2;255;255;255m%-6d"
+                     " \033[38;2;120;120;180m\xce\x94:\033[38;2;%s%+d"
+                     " \033[38;2;120;120;180mMin:\033[38;2;200;200;200m%-5d"
+                     " \033[38;2;120;120;180mMax:\033[38;2;200;200;200m%-5d"
+                     " \033[38;2;120;120;180mAvg:\033[38;2;200;200;200m%-5d",
+                     population,
+                     (delta >= 0) ? "80;255;80m" : "255;80;80m", delta,
+                     mn, mx, avg);
+        /* Pad to width */
+        p += sprintf(p, "%s", bg);
+        for (int i = 52; i < db_w - 1; i++) *p++ = ' ';
+        p += sprintf(p, "%s\xe2\x94\x82%s", bdr, rst3);
+
+        /* Stats row 2: trend + species info */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     db_row + 2, db_col, bdr, bg);
+        p += sprintf(p, " \033[38;2;120;120;180mTrend: %s", trend);
+        if (ecosystem_mode && hist_count > 0) {
+            int pa = hist_get_a(0), pb = hist_get_b(0);
+            p += sprintf(p, "%s  \033[38;2;60;120;255m\xe2\x97\x89" "A:%d"
+                         "  \033[38;2;255;80;40m\xe2\x97\x89" "B:%d",
+                         bg, pa, pb);
+        }
+        p += sprintf(p, "%s", bg);
+        /* Pad - approximate since we don't know exact cursor col */
+        for (int i = 0; i < 8; i++) *p++ = ' ';
+        p += sprintf(p, "%s\xe2\x94\x82%s", bdr, rst3);
+
+        /* Separator */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x9c", db_row + 3, db_col, bdr);
+        for (int i = 0; i < db_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\xa4';
+        p += sprintf(p, "%s", rst3);
+
+        /* Graph area: plot population as block chars, newest on right */
+        int graph_w = db_w - 2; /* inside borders */
+        int gn = (hist_count < graph_w) ? hist_count : graph_w;
+
+        /* For each row of the graph (top=max, bottom=min) */
+        int range = mx - mn;
+        if (range == 0) range = 1;
+
+        /* Build column heights (0 to graph_h-1) for total, species A, species B */
+        int col_total[120], col_a[120], col_b[120];
+        for (int c = 0; c < gn; c++) {
+            int age = gn - 1 - c; /* age: leftmost col = oldest */
+            col_total[c] = (hist_get(age) - mn) * (graph_h - 1) / range;
+            if (ecosystem_mode) {
+                /* Scale species to same range as total */
+                col_a[c] = (hist_get_a(age) - mn) * (graph_h - 1) / range;
+                col_b[c] = (hist_get_b(age) - mn) * (graph_h - 1) / range;
+                if (col_a[c] < 0) col_a[c] = 0;
+                if (col_b[c] < 0) col_b[c] = 0;
+            }
+        }
+
+        for (int row = 0; row < graph_h; row++) {
+            int y_val = graph_h - 1 - row; /* value level for this row (0=bottom) */
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                         db_row + 4 + row, db_col, bdr, bg);
+
+            /* Y-axis label on leftmost 5 chars */
+            if (row == 0)
+                p += sprintf(p, "\033[38;2;100;100;140m%5d", mx);
+            else if (row == graph_h - 1)
+                p += sprintf(p, "\033[38;2;100;100;140m%5d", mn);
+            else if (row == graph_h / 2)
+                p += sprintf(p, "\033[38;2;100;100;140m%5d", (mx + mn) / 2);
+            else
+                p += sprintf(p, "     ");
+
+            int data_w = graph_w - 5; /* remaining width for data points */
+            int dn = (gn < data_w) ? gn : data_w;
+            int offset = data_w - dn; /* left padding */
+
+            for (int c = 0; c < offset; c++)
+                p += sprintf(p, "\033[38;2;20;25;35m\xc2\xb7");
+
+            for (int c = 0; c < dn; c++) {
+                int ci = c + (gn - dn); /* index into col arrays */
+                if (ecosystem_mode) {
+                    /* Show species lines: A=blue, B=red, overlap=white */
+                    int is_a = (col_a[ci] == y_val);
+                    int is_b = (col_b[ci] == y_val);
+                    int is_t = (col_total[ci] == y_val);
+                    if (is_a && is_b)
+                        p += sprintf(p, "\033[38;2;255;255;255m\xe2\x96\x88");
+                    else if (is_a)
+                        p += sprintf(p, "\033[38;2;60;120;255m\xe2\x96\x88");
+                    else if (is_b)
+                        p += sprintf(p, "\033[38;2;255;80;40m\xe2\x96\x88");
+                    else if (is_t)
+                        p += sprintf(p, "\033[38;2;80;200;255m\xe2\x96\x88");
+                    else if (col_total[ci] > y_val)
+                        p += sprintf(p, "\033[38;2;15;20;30m\xe2\x96\x91");
+                    else
+                        p += sprintf(p, "\033[38;2;12;16;24m ");
+                } else {
+                    /* Single population line with fill */
+                    if (col_total[ci] == y_val) {
+                        /* Line point — color by value level */
+                        int lvl = y_val * 7 / (graph_h - 1);
+                        if (lvl <= 2)
+                            p += sprintf(p, "\033[38;2;255;80;60m\xe2\x96\x88");
+                        else if (lvl <= 4)
+                            p += sprintf(p, "\033[38;2;255;200;60m\xe2\x96\x88");
+                        else
+                            p += sprintf(p, "\033[38;2;80;255;120m\xe2\x96\x88");
+                    } else if (col_total[ci] > y_val) {
+                        /* Fill below line */
+                        p += sprintf(p, "\033[38;2;15;20;30m\xe2\x96\x91");
+                    } else {
+                        p += sprintf(p, "\033[38;2;12;16;24m ");
+                    }
+                }
+            }
+            p += sprintf(p, "%s%s\xe2\x94\x82%s", bg, bdr, rst3);
+        }
+
+        /* Legend row */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     db_row + 4 + graph_h, db_col, bdr, bg);
+        if (ecosystem_mode)
+            p += sprintf(p, " \033[38;2;80;200;255m\xe2\x94\x80total"
+                         " \033[38;2;60;120;255m\xe2\x94\x80" "A"
+                         " \033[38;2;255;80;40m\xe2\x94\x80" "B"
+                         " \033[38;2;100;100;140m  %d gens  [y]close",
+                         hist_count);
+        else
+            p += sprintf(p, " \033[38;2;80;200;255m\xe2\x94\x80population"
+                         " \033[38;2;100;100;140m  %d gens  %.1f/gen  [y]close",
+                         hist_count, (double)growth_per_gen);
+        p += sprintf(p, "%s", bg);
+        for (int i = 0; i < 6; i++) *p++ = ' ';
+        p += sprintf(p, "%s\xe2\x94\x82%s", bdr, rst3);
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94",
+                     db_row + 5 + graph_h, db_col, bdr);
+        for (int i = 0; i < db_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", rst3);
+    }
+
     *p = '\0';
 
     (void)!write(STDOUT_FILENO, render_buf, p - render_buf);
@@ -4256,6 +4479,8 @@ int main(int argc, char **argv) {
             draw_mode = !draw_mode;
         else if (key == 'g' || key == 'G')
             show_graph = !show_graph;
+        else if (key == 'y' || key == 'Y')
+            dashboard_mode = !dashboard_mode;
         else if (key == 'w')
             topology = (topology + 1) % TOPO_COUNT;
         else if (key == 'W') {

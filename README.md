@@ -53,6 +53,7 @@ Requires only `gcc` and a POSIX terminal.
 | Scroll wheel | Rotate stamp 0°/90°/180°/270° (in stamp mode) |
 | `C` | Toggle Wolfram class detector (auto-classify I/II/III/IV) |
 | `O` | Toggle information flow field (transfer entropy causal vectors) |
+| `A` | Toggle phase-space attractor (Takens delay embedding portrait) |
 | `G` | Genetic rule explorer — evolve interesting rulesets |
 | `G` (in overlay) | Breed next generation of candidate rules |
 | `1`–`5` (in overlay) | Load a discovered rule into the simulation |
@@ -381,6 +382,23 @@ vector field** that reveals how information propagates through the automaton.
 - **Vorticity** measures rotational flow patterns — swirling information currents
 
 Unlike other analyzers that measure *properties* (entropy, dimension, sensitivity), the flow field measures *directed relationships* — showing that cell A is causing changes in cell B but not vice versa.
+
+### Phase-Space Attractor (Takens Delay Embedding)
+
+Toggle with `A`. Reconstructs the system's **dynamical attractor** from the population time series using Takens' delay embedding theorem. The 1D population history `pop(t)` is embedded into 2D coordinates `(pop(t), pop(t+τ))`, producing a **phase portrait** that reveals the topology of the underlying dynamics.
+
+**How it works:**
+1. **Delay τ auto-tuning** — scans the autocorrelation function and picks τ at the first zero-crossing (or 1/e decay), ensuring the two embedding axes carry independent information
+2. **Phase portrait rendering** — the trajectory is rasterized into an 80×80 bin canvas, centered on the viewport, with log-scaled density coloring (dark blue → cyan → yellow → white)
+3. **Correlation dimension D₂** — estimated via the Grassberger-Procaccia algorithm on the point cloud, giving a fractal dimension of the attractor that complements the box-counting D_box from the fractal analyzer
+
+**What the shapes mean:**
+- **Single dot** → fixed point (dead grid or stable population)
+- **Closed loop** → periodic orbit (oscillating population, e.g. blinker-dominated grids)
+- **Thick ring / torus** → quasi-periodic dynamics (multiple incommensurate frequencies)
+- **Space-filling cloud** → strange attractor / chaotic dynamics (positive Lyapunov, fractal D₂)
+
+The HUD panel shows embedding parameters (d, τ), trajectory length, correlation dimension D₂ with automatic classification, population range, and canvas fill percentage.
 
 ## Implementation Details
 

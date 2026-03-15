@@ -53,6 +53,7 @@
  *   F           Toggle box-counting fractal dimension analyzer
  *   C           Toggle Wolfram class detector (auto-classify I/II/III/IV)
  *   O           Toggle information flow field (transfer entropy causal vectors)
+ *   A           Toggle phase-space attractor (Takens delay embedding portrait)
  *   Ctrl-E      Export current grid as RLE file (auto-numbered export_NNN.rle)
  *   Arrow keys  Pan viewport across the full 400×200 grid
  *   0           Re-center viewport on grid center
@@ -222,6 +223,27 @@ static int   flow_n_sinks = 0;        /* cells with strong inward convergence */
 /* Direction histogram: 8 bins for N,NE,E,SE,S,SW,W,NW */
 static int   flow_dir_hist[8];
 static int   flow_dir_hist_max = 1;
+
+/* ── Phase-Space Attractor (Takens delay embedding) ──────────────────────── */
+static int   attractor_mode = 0;        /* 0=off, 1=on */
+static int   attractor_stale = 1;       /* 1=needs recomputation */
+
+/* Attractor scatter plot: 2D delay-embedded phase portrait rendered into a
+   grid of bins.  Axes are population(t) vs population(t+τ).  Each bin
+   accumulates hit counts; brighter = more trajectory visits. */
+#define ATTR_BINS 80                    /* resolution of scatter plot (bins per axis) */
+#define ATTR_MAX_PTS 4096               /* max trajectory points to keep */
+static int   attr_canvas[ATTR_BINS][ATTR_BINS]; /* hit-count canvas */
+static int   attr_canvas_max = 1;       /* max bin count (for normalization) */
+static int   attr_n_pts = 0;            /* number of points in trajectory */
+static float attr_pts_x[ATTR_MAX_PTS];  /* normalized x coords (pop(t))   */
+static float attr_pts_y[ATTR_MAX_PTS];  /* normalized y coords (pop(t+τ)) */
+static int   attr_delay = 1;            /* embedding delay τ */
+static int   attr_traj_len = 0;         /* usable trajectory length */
+static float attr_corr_dim = 0.0f;      /* correlation dimension D₂ */
+static float attr_pop_min = 0.0f;       /* population range for axis labels */
+static float attr_pop_max = 1.0f;
+static int   attr_embed_dim = 2;        /* embedding dimension (always 2 for display) */
 
 /* ── Pattern Census ───────────────────────────────────────────────────────── */
 static int census_mode = 0;    /* 0=off, 1=on */
@@ -1098,6 +1120,7 @@ static void grid_step(void) {
     fractal_stale = 1;
     wolfram_stale = 1;
     flow_stale = 1;
+    attractor_stale = 1;
 }
 
 /* ── Census scan implementation ───────────────────────────────────────────── */
@@ -3326,6 +3349,155 @@ static void flow_compute(void) {
     flow_stale = 0;
 }
 
+/* ── Phase-Space Attractor computation ────────────────────────────────────── */
+
+static void attractor_compute(void) {
+    /* Need enough population history for delay embedding */
+    if (hist_count < 4) {
+        attractor_stale = 0;
+        return;
+    }
+
+    int n = hist_count;
+
+    /* ── Step 1: Auto-tune delay τ via first zero-crossing of autocorrelation ── */
+    /* This is the standard heuristic from nonlinear dynamics:
+       choose τ where the autocorrelation first drops to zero (or 1/e). */
+    {
+        /* Compute mean */
+        double mean = 0.0;
+        for (int i = 0; i < n; i++) {
+            int idx = (hist_pos - n + i + HIST_LEN) % HIST_LEN;
+            mean += pop_history[idx];
+        }
+        mean /= n;
+
+        /* Compute variance */
+        double var = 0.0;
+        for (int i = 0; i < n; i++) {
+            int idx = (hist_pos - n + i + HIST_LEN) % HIST_LEN;
+            double d = pop_history[idx] - mean;
+            var += d * d;
+        }
+        var /= n;
+
+        /* Find first zero-crossing of ACF or first drop below 1/e */
+        int best_tau = 1;
+        if (var > 0.001) {
+            double prev_acf = 1.0;
+            for (int tau = 1; tau < n / 2 && tau <= 30; tau++) {
+                double acf = 0.0;
+                int cnt = 0;
+                for (int i = 0; i < n - tau; i++) {
+                    int idx0 = (hist_pos - n + i + HIST_LEN) % HIST_LEN;
+                    int idx1 = (hist_pos - n + i + tau + HIST_LEN) % HIST_LEN;
+                    acf += (pop_history[idx0] - mean) * (pop_history[idx1] - mean);
+                    cnt++;
+                }
+                acf = cnt > 0 ? acf / (cnt * var) : 0.0;
+
+                if (acf <= 0.0 || acf <= 1.0 / M_E) {
+                    best_tau = tau;
+                    break;
+                }
+                if (acf < prev_acf * 0.5 && tau >= 2) {
+                    best_tau = tau;
+                    break;
+                }
+                prev_acf = acf;
+                best_tau = tau;
+            }
+        }
+        if (best_tau < 1) best_tau = 1;
+        attr_delay = best_tau;
+    }
+
+    /* ── Step 2: Build delay-embedded trajectory ── */
+    int tau = attr_delay;
+    int traj_len = n - tau;
+    if (traj_len < 2) {
+        attractor_stale = 0;
+        return;
+    }
+    if (traj_len > ATTR_MAX_PTS) traj_len = ATTR_MAX_PTS;
+    attr_traj_len = traj_len;
+
+    /* Find population range for normalization */
+    float pmin = 1e9f, pmax = -1e9f;
+    for (int i = 0; i < n; i++) {
+        int idx = (hist_pos - n + i + HIST_LEN) % HIST_LEN;
+        float v = (float)pop_history[idx];
+        if (v < pmin) pmin = v;
+        if (v > pmax) pmax = v;
+    }
+    if (pmax <= pmin) pmax = pmin + 1.0f;
+    attr_pop_min = pmin;
+    attr_pop_max = pmax;
+    float range = pmax - pmin;
+
+    /* Build normalized (x, y) = (pop(t), pop(t+τ)) */
+    for (int i = 0; i < traj_len; i++) {
+        int idx_t   = (hist_pos - n + i + HIST_LEN) % HIST_LEN;
+        int idx_ttau = (hist_pos - n + i + tau + HIST_LEN) % HIST_LEN;
+        attr_pts_x[i] = (pop_history[idx_t]   - pmin) / range;
+        attr_pts_y[i] = (pop_history[idx_ttau] - pmin) / range;
+    }
+    attr_n_pts = traj_len;
+
+    /* ── Step 3: Rasterize into scatter plot canvas ── */
+    memset(attr_canvas, 0, sizeof(attr_canvas));
+    attr_canvas_max = 1;
+
+    for (int i = 0; i < traj_len; i++) {
+        int bx = (int)(attr_pts_x[i] * (ATTR_BINS - 1));
+        int by = (int)((1.0f - attr_pts_y[i]) * (ATTR_BINS - 1)); /* invert Y for screen */
+        if (bx < 0) bx = 0; if (bx >= ATTR_BINS) bx = ATTR_BINS - 1;
+        if (by < 0) by = 0; if (by >= ATTR_BINS) by = ATTR_BINS - 1;
+        attr_canvas[by][bx]++;
+        if (attr_canvas[by][bx] > attr_canvas_max)
+            attr_canvas_max = attr_canvas[by][bx];
+    }
+
+    /* ── Step 4: Correlation dimension D₂ estimate ── */
+    /* Grassberger-Procaccia algorithm: D₂ = lim_{r→0} log C(r) / log r
+       where C(r) = fraction of point pairs within distance r.
+       We estimate the slope from two radii. */
+    {
+        int max_pairs = traj_len < 200 ? traj_len : 200; /* subsample for speed */
+        int step = traj_len / max_pairs;
+        if (step < 1) step = 1;
+
+        float r_small = 0.05f, r_large = 0.20f;
+        int count_small = 0, count_large = 0;
+        int total_pairs = 0;
+
+        for (int i = 0; i < traj_len; i += step) {
+            for (int j = i + step; j < traj_len; j += step) {
+                float dx = attr_pts_x[i] - attr_pts_x[j];
+                float dy = attr_pts_y[i] - attr_pts_y[j];
+                float dist = sqrtf(dx * dx + dy * dy);
+                if (dist < r_small) count_small++;
+                if (dist < r_large) count_large++;
+                total_pairs++;
+            }
+        }
+
+        if (total_pairs > 0 && count_small > 0 && count_large > count_small) {
+            float c_small = (float)count_small / total_pairs;
+            float c_large = (float)count_large / total_pairs;
+            float log_ratio_c = logf(c_large / c_small);
+            float log_ratio_r = logf(r_large / r_small);
+            attr_corr_dim = log_ratio_r > 0.001f ? log_ratio_c / log_ratio_r : 0.0f;
+            if (attr_corr_dim < 0.0f) attr_corr_dim = 0.0f;
+            if (attr_corr_dim > 3.0f) attr_corr_dim = 3.0f;
+        } else {
+            attr_corr_dim = count_large > 0 ? 0.1f : 0.0f;
+        }
+    }
+
+    attractor_stale = 0;
+}
+
 /* Map flow magnitude + direction to RGB color and Unicode arrow glyph */
 static RGB flow_to_rgb(float mag, float vx, float vy) {
     /* Normalize magnitude for color */
@@ -4731,6 +4903,65 @@ static int cell_color(int x, int y, RGB *out) {
                 out->b = (unsigned char)(out->b < 220 ? out->b + 35 : 255);
             }
             return grid[y][x] ? 1 : 14; /* 14 = flow ghost */
+        }
+        return 0;
+    }
+
+    /* Phase-space attractor overlay: scatter plot of delay-embedded trajectory */
+    if (attractor_mode && attr_n_pts > 2) {
+        /* Map grid cell (x,y) to attractor canvas bin.
+           The scatter plot occupies a centered square region of the viewport. */
+        int vw = (view_w > 0) ? view_w : W;
+        int vh = (view_h > 0) ? view_h : H;
+        int plot_size = (vw < vh ? vw : vh) * 3 / 4; /* 75% of smaller dimension */
+        int ox = (vw - plot_size) / 2 + view_x;       /* grid coords of plot origin */
+        int oy = (vh - plot_size) / 2 + view_y;
+
+        int rx = x - ox;
+        int ry = y - oy;
+        if (rx >= 0 && rx < plot_size && ry >= 0 && ry < plot_size) {
+            int bx = rx * ATTR_BINS / plot_size;
+            int by = ry * ATTR_BINS / plot_size;
+            if (bx >= 0 && bx < ATTR_BINS && by >= 0 && by < ATTR_BINS) {
+                int hits = attr_canvas[by][bx];
+                if (hits > 0) {
+                    /* Color by density: dark blue → cyan → yellow → white */
+                    float t = (float)hits / attr_canvas_max;
+                    /* Apply log scaling for better dynamic range */
+                    t = logf(1.0f + t * 9.0f) / logf(10.0f);
+                    if (t > 1.0f) t = 1.0f;
+
+                    if (t < 0.33f) {
+                        float s = t / 0.33f;
+                        out->r = (unsigned char)(20 + 10 * s);
+                        out->g = (unsigned char)(40 + 160 * s);
+                        out->b = (unsigned char)(120 + 135 * s);
+                    } else if (t < 0.66f) {
+                        float s = (t - 0.33f) / 0.33f;
+                        out->r = (unsigned char)(30 + 225 * s);
+                        out->g = (unsigned char)(200 + 55 * s);
+                        out->b = (unsigned char)(255 - 155 * s);
+                    } else {
+                        float s = (t - 0.66f) / 0.34f;
+                        out->r = (unsigned char)(255);
+                        out->g = (unsigned char)(255);
+                        out->b = (unsigned char)(100 + 155 * s);
+                    }
+                    return 1;
+                }
+                /* Inside plot area but empty — dark background with faint grid */
+                if ((bx % (ATTR_BINS / 4) == 0) || (by % (ATTR_BINS / 4) == 0)) {
+                    out->r = 20; out->g = 25; out->b = 35;
+                } else {
+                    out->r = 6; out->g = 8; out->b = 14;
+                }
+                return 15; /* 15 = attractor background */
+            }
+        }
+        /* Outside plot area — show normal cells dimmed */
+        if (grid[y][x]) {
+            out->r = 40; out->g = 45; out->b = 55;
+            return 1;
         }
         return 0;
     }
@@ -6484,6 +6715,119 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", flrst);
     }
 
+    /* ── Phase-Space Attractor overlay panel ────────────────────────────────── */
+    if (attractor_mode) {
+        int at_w = 44;
+        int at_col = term_cols - at_w - 2;
+        /* Stack below other active panels */
+        int at_row = 3;
+        if (entropy_mode)  at_row += 8;
+        if (temp_mode)     at_row += 9;
+        if (lyapunov_mode) at_row += 8;
+        if (fourier_mode)  at_row += 18;
+        if (fractal_mode)  at_row += 11;
+        if (wolfram_mode)  at_row += 14;
+        if (flow_mode)     at_row += 9;
+        if (at_col < 1) at_col = 1;
+
+        const char *abdr = "\033[38;2;100;180;255;48;2;6;10;20m";
+        const char *abg  = "\033[48;2;6;10;20m";
+        const char *arst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 Attractor \xcf\x86 ",
+                     at_row, at_col, abdr);
+        for (int i = 15; i < at_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", arst);
+
+        /* Row 1: Embedding parameters */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     at_row + 1, at_col, abdr, abg);
+        p += sprintf(p, " \033[38;2;100;180;255mEmbed: \033[1;38;2;160;220;255md=%d  "
+                     "\xcf\x84=%d  \033[0;38;2;100;180;255mpts=%d",
+                     attr_embed_dim, attr_delay, attr_traj_len);
+        {
+            int used = 28 + (attr_delay >= 10 ? 1 : 0) + (attr_traj_len >= 100 ? 1 : 0)
+                     + (attr_traj_len >= 10 ? 1 : 0);
+            for (int i = used; i < at_w - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", abdr, arst);
+
+        /* Row 2: Correlation dimension */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     at_row + 2, at_col, abdr, abg);
+        {
+            /* Classify the attractor from D₂ */
+            const char *atype;
+            int tr, tg, tb;
+            if (attr_corr_dim < 0.15f) {
+                atype = "Fixed point"; tr = 80; tg = 200; tb = 80;
+            } else if (attr_corr_dim < 0.6f) {
+                atype = "Limit cycle"; tr = 80; tg = 220; tb = 255;
+            } else if (attr_corr_dim < 1.3f) {
+                atype = "Torus/Quasi"; tr = 255; tg = 220; tb = 80;
+            } else {
+                atype = "Strange"; tr = 255; tg = 80; tb = 100;
+            }
+            p += sprintf(p, " \033[38;2;100;180;255mD\xe2\x82\x82: "
+                         "\033[1;38;2;%d;%d;%dm%.3f \033[0;38;2;%d;%d;%dm%s",
+                         tr, tg, tb, attr_corr_dim, tr, tg, tb, atype);
+        }
+        {
+            int used = 30;
+            for (int i = used; i < at_w - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", abdr, arst);
+
+        /* Row 3: Population range */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     at_row + 3, at_col, abdr, abg);
+        p += sprintf(p, " \033[38;2;100;180;255mPop range: "
+                     "\033[38;2;180;180;160m%.0f \xe2\x80\x93 %.0f",
+                     attr_pop_min, attr_pop_max);
+        {
+            int used = 28 + (attr_pop_max >= 1000 ? 1 : 0) + (attr_pop_max >= 10000 ? 1 : 0);
+            for (int i = used; i < at_w - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", abdr, arst);
+
+        /* Row 4: Canvas density (fraction of bins with hits) */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     at_row + 4, at_col, abdr, abg);
+        {
+            int filled = 0;
+            for (int by = 0; by < ATTR_BINS; by++)
+                for (int bx = 0; bx < ATTR_BINS; bx++)
+                    if (attr_canvas[by][bx] > 0) filled++;
+            float fill_pct = 100.0f * filled / (ATTR_BINS * ATTR_BINS);
+            p += sprintf(p, " \033[38;2;100;180;255mCanvas fill: "
+                         "\033[38;2;200;200;180m%.1f%% (%d/%d)",
+                         fill_pct, filled, ATTR_BINS * ATTR_BINS);
+        }
+        {
+            int used = 34;
+            for (int i = used; i < at_w - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", abdr, arst);
+
+        /* Row 5: Axes label */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     at_row + 5, at_col, abdr, abg);
+        p += sprintf(p, " \033[38;2;80;120;160mX: pop(t)  Y: pop(t+\xcf\x84)");
+        {
+            int used = 28;
+            for (int i = used; i < at_w - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", abdr, arst);
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", at_row + 6, at_col, abdr);
+        for (int i = 0; i < at_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", arst);
+    }
+
     /* ── Population Dynamics Dashboard overlay ─────────────────────────────── */
     if (dashboard_mode && hist_count > 1) {
         int db_w = 62;      /* panel width */
@@ -6963,6 +7307,12 @@ int main(int argc, char **argv) {
                 flow_compute(); /* compute on toggle-on */
             }
         }
+        else if (key == 'A') {
+            attractor_mode = !attractor_mode;
+            if (attractor_mode) {
+                attractor_compute(); /* compute on toggle-on */
+            }
+        }
         else if (key == ']') {
             if (temp_mode) {
                 temp_brush_radius = temp_brush_radius < 20 ? temp_brush_radius + 1 : 20;
@@ -7378,6 +7728,11 @@ int main(int argc, char **argv) {
         /* Auto-refresh information flow field every 16 generations (transfer entropy over temporal window) */
         if (flow_mode && flow_stale && (generation % 16 == 0 || !running)) {
             flow_compute();
+        }
+
+        /* Auto-refresh phase-space attractor every 8 generations (uses population history) */
+        if (attractor_mode && attractor_stale && (generation % 8 == 0 || !running)) {
+            attractor_compute();
         }
 
         render(running, speed_ms, draw_mode);

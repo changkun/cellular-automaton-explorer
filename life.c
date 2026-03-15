@@ -29,6 +29,9 @@
  *   f           Toggle frequency analysis overlay (period detection heatmap)
  *   W           Toggle wormhole portal placement (left=entrance, right=exit, middle=remove)
  *                 Paired portals create non-local neighbor coupling
+ *   S           Toggle stamp mode (place classic patterns from library)
+ *                 [/] cycle pattern, scroll wheel rotates 0°/90°/180°/270°
+ *                 Left-click places pattern, right-click cancels stamp mode
  *   a           Toggle dual-species ecosystem mode (Red vs Blue)
  *   6           Toggle active brush species (A/B) in ecosystem mode
  *   { / }       Adjust cross-species interaction coefficient (-1.0 to +1.0)
@@ -822,6 +825,140 @@ static void load_pattern(int id) {
         case 3: place_pattern(pat_gun, 36); break;
         case 4: place_pattern(pat_rpent, 5); break;
         case 5: place_pattern(pat_acorn, 7); break;
+    }
+}
+
+/* ── Stamp Tool (pattern library with rotation) ────────────────────────────── */
+
+#define MAX_STAMP_CELLS 128
+#define N_STAMPS 20
+
+typedef struct {
+    const char *name;
+    int n;                              /* number of cells */
+    Offset cells[MAX_STAMP_CELLS];      /* relative coords */
+} StampPattern;
+
+/* Pre-rotated versions are computed at init */
+typedef struct {
+    int n;
+    Offset cells[MAX_STAMP_CELLS];
+    int w, h;                           /* bounding box */
+} RotatedStamp;
+
+static RotatedStamp stamp_rotations[N_STAMPS][4]; /* [pattern][rotation] */
+static int stamp_mode = 0;       /* 0=off, 1=stamp placement mode */
+static int stamp_sel = 0;        /* selected pattern index */
+static int stamp_rot = 0;        /* rotation: 0=0°, 1=90°, 2=180°, 3=270° */
+
+/* Raw pattern definitions (coordinates relative to origin) */
+static const StampPattern stamp_library[N_STAMPS] = {
+    /* ── Still lifes ── */
+    { "Block", 4, {{0,0},{1,0},{0,1},{1,1}} },
+    { "Beehive", 6, {{1,0},{2,0},{0,1},{3,1},{1,2},{2,2}} },
+    { "Loaf", 7, {{1,0},{2,0},{0,1},{3,1},{1,2},{3,2},{2,3}} },
+    { "Boat", 5, {{0,0},{1,0},{0,1},{2,1},{1,2}} },
+    { "Tub", 4, {{1,0},{0,1},{2,1},{1,2}} },
+
+    /* ── Oscillators ── */
+    { "Blinker", 3, {{0,0},{1,0},{2,0}} },
+    { "Toad", 6, {{1,0},{2,0},{3,0},{0,1},{1,1},{2,1}} },
+    { "Beacon", 6, {{0,0},{1,0},{0,1},{3,2},{2,3},{3,3}} },
+    { "Pentadecathlon", 10, {{0,0},{1,0},{2,0},{3,0},{4,0},{5,0},{6,0},{7,0},
+                              {8,0},{9,0}} },
+    { "Clock", 6, {{2,0},{0,1},{2,1},{1,2},{3,2},{1,3}} },
+
+    /* ── Spaceships ── */
+    { "Glider", 5, {{1,0},{2,1},{0,2},{1,2},{2,2}} },
+    { "LWSS", 9, {{1,0},{4,0},{0,1},{0,2},{4,2},{0,3},{1,3},{2,3},{3,3}} },
+    { "MWSS", 11, {{2,0},{0,1},{5,1},{0,2},{0,3},{5,3},{0,4},{1,4},{2,4},{3,4},{4,4}} },
+    { "HWSS", 13, {{2,0},{3,0},{0,1},{6,1},{0,2},{0,3},{6,3},{0,4},{1,4},{2,4},{3,4},{4,4},{5,4}} },
+
+    /* ── Methuselahs ── */
+    { "R-pentomino", 5, {{1,0},{2,0},{0,1},{1,1},{1,2}} },
+    { "Diehard", 7, {{6,0},{0,1},{1,1},{1,2},{5,2},{6,2},{7,2}} },
+    { "Acorn", 7, {{1,0},{3,1},{0,2},{1,2},{4,2},{5,2},{6,2}} },
+    { "Pi-heptomino", 7, {{0,0},{1,0},{2,0},{0,1},{2,1},{0,2},{2,2}} },
+
+    /* ── Guns ── */
+    { "Gosper Gun", 36, {
+        {0,4},{0,5},{1,4},{1,5},
+        {10,4},{10,5},{10,6},{11,3},{11,7},{12,2},{12,8},{13,2},{13,8},
+        {14,5},{15,3},{15,7},{16,4},{16,5},{16,6},{17,5},
+        {20,2},{20,3},{20,4},{21,2},{21,3},{21,4},{22,1},{22,5},
+        {24,0},{24,1},{24,5},{24,6},
+        {34,2},{34,3},{35,2},{35,3},
+    } },
+
+    /* ── Other ── */
+    { "Pulsar", 48, {
+        {2,0},{3,0},{4,0},{-2,0},{-3,0},{-4,0},
+        {2,5},{3,5},{4,5},{-2,5},{-3,5},{-4,5},
+        {2,-5},{3,-5},{4,-5},{-2,-5},{-3,-5},{-4,-5},
+        {0,2},{0,3},{0,4},{0,-2},{0,-3},{0,-4},
+        {5,2},{5,3},{5,4},{5,-2},{5,-3},{5,-4},
+        {-5,2},{-5,3},{-5,4},{-5,-2},{-5,-3},{-5,-4},
+        {2,1},{-2,1},{2,-1},{-2,-1},
+        {1,2},{-1,2},{1,-2},{-1,-2},
+        {4,1},{-4,1},{4,-1},{-4,-1},
+        {1,4},{-1,4},{1,-4},{-1,-4},
+    } },
+};
+
+/* Build rotated versions of all stamps (called once at init) */
+static void stamp_init(void) {
+    for (int s = 0; s < N_STAMPS; s++) {
+        const StampPattern *sp = &stamp_library[s];
+        /* Find center of bounding box */
+        int minx = 999, miny = 999, maxx = -999, maxy = -999;
+        for (int i = 0; i < sp->n && i < MAX_STAMP_CELLS; i++) {
+            if (sp->cells[i].dx < minx) minx = sp->cells[i].dx;
+            if (sp->cells[i].dy < miny) miny = sp->cells[i].dy;
+            if (sp->cells[i].dx > maxx) maxx = sp->cells[i].dx;
+            if (sp->cells[i].dy > maxy) maxy = sp->cells[i].dy;
+        }
+        float cx = (minx + maxx) / 2.0f;
+        float cy = (miny + maxy) / 2.0f;
+
+        for (int r = 0; r < 4; r++) {
+            RotatedStamp *rs = &stamp_rotations[s][r];
+            rs->n = sp->n < MAX_STAMP_CELLS ? sp->n : MAX_STAMP_CELLS;
+            int rminx = 999, rminy = 999, rmaxx = -999, rmaxy = -999;
+            for (int i = 0; i < rs->n; i++) {
+                float dx = sp->cells[i].dx - cx;
+                float dy = sp->cells[i].dy - cy;
+                float rdx, rdy;
+                switch (r) {
+                    case 0: rdx = dx; rdy = dy; break;
+                    case 1: rdx = -dy; rdy = dx; break;  /* 90° CW */
+                    case 2: rdx = -dx; rdy = -dy; break;  /* 180° */
+                    default: rdx = dy; rdy = -dx; break;  /* 270° CW */
+                }
+                int ix = (int)(rdx + (rdx >= 0 ? 0.5f : -0.5f));
+                int iy = (int)(rdy + (rdy >= 0 ? 0.5f : -0.5f));
+                rs->cells[i] = (Offset){ix, iy};
+                if (ix < rminx) rminx = ix;
+                if (iy < rminy) rminy = iy;
+                if (ix > rmaxx) rmaxx = ix;
+                if (iy > rmaxy) rmaxy = iy;
+            }
+            rs->w = rmaxx - rminx + 1;
+            rs->h = rmaxy - rminy + 1;
+        }
+    }
+}
+
+/* Place stamp at grid position (gx, gy) — center of pattern goes there */
+static void stamp_place(int gx, int gy) {
+    const RotatedStamp *rs = &stamp_rotations[stamp_sel][stamp_rot];
+    for (int i = 0; i < rs->n; i++) {
+        int px = gx + rs->cells[i].dx;
+        int py = gy + rs->cells[i].dy;
+        if (symmetry > 0) {
+            sym_apply(px, py, grid_set);
+        } else {
+            grid_set(px, py);
+        }
     }
 }
 
@@ -2223,6 +2360,15 @@ static void render(int running, int speed_ms, int draw_mode) {
                  " \033[90m\u25A8ZONES\033[0m");
     }
 
+    /* Stamp mode indicator */
+    char stamp_str[128] = "";
+    if (stamp_mode) {
+        static const char *rot_labels[] = {"0\xC2\xB0","90\xC2\xB0","180\xC2\xB0","270\xC2\xB0"};
+        snprintf(stamp_str, sizeof(stamp_str),
+                 " \033[38;2;255;200;60m\xe2\x96\xa3" "STAMP:%s %s\033[0m",
+                 stamp_library[stamp_sel].name, rot_labels[stamp_rot]);
+    }
+
     /* Rule string */
     char rule_str[32];
     rule_to_string(rule_str, sizeof(rule_str));
@@ -2238,10 +2384,10 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
                  state, wrap_str, draw_str, heat_str, tracer_str, freq_str, sym_str, zoom_str, map_str, zone_str,
-                 portal_str, emit_str, eco_str, rule_display, generation, population, speed_ms);
+                 portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
     if (flash_active()) {
@@ -2266,7 +2412,7 @@ static void render(int running, int speed_ms, int draw_mode) {
     p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
                      "[1-5]pre [d]draw [k]sym [g]graph [w]wrap [h]heat [T]trace [f]freq "
                      "[/]rule [m]mut [b]edit [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
-                     "[z/x]zoom [n]map [<>]time [t]tbar "
+                     "[S]stamp [z/x]zoom [n]map [<>]time [t]tbar "
                      "C-s:save C-o:load [q]quit\033[0m\033[K\n");
 
     int usable_rows = term_rows - 3;
@@ -2500,6 +2646,74 @@ static void render(int running, int speed_ms, int draw_mode) {
     /* Rule editor overlay */
     render_rule_editor(&p);
 
+    /* Stamp preview overlay (bottom-right corner) */
+    if (stamp_mode) {
+        const RotatedStamp *rs = &stamp_rotations[stamp_sel][stamp_rot];
+        /* Find bounding box */
+        int sminx = 999, sminy = 999, smaxx = -999, smaxy = -999;
+        for (int i = 0; i < rs->n; i++) {
+            if (rs->cells[i].dx < sminx) sminx = rs->cells[i].dx;
+            if (rs->cells[i].dy < sminy) sminy = rs->cells[i].dy;
+            if (rs->cells[i].dx > smaxx) smaxx = rs->cells[i].dx;
+            if (rs->cells[i].dy > smaxy) smaxy = rs->cells[i].dy;
+        }
+        int pw = smaxx - sminx + 1;
+        int ph = smaxy - sminy + 1;
+        /* Clamp preview size */
+        if (pw > 40) pw = 40;
+        if (ph > 16) ph = 16;
+
+        int box_w = (pw > 12 ? pw : 12) + 4; /* min width for title */
+        int box_h = ph + 3;  /* title + cells + bottom border */
+        int box_col = term_cols - box_w - 1;
+        int box_row = term_rows - box_h;
+        if (box_col < 1) box_col = 1;
+        if (box_row < 3) box_row = 3;
+
+        const char *bdr = "\033[38;2;255;200;60;48;2;15;15;25m";
+        const char *bg = "\033[48;2;15;15;25m";
+        const char *rst = "\033[0m";
+        static const char *rot_labels[] = {"0\xC2\xB0","90\xC2\xB0","180\xC2\xB0","270\xC2\xB0"};
+
+        /* Top border with name */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 %s %s ",
+                     box_row, box_col, bdr, stamp_library[stamp_sel].name, rot_labels[stamp_rot]);
+        int title_len = (int)strlen(stamp_library[stamp_sel].name) + (int)strlen(rot_labels[stamp_rot]) + 4;
+        for (int i = title_len; i < box_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", rst);
+
+        /* Pattern cells */
+        for (int row = 0; row < ph; row++) {
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s", box_row + 1 + row, box_col, bdr, bg);
+            for (int col = 0; col < box_w - 1; col++) {
+                int cx = sminx + col;
+                int cy = sminy + row;
+                int found = 0;
+                if (col < pw) {
+                    for (int i = 0; i < rs->n; i++) {
+                        if (rs->cells[i].dx == cx && rs->cells[i].dy == cy) {
+                            found = 1; break;
+                        }
+                    }
+                }
+                if (found)
+                    p += sprintf(p, "\033[38;2;255;200;60;48;2;15;15;25m\xe2\x96\x88");
+                else
+                    *p++ = ' ';
+            }
+            p += sprintf(p, "%s\xe2\x94\x82%s", bdr, rst);
+        }
+
+        /* Bottom border with hint */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94\xe2\x94\x80 [/]sel \xe2\x86\x95rot ",
+                     box_row + 1 + ph, box_col, bdr);
+        int hint_len = 12;
+        for (int i = hint_len; i < box_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", rst);
+    }
+
     *p = '\0';
 
     (void)!write(STDOUT_FILENO, render_buf, p - render_buf);
@@ -2532,6 +2746,7 @@ static long long now_ms(void) {
 int main(void) {
     srand(time(NULL));
     build_pulsar();
+    stamp_init();
     timeline_init();
 
     W = MAX_W;
@@ -2682,6 +2897,7 @@ int main(void) {
                 portal_placing = 0;
                 emit_mode = 0;
                 zone_mode = 0;
+                stamp_mode = 0;
                 draw_mode = 1;
             }
             printf("\033[2J"); fflush(stdout);
@@ -2695,7 +2911,9 @@ int main(void) {
             }
         }
         else if (key == ']') {
-            if (emit_mode) {
+            if (stamp_mode) {
+                stamp_sel = (stamp_sel + 1) % N_STAMPS;
+            } else if (emit_mode) {
                 emit_pattern = (emit_pattern + 1) % N_EMIT_PATTERNS;
             } else if (zone_mode) {
                 zone_brush = (zone_brush + 1) % N_RULESETS;
@@ -2706,7 +2924,9 @@ int main(void) {
             }
         }
         else if (key == '[') {
-            if (emit_mode) {
+            if (stamp_mode) {
+                stamp_sel = (stamp_sel - 1 + N_STAMPS) % N_STAMPS;
+            } else if (emit_mode) {
                 emit_pattern = (emit_pattern - 1 + N_EMIT_PATTERNS) % N_EMIT_PATTERNS;
             } else if (zone_mode) {
                 zone_brush = (zone_brush - 1 + N_RULESETS) % N_RULESETS;
@@ -2720,7 +2940,7 @@ int main(void) {
             show_minimap = !show_minimap;
         else if (key == 'j' || key == 'J') {
             zone_mode = !zone_mode;
-            emit_mode = 0;
+            emit_mode = 0; stamp_mode = 0;
             portal_mode = 0; portal_placing = 0;
             if (zone_mode) {
                 draw_mode = 1;
@@ -2729,7 +2949,7 @@ int main(void) {
         }
         else if (key == 'e' || key == 'E') {
             emit_mode = !emit_mode;
-            zone_mode = 0;
+            zone_mode = 0; stamp_mode = 0;
             portal_mode = 0; portal_placing = 0;
             if (emit_mode) {
                 draw_mode = 1;
@@ -2741,6 +2961,16 @@ int main(void) {
         }
         else if (key == 'k' || key == 'K')
             symmetry = (symmetry + 1) % 4;
+        else if (key == 'S') {
+            stamp_mode = !stamp_mode;
+            if (stamp_mode) {
+                emit_mode = 0;
+                zone_mode = 0;
+                portal_mode = 0; portal_placing = 0;
+                draw_mode = 1;
+            }
+            printf("\033[2J"); fflush(stdout);
+        }
         else if (key == 'a') {
             ecosystem_mode = !ecosystem_mode;
             if (ecosystem_mode) {
@@ -2816,8 +3046,13 @@ int main(void) {
                     goto mouse_done;
             }
 
-            /* Scroll wheel: portal radius / emit radius / zoom */
-            if (portal_mode && m->type == 1 && (btn == 64 || btn == 65)) {
+            /* Scroll wheel: stamp rotation / portal radius / emit radius / zoom */
+            if (stamp_mode && m->type == 1 && (btn == 64 || btn == 65)) {
+                if (btn == 64)
+                    stamp_rot = (stamp_rot + 1) % 4;
+                else
+                    stamp_rot = (stamp_rot + 3) % 4;
+            } else if (portal_mode && m->type == 1 && (btn == 64 || btn == 65)) {
                 if (btn == 64)
                     portal_radius = portal_radius < 6 ? portal_radius + 1 : 6;
                 else
@@ -2863,7 +3098,24 @@ int main(void) {
                     gy = view_y + (m->y - 3) * 2;
                 }
 
-                if (portal_mode) {
+                if (stamp_mode) {
+                    /* Stamp placement: left-click places, right-click exits stamp mode */
+                    if (m->type == 1) {
+                        int mbtn = btn & 0x03;
+                        if (mbtn == 0) {
+                            stamp_place(gx, gy);
+                            char msg[64];
+                            static const char *rot_names[] = {"0\xC2\xB0","90\xC2\xB0","180\xC2\xB0","270\xC2\xB0"};
+                            snprintf(msg, sizeof(msg), "Placed %s (%s)",
+                                     stamp_library[stamp_sel].name, rot_names[stamp_rot]);
+                            flash_set(msg);
+                        } else if (mbtn == 2) {
+                            stamp_mode = 0;
+                            printf("\033[2J"); fflush(stdout);
+                        }
+                    }
+                    if (m->type == 2) mouse_held = 0;
+                } else if (portal_mode) {
                     /* Portal placement: left=place entrance/exit, middle=remove */
                     if (m->type == 1) {
                         int mbtn = btn & 0x03;

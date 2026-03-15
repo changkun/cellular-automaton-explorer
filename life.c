@@ -62,6 +62,9 @@
  *   $           Toggle topological feature map (connected components + holes)
  *                 Colors each component uniquely, highlights enclosed holes
  *                 Sidebar shows β₀ (components), β₁ (holes), sparklines
+ *   %           Toggle renormalization group flow (multi-scale structure)
+ *                 Majority-rule block decimation at 2x, 4x, 8x scales
+ *                 Cyan=fine, yellow=meso, magenta=coarse, white=scale-invariant
  *   Ctrl-E      Export current grid as RLE file (auto-numbered export_NNN.rle)
  *   Arrow keys  Pan viewport across the full 400×200 grid
  *   0           Re-center viewport on grid center
@@ -392,6 +395,42 @@ static int   topo_hist_count = 0;           /* entries filled */
 #define TOPO_QUEUE_SIZE (MAX_W * MAX_H)
 static int topo_qx[TOPO_QUEUE_SIZE];
 static int topo_qy[TOPO_QUEUE_SIZE];
+
+/* ── Renormalization Group Flow ──────────────────────────────────────────── */
+/* Real-space RG via majority-rule block decimation at scales 2x, 4x, 8x.
+   At each scale, non-overlapping blocks of s×s cells are reduced to a single
+   "coarse" cell (alive if majority of block cells are alive).  The density
+   at each scale reveals which spatial frequencies carry structure:
+     - Fine-dominated (cyan): structure only at small scales (dust, noise)
+     - Meso-dominated (yellow): medium-scale organization (clusters)
+     - Coarse-dominated (magenta): large-scale coherent structure
+     - Scale-invariant (white): similar density across all scales (critical/fractal)
+   Criticality score = 1 - max deviation from mean across scales. */
+#define RG_N_SCALES 3   /* scales: 2x, 4x, 8x block sizes */
+#define RG_HIST_LEN 64  /* sparkline history length */
+
+static float rg_grid[MAX_H][MAX_W];     /* per-cell dominant scale (0=fine, 0.5=meso, 1.0=coarse) */
+static float rg_invariance[MAX_H][MAX_W]; /* per-cell scale invariance (0=dominated, 1=flat) */
+static int   rg_mode = 0;               /* 0=off, 1=on */
+static int   rg_stale = 1;              /* 1=needs recomputation */
+static float rg_density[RG_N_SCALES];   /* global density at each RG scale */
+static float rg_criticality = 0.0f;     /* global criticality score (flatness) */
+static float rg_global_fine = 0.0f;     /* fraction of cells that are fine-dominated */
+static float rg_global_meso = 0.0f;     /* fraction of cells that are meso-dominated */
+static float rg_global_coarse = 0.0f;   /* fraction of cells that are coarse-dominated */
+static float rg_global_invariant = 0.0f;/* fraction of cells that are scale-invariant */
+static float rg_mean_invariance = 0.0f; /* mean invariance across grid */
+
+/* Coarse-grained grids at each scale */
+#define RG_MAX_CW (MAX_W / 2)  /* max coarse width at scale 2 */
+#define RG_MAX_CH (MAX_H / 2)  /* max coarse height at scale 2 */
+static unsigned char rg_coarse[RG_N_SCALES][RG_MAX_CH][RG_MAX_CW];
+
+/* Sparkline history */
+static float rg_hist_crit[RG_HIST_LEN]; /* criticality history */
+static float rg_hist_d[RG_N_SCALES][RG_HIST_LEN]; /* density per scale history */
+static int   rg_hist_idx = 0;
+static int   rg_hist_count = 0;
 
 /* ── Pattern Census ───────────────────────────────────────────────────────── */
 static int census_mode = 0;    /* 0=off, 1=on */
@@ -1276,6 +1315,7 @@ static void grid_step(void) {
     mi_stale = 1;
     cplx_stale = 1;
     topo_stale = 1;
+    rg_stale = 1;
 
     /* Always record frames for surprise field (cheap memcpy) */
     surp_record_frame();
@@ -4223,6 +4263,192 @@ static RGB topo_hole_rgb(void) {
     return (RGB){160, 50, 200};
 }
 
+/* ── Renormalization Group Flow computation ────────────────────────────────── */
+/* Majority-rule block decimation: for block size s, a coarse cell is alive
+   if more than half the s×s block cells are alive. */
+static void rg_compute(void) {
+    int scales[RG_N_SCALES] = {2, 4, 8};  /* block sizes */
+
+    /* Phase 1: Build coarse-grained grids at each scale */
+    for (int si = 0; si < RG_N_SCALES; si++) {
+        int s = scales[si];
+        int cw = W / s;
+        int ch = H / s;
+        int threshold = (s * s) / 2;  /* majority threshold */
+        int total_alive = 0;
+        int total_cells = cw * ch;
+
+        for (int cy = 0; cy < ch; cy++) {
+            for (int cx = 0; cx < cw; cx++) {
+                /* Count alive cells in this block */
+                int count = 0;
+                int bx = cx * s, by = cy * s;
+                for (int dy = 0; dy < s && (by + dy) < H; dy++) {
+                    for (int dx = 0; dx < s && (bx + dx) < W; dx++) {
+                        if (grid[by + dy][bx + dx] > 0) count++;
+                    }
+                }
+                int alive = (count > threshold) ? 1 : 0;
+                rg_coarse[si][cy][cx] = (unsigned char)alive;
+                total_alive += alive;
+            }
+        }
+        rg_density[si] = total_cells > 0 ? (float)total_alive / total_cells : 0.0f;
+    }
+
+    /* Phase 2: Per-cell analysis — determine dominant scale and invariance */
+    int n_fine = 0, n_meso = 0, n_coarse = 0, n_invariant = 0;
+    float total_inv = 0.0f;
+    int n_alive = 0;
+
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            if (grid[y][x] == 0) {
+                rg_grid[y][x] = 0.0f;
+                rg_invariance[y][x] = 0.0f;
+                continue;
+            }
+            n_alive++;
+
+            /* Get this cell's state at each coarse scale */
+            float local_density[RG_N_SCALES];
+            for (int si = 0; si < RG_N_SCALES; si++) {
+                int s = scales[si];
+                int cx = x / s, cy = y / s;
+                int cw = W / s, ch = H / s;
+                if (cx >= cw) cx = cw - 1;
+                if (cy >= ch) cy = ch - 1;
+
+                /* Use a local neighborhood of coarse cells for smoother result */
+                int alive_count = 0, total_count = 0;
+                for (int dy = -1; dy <= 1; dy++) {
+                    for (int dx = -1; dx <= 1; dx++) {
+                        int nx = cx + dx, ny = cy + dy;
+                        if (nx >= 0 && nx < cw && ny >= 0 && ny < ch) {
+                            alive_count += rg_coarse[si][ny][nx];
+                            total_count++;
+                        }
+                    }
+                }
+                local_density[si] = total_count > 0 ? (float)alive_count / total_count : 0.0f;
+            }
+
+            /* Determine which scale dominates: where density drops most */
+            /* Compute "structure contribution" at each scale:
+               how much density the scale retains compared to raw */
+            float raw_density = 1.0f; /* this cell is alive */
+            float drop[RG_N_SCALES];
+            float max_drop = 0.0f;
+            int max_drop_idx = 0;
+
+            for (int si = 0; si < RG_N_SCALES; si++) {
+                float prev = (si == 0) ? raw_density : local_density[si - 1];
+                drop[si] = prev - local_density[si];
+                if (drop[si] < 0) drop[si] = 0;
+                if (drop[si] > max_drop) {
+                    max_drop = drop[si];
+                    max_drop_idx = si;
+                }
+            }
+
+            /* Map dominant scale to 0..1: 0=fine(2x), 0.5=meso(4x), 1.0=coarse(8x) */
+            rg_grid[y][x] = (float)max_drop_idx / (RG_N_SCALES - 1);
+
+            /* Scale invariance: 1 - normalized variance of densities across scales */
+            float mean_d = 0.0f;
+            for (int si = 0; si < RG_N_SCALES; si++) mean_d += local_density[si];
+            mean_d /= RG_N_SCALES;
+
+            float var_d = 0.0f;
+            for (int si = 0; si < RG_N_SCALES; si++) {
+                float diff = local_density[si] - mean_d;
+                var_d += diff * diff;
+            }
+            var_d /= RG_N_SCALES;
+            /* Invariance: high when variance is low (all scales similar) */
+            float inv = 1.0f - sqrtf(var_d) * 3.0f;  /* scale factor for visual range */
+            if (inv < 0.0f) inv = 0.0f;
+            if (inv > 1.0f) inv = 1.0f;
+            rg_invariance[y][x] = inv;
+            total_inv += inv;
+
+            /* Classify */
+            if (inv > 0.6f) {
+                n_invariant++;
+            } else if (max_drop_idx == 0) {
+                n_fine++;
+            } else if (max_drop_idx == 1) {
+                n_meso++;
+            } else {
+                n_coarse++;
+            }
+        }
+    }
+
+    /* Global stats */
+    float n_total = (float)(n_alive > 0 ? n_alive : 1);
+    rg_global_fine = (float)n_fine / n_total;
+    rg_global_meso = (float)n_meso / n_total;
+    rg_global_coarse = (float)n_coarse / n_total;
+    rg_global_invariant = (float)n_invariant / n_total;
+    rg_mean_invariance = n_alive > 0 ? total_inv / n_alive : 0.0f;
+
+    /* Criticality: how flat the density spectrum is across scales */
+    float d_mean = 0.0f;
+    for (int si = 0; si < RG_N_SCALES; si++) d_mean += rg_density[si];
+    d_mean /= RG_N_SCALES;
+    float d_var = 0.0f;
+    for (int si = 0; si < RG_N_SCALES; si++) {
+        float diff = rg_density[si] - d_mean;
+        d_var += diff * diff;
+    }
+    d_var /= RG_N_SCALES;
+    rg_criticality = 1.0f - sqrtf(d_var) * 4.0f;
+    if (rg_criticality < 0.0f) rg_criticality = 0.0f;
+    if (rg_criticality > 1.0f) rg_criticality = 1.0f;
+
+    /* Record history */
+    rg_hist_crit[rg_hist_idx] = rg_criticality;
+    for (int si = 0; si < RG_N_SCALES; si++)
+        rg_hist_d[si][rg_hist_idx] = rg_density[si];
+    rg_hist_idx = (rg_hist_idx + 1) % RG_HIST_LEN;
+    if (rg_hist_count < RG_HIST_LEN) rg_hist_count++;
+
+    rg_stale = 0;
+}
+
+/* RG flow color: blend dominant scale (hue) with invariance (brightness) */
+static RGB rg_to_rgb(float dominant_scale, float invariance) {
+    /* Scale-invariant cells → white/silver; dominated cells → colored by scale */
+    if (invariance > 0.6f) {
+        /* Scale-invariant: white with slight warm tint */
+        float t = (invariance - 0.6f) / 0.4f;
+        unsigned char v = (unsigned char)(180 + 75 * t);
+        return (RGB){v, (unsigned char)(v - 10), (unsigned char)(v - 20)};
+    }
+
+    /* Colored by dominant scale: cyan(fine) → yellow(meso) → magenta(coarse) */
+    if (dominant_scale < 0.25f) {
+        /* Fine: cyan */
+        float t = dominant_scale / 0.25f;
+        return (RGB){(unsigned char)(30 + 40 * t),
+                     (unsigned char)(180 + 40 * t),
+                     (unsigned char)(220 - 30 * t)};
+    } else if (dominant_scale < 0.75f) {
+        /* Meso: yellow-gold */
+        float t = (dominant_scale - 0.25f) / 0.5f;
+        return (RGB){(unsigned char)(200 + 55 * t),
+                     (unsigned char)(200 - 40 * t),
+                     (unsigned char)(40 + 80 * t)};
+    } else {
+        /* Coarse: magenta-violet */
+        float t = (dominant_scale - 0.75f) / 0.25f;
+        return (RGB){(unsigned char)(220 - 40 * t),
+                     (unsigned char)(60 + 30 * t),
+                     (unsigned char)(200 + 55 * t)};
+    }
+}
+
 /* ── Mutual Information Network computation ──────────────────────────────── */
 
 /* Draw a Bresenham line on mi_overlay, keeping max MI at each cell */
@@ -6033,6 +6259,25 @@ static int cell_color(int x, int y, RGB *out) {
         return 0;
     }
 
+    /* Renormalization group flow overlay: multi-scale structure */
+    if (rg_mode) {
+        if (grid[y][x]) {
+            *out = rg_to_rgb(rg_grid[y][x], rg_invariance[y][x]);
+            return 1;
+        }
+        /* Show faint color for dead cells near structure */
+        float inv = rg_invariance[y][x];
+        float dom = rg_grid[y][x];
+        if (inv > 0.01f || dom > 0.01f) {
+            RGB c = rg_to_rgb(dom, inv);
+            out->r = c.r / 4;
+            out->g = c.g / 4;
+            out->b = c.b / 4;
+            return 21; /* 21 = rg ghost */
+        }
+        return 0;
+    }
+
     /* Composite complexity index overlay: edge-of-chaos heatmap */
     if (cplx_mode) {
         float c = cplx_grid[y][x];
@@ -6277,6 +6522,12 @@ static void render(int running, int speed_ms, int draw_mode) {
                  " \033[38;2;180;100;240m\xe2\x97\x86TOPO:\xce\xb2\xe2\x82\x80=%d \xce\xb2\xe2\x82\x81=%d\033[0m",
                  topo_beta0, topo_beta1);
 
+    /* Renormalization group flow indicator */
+    char rg_str[96] = "";
+    if (rg_mode)
+        snprintf(rg_str, sizeof(rg_str),
+                 " \033[38;2;100;220;200m\xe2\x97\x86RG:C=%.2f\033[0m", rg_criticality);
+
     /* Genetic explorer indicator */
     char gene_str[64] = "";
     if (gene_mode == 1)
@@ -6397,9 +6648,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, surp_str, mi_str, cplx_str, topo_str2, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
+                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -8510,6 +8761,152 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", trst);
     }
 
+    /* ── Renormalization Group Flow overlay panel ────────────────────────────── */
+    if (rg_mode) {
+        int rp_w = 44;
+        int rp_col = term_cols - rp_w - 2;
+        /* Stack below other active panels */
+        int rp_row = 3;
+        if (entropy_mode)   rp_row += 8;
+        if (temp_mode)      rp_row += 9;
+        if (lyapunov_mode)  rp_row += 8;
+        if (fourier_mode)   rp_row += 18;
+        if (fractal_mode)   rp_row += 11;
+        if (wolfram_mode)   rp_row += 14;
+        if (flow_mode)      rp_row += 9;
+        if (attractor_mode) rp_row += 8;
+        if (cone_mode >= 1) rp_row += 8;
+        if (surp_mode)      rp_row += 8;
+        if (mi_mode)        rp_row += 12;
+        if (cplx_mode)      rp_row += 11;
+        if (topo_mode)      rp_row += 11;
+        if (rp_col < 1) rp_col = 1;
+
+        const char *rbdr = "\033[38;2;100;220;200;48;2;8;18;16m";
+        const char *rbg  = "\033[48;2;8;18;16m";
+        const char *rrst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 RG Flow \xe2\x97\x86 ",
+                     rp_row, rp_col, rbdr);
+        for (int i = 15; i < rp_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", rrst);
+
+        /* Row 1: Criticality score */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     rp_row + 1, rp_col, rbdr, rbg);
+        p += sprintf(p, " \033[38;2;100;220;200mCriticality: \033[1;38;2;");
+        /* Color criticality: low=red, mid=yellow, high=cyan */
+        if (rg_criticality < 0.4f) p += sprintf(p, "220;80;80m");
+        else if (rg_criticality < 0.7f) p += sprintf(p, "220;200;80m");
+        else p += sprintf(p, "80;255;220m");
+        p += sprintf(p, "%.3f", rg_criticality);
+        { int used = 21; for (int i = used; i < rp_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", rbdr, rrst);
+
+        /* Row 2: Scale density bars */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     rp_row + 2, rp_col, rbdr, rbg);
+        p += sprintf(p, " \033[38;2;80;200;220m2x:%.2f \033[38;2;220;200;60m4x:%.2f \033[38;2;200;80;220m8x:%.2f",
+                     rg_density[0], rg_density[1], rg_density[2]);
+        { int used = 29; for (int i = used; i < rp_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", rbdr, rrst);
+
+        /* Row 3: Scale spectrum bar (visual) */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     rp_row + 3, rp_col, rbdr, rbg);
+        p += sprintf(p, " \033[38;2;100;180;160mSpectrum: ");
+        {
+            int bar_w = rp_w - 14;
+            const char *block = "\xe2\x96\x88"; /* █ */
+            for (int i = 0; i < bar_w; i++) {
+                float t = (float)i / (bar_w - 1);
+                int si;
+                if (t < 0.33f) si = 0;
+                else if (t < 0.67f) si = 1;
+                else si = 2;
+                int lvl = (int)(rg_density[si] * 8);
+                if (lvl > 8) lvl = 8;
+                if (lvl > 0) {
+                    if (si == 0) p += sprintf(p, "\033[38;2;80;200;220m");
+                    else if (si == 1) p += sprintf(p, "\033[38;2;220;200;60m");
+                    else p += sprintf(p, "\033[38;2;200;80;220m");
+                    p += sprintf(p, "%s", block);
+                } else {
+                    p += sprintf(p, "\033[38;2;30;40;35m\xe2\x96\x91");
+                }
+            }
+        }
+        p += sprintf(p, " ");
+        p += sprintf(p, "%s\xe2\x94\x82%s", rbdr, rrst);
+
+        /* Row 4: Classification fractions */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     rp_row + 4, rp_col, rbdr, rbg);
+        p += sprintf(p, " \033[38;2;80;200;220mFine:%.0f%% \033[38;2;220;200;60mMeso:%.0f%%",
+                     rg_global_fine * 100, rg_global_meso * 100);
+        { int used = 21; for (int i = used; i < rp_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", rbdr, rrst);
+
+        /* Row 5: Coarse and scale-invariant fractions */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     rp_row + 5, rp_col, rbdr, rbg);
+        p += sprintf(p, " \033[38;2;200;80;220mCoarse:%.0f%% \033[38;2;240;240;220mInvariant:%.0f%%",
+                     rg_global_coarse * 100, rg_global_invariant * 100);
+        { int used = 28; for (int i = used; i < rp_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", rbdr, rrst);
+
+        /* Row 6: Mean invariance */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     rp_row + 6, rp_col, rbdr, rbg);
+        p += sprintf(p, " \033[38;2;140;180;170mMean invariance: \033[38;2;200;240;230m%.3f",
+                     rg_mean_invariance);
+        { int used = 25; for (int i = used; i < rp_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", rbdr, rrst);
+
+        /* Row 7: Criticality sparkline */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     rp_row + 7, rp_col, rbdr, rbg);
+        p += sprintf(p, " \033[38;2;80;140;130mC ");
+        if (rg_hist_count > 1) {
+            int n = rg_hist_count < 30 ? rg_hist_count : 30;
+            const char *spark_chars[] = {"\xe2\x96\x81","\xe2\x96\x82","\xe2\x96\x83",
+                                         "\xe2\x96\x84","\xe2\x96\x85","\xe2\x96\x86",
+                                         "\xe2\x96\x87","\xe2\x96\x88"};
+            for (int i = 0; i < n; i++) {
+                int idx = (rg_hist_idx - n + i + RG_HIST_LEN) % RG_HIST_LEN;
+                int lvl = (int)(rg_hist_crit[idx] * 7.0f);
+                if (lvl < 0) lvl = 0;
+                if (lvl > 7) lvl = 7;
+                /* Color: red→yellow→cyan */
+                if (rg_hist_crit[idx] < 0.4f)
+                    p += sprintf(p, "\033[38;2;220;80;80m%s", spark_chars[lvl]);
+                else if (rg_hist_crit[idx] < 0.7f)
+                    p += sprintf(p, "\033[38;2;220;200;80m%s", spark_chars[lvl]);
+                else
+                    p += sprintf(p, "\033[38;2;80;255;220m%s", spark_chars[lvl]);
+            }
+        }
+        p += sprintf(p, "%s", rbg);
+        { int used = 4 + (rg_hist_count < 30 ? rg_hist_count : 30);
+          for (int i = used; i < rp_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", rbdr, rrst);
+
+        /* Row 8: Toggle hint */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     rp_row + 8, rp_col, rbdr, rbg);
+        p += sprintf(p, " \033[38;2;80;100;90m[%%]toggle  majority-rule RG");
+        { int used = 33; for (int i = used; i < rp_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", rbdr, rrst);
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", rp_row + 9, rp_col, rbdr);
+        for (int i = 0; i < rp_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", rrst);
+    }
+
     /* ── Population Dynamics Dashboard overlay ─────────────────────────────── */
     if (dashboard_mode && hist_count > 1) {
         int db_w = 62;      /* panel width */
@@ -9036,6 +9433,12 @@ int main(int argc, char **argv) {
                 topo_compute(); /* compute on toggle-on */
             }
         }
+        else if (key == '%') {
+            rg_mode = !rg_mode;
+            if (rg_mode) {
+                rg_compute(); /* compute on toggle-on */
+            }
+        }
         else if (key == ']') {
             if (temp_mode) {
                 temp_brush_radius = temp_brush_radius < 20 ? temp_brush_radius + 1 : 20;
@@ -9492,6 +9895,11 @@ int main(int argc, char **argv) {
         /* Auto-refresh topological feature map every 4 generations */
         if (topo_mode && topo_stale && (generation % 4 == 0 || !running)) {
             topo_compute();
+        }
+
+        /* Auto-refresh RG flow every 4 generations */
+        if (rg_mode && rg_stale && (generation % 4 == 0 || !running)) {
+            rg_compute();
         }
 
         render(running, speed_ms, draw_mode);

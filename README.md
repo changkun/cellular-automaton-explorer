@@ -59,6 +59,7 @@ Requires only `gcc` and a POSIX terminal.
 | `@` | Toggle mutual information network (inter-region coupling map) |
 | `#` | Toggle composite complexity index (edge-of-chaos heatmap) |
 | `$` | Toggle topological feature map (connected components + holes, β₀/β₁) |
+| `%` | Toggle renormalization group flow (multi-scale structure analysis) |
 | `+`/`-` (in cone) | Adjust forward cone depth |
 | `G` | Genetic rule explorer — evolve interesting rulesets |
 | `G` (in overlay) | Breed next generation of candidate rules |
@@ -477,6 +478,30 @@ The sidebar panel displays:
 - β₀ and β₁ sparkline history (30-frame rolling window)
 
 This overlay reveals **percolation transitions** (when many small components suddenly merge into one large connected cluster), **topological genus** of patterns (how many holes structures like ponds and beehives contain), and the fragmentation/coalescence dynamics invisible to other analyzers.
+
+Recomputes every 4 generations while running.
+
+### Renormalization Group Flow
+
+Toggle with `%`. Implements **real-space renormalization group (RG)** analysis via majority-rule block decimation at three scales (2×2, 4×4, 8×8 blocks). This reveals how spatial structure distributes across length scales — the fundamental question of critical phenomena and phase transitions.
+
+**How it works:** At each scale, non-overlapping blocks of s×s cells are coarse-grained to a single "super-cell" (alive if majority of block cells are alive). The density retained at each scale indicates where structure lives:
+
+- **Cyan** = fine-dominated: structure only at small scales (dust, isolated cells, noise)
+- **Yellow** = meso-dominated: medium-scale organization (clusters, oscillator groups)
+- **Magenta** = coarse-dominated: large-scale coherent structure (spanning patterns)
+- **White** = scale-invariant: similar density at all scales (critical/fractal behavior)
+
+**Criticality score:** Measures flatness of the density spectrum across scales. Score near 1.0 indicates scale-invariant (critical) behavior — the hallmark of systems at the edge of chaos. Score near 0.0 means structure is concentrated at specific scales.
+
+The sidebar panel displays:
+- Criticality score with color coding (red=low, yellow=mid, cyan=high)
+- Density at each RG scale (2x, 4x, 8x)
+- Visual scale spectrum bar
+- Classification fractions (fine/meso/coarse/invariant)
+- Mean invariance and criticality sparkline history
+
+This overlay connects directly to **statistical mechanics** and **critical phenomena**: scale-invariant configurations correspond to critical points where correlation length diverges, while scale-dominated configurations indicate ordered or disordered phases.
 
 Recomputes every 4 generations while running.
 

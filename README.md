@@ -41,6 +41,9 @@ Requires only `gcc` and a POSIX terminal.
 | `T` | Cycle signal tracer: off → accumulate → frozen → clear+off |
 | `f` | Toggle frequency analysis overlay (period detection heatmap) |
 | `W` | Toggle wormhole portal placement mode |
+| `a` | Toggle dual-species ecosystem mode |
+| `6` | Toggle brush species (A ↔ B) in ecosystem mode |
+| `{` / `}` | Adjust cross-species interaction coefficient (-1.0 to +1.0) |
 | `Ctrl-S` | Save state to numbered `.life` file |
 | `Ctrl-O` | Load most recent `.life` save |
 | `Arrow keys` | Pan viewport across the full 400×200 grid |
@@ -216,6 +219,45 @@ Portals are saved/loaded with `.life` files and render at all zoom levels with a
 swirling rings (cyan for entrances, magenta for exits). Press `c` twice to clear portals
 along with zones and emitters.
 
+## Dual-Species Ecosystem
+
+Press `a` to toggle **ecosystem mode** — a dual-species system where Red and Blue populations
+coexist on the same grid with independent birth/survival rules and tunable inter-species interaction.
+
+### Species
+- **Species A** (blue-cyan gradient): defaults to Conway rules (B3/S23)
+- **Species B** (red-orange gradient): defaults to HighLife rules (B36/S23)
+
+Each species counts its own neighbors and cross-species neighbors separately. The effective
+neighbor count is computed as `same + interaction × cross`, where the interaction coefficient
+ranges from -1.0 (hostile) to +1.0 (cooperative).
+
+### Interaction spectrum
+
+| Value | Behavior |
+|-------|----------|
+| -1.0 | Hostile — cross-species neighbors count negatively (overpopulation pressure) |
+| 0.0 | Neutral — species completely ignore each other |
+| +1.0 | Cooperative — cross-species neighbors help equally (full mutualism) |
+
+Adjust with `{` / `}` in increments of 0.1.
+
+### Drawing & controls
+- Press `6` to switch the brush between species A and B
+- Drawing, emitters, and randomize all respect the active brush species
+- Randomize assigns species 50/50 randomly
+- When toggling ecosystem mode on, existing live cells default to species A
+
+### Emergent behaviors
+- **Territorial boundaries** — species carve out regions, with contested frontiers
+- **Predator-prey oscillations** — hostile interaction creates population cycling
+- **Extinction cascades** — one species can drive the other to extinction under strong competition
+- **Symbiotic structures** — cooperative interaction lets mixed-species configurations stabilize
+- **HighLife replicators vs Conway gliders** — the two default rulesets produce dramatically different growth patterns that interact at species boundaries
+
+The minimap shows species A in blue, species B in red, and mixed regions in purple.
+Species data is fully integrated with timeline replay and save/load.
+
 ## Save & Load
 
 Press `Ctrl-S` to save the full simulation state to a numbered `.life` file (`save_001.life`,
@@ -247,5 +289,6 @@ grid state, cell ages, ghost trails, zones, emitters, absorbers, ruleset, symmet
 - Save/load — binary `.life` files preserving full state (grid, zones, emitters, absorbers, settings) with auto-numbered slots and status flash feedback
 - Frequency analysis — per-cell oscillation period detection via autocorrelation over timeline history, with ice-blue→emerald→gold→red color spectrum and legend overlay
 - Wormhole portals — paired non-local spatial couplings with additive neighbor model, animated ring visualization, positional offset mapping, and bidirectional coupling across up to 8 portal pairs
+- Dual-species ecosystem — two coexisting cell populations with independent B/S rules, species-aware neighbor counting, configurable interaction coefficient (-1.0 hostile to +1.0 cooperative), species-specific color gradients, and birth arbitration
 - Full 400×200 simulation grid with viewport navigation (arrow keys + mouse scroll)
 - Proper terminal cleanup on exit (raw mode restore, cursor show)

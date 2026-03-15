@@ -29,6 +29,9 @@
  *   f           Toggle frequency analysis overlay (period detection heatmap)
  *   W           Toggle wormhole portal placement (left=entrance, right=exit, middle=remove)
  *                 Paired portals create non-local neighbor coupling
+ *   a           Toggle dual-species ecosystem mode (Red vs Blue)
+ *   6           Toggle active brush species (A/B) in ecosystem mode
+ *   { / }       Adjust cross-species interaction coefficient (-1.0 to +1.0)
  *   Ctrl-S      Save state to numbered .life file
  *   Ctrl-O      Load most recent .life save (or Ctrl-O N for slot N)
  *   Arrow keys  Pan viewport across the full 400×200 grid
@@ -90,6 +93,17 @@ static int zone_mode = 0; /* 0=off, 1=zone-paint mode */
 static int zone_brush = 0; /* which ruleset to paint in zone mode */
 static int zone_enabled = 0; /* whether per-cell zones are active */
 static int rule_editor = 0; /* 0=off, 1=rule editor overlay visible */
+
+/* ── Dual-Species Ecosystem ─────────────────────────────────────────────── */
+static unsigned char species[MAX_H][MAX_W]; /* 0=none, 1=species A, 2=species B */
+static unsigned char next_species[MAX_H][MAX_W]; /* double-buffer for species */
+static int ecosystem_mode = 0;     /* 0=off, 1=dual-species active */
+static int brush_species = 1;      /* 1=A, 2=B — which species the draw brush places */
+static float interaction = 0.0f;   /* -1.0 to +1.0: cross-species neighbor weight */
+static unsigned short species_a_birth = 0x008;    /* B3 (Conway default) */
+static unsigned short species_a_survival = 0x00C; /* S23 */
+static unsigned short species_b_birth = 0x048;    /* B36 (HighLife default) */
+static unsigned short species_b_survival = 0x00C; /* S23 */
 
 /* Rule editor overlay geometry (computed at render time) */
 static int re_col0, re_row0; /* top-left corner (1-based terminal coords) */
@@ -325,6 +339,7 @@ static int portal_neighbor_count(int x, int y) {
 typedef struct {
     unsigned char grid[MAX_H][MAX_W];
     unsigned char ghost[MAX_H][MAX_W];
+    unsigned char species[MAX_H][MAX_W];
     int generation;
     int population;
 } TimelineFrame;
@@ -350,6 +365,7 @@ static void timeline_push(void) {
     TimelineFrame *f = &timeline[tl_head];
     memcpy(f->grid, grid, sizeof(grid));
     memcpy(f->ghost, ghost, sizeof(ghost));
+    memcpy(f->species, species, sizeof(species));
     f->generation = generation;
     f->population = population;
     tl_head = (tl_head + 1) % TL_MAX;
@@ -369,6 +385,7 @@ static void timeline_restore(int age) {
     if (!f) return;
     memcpy(grid, f->grid, sizeof(grid));
     memcpy(ghost, f->ghost, sizeof(ghost));
+    memcpy(species, f->species, sizeof(species));
     generation = f->generation;
     population = f->population;
 }
@@ -522,6 +539,7 @@ static void grid_clear(void) {
     memset(grid, 0, sizeof(grid));
     memset(ghost, 0, sizeof(ghost));
     memset(tracer, 0, sizeof(tracer));
+    memset(species, 0, sizeof(species));
     /* zones are preserved across clear — use 'c' twice or toggle zone_mode to reset */
     generation = 0;
     population = 0;
@@ -541,6 +559,8 @@ static void grid_randomize(double density) {
         for (int x = 0; x < W; x++)
             if ((double)rand() / RAND_MAX < density) {
                 grid[y][x] = 1;
+                if (ecosystem_mode)
+                    species[y][x] = (unsigned char)((rand() % 2) + 1);
                 population++;
             }
 }
@@ -554,10 +574,12 @@ static inline int wrap_coord(int v, int max) {
 static void grid_step(void) {
     population = 0;
     memset(next_grid, 0, sizeof(next_grid));
+    if (ecosystem_mode) memset(next_species, 0, sizeof(next_species));
 
     for (int y = 0; y < H; y++) {
         for (int x = 0; x < W; x++) {
             int n = 0;
+            int n_a = 0, n_b = 0; /* per-species neighbor counts (ecosystem mode) */
             for (int dy = -1; dy <= 1; dy++)
                 for (int dx = -1; dx <= 1; dx++) {
                     if (dx == 0 && dy == 0) continue;
@@ -565,33 +587,86 @@ static void grid_step(void) {
                     if (wrap_mode) {
                         nx = wrap_coord(nx, W);
                         ny = wrap_coord(ny, H);
-                        n += (grid[ny][nx] > 0);
-                    } else {
-                        if (nx >= 0 && nx < W && ny >= 0 && ny < H)
-                            n += (grid[ny][nx] > 0);
+                    } else if (nx < 0 || nx >= W || ny < 0 || ny >= H) {
+                        continue;
+                    }
+                    if (grid[ny][nx] > 0) {
+                        n++;
+                        if (ecosystem_mode) {
+                            if (species[ny][nx] == 1) n_a++;
+                            else n_b++;
+                        }
                     }
                 }
             /* Add portal neighbor contributions (non-local coupling) */
             if (n_portals > 0)
                 n += portal_neighbor_count(x, y);
 
-            int alive = grid[y][x] > 0;
-            /* Use per-cell zone rules if zones are active, else global */
-            unsigned short b_mask = birth_mask;
-            unsigned short s_mask = survival_mask;
-            if (zone_enabled) {
-                int zi = zone[y][x];
-                if (zi < N_RULESETS) {
-                    b_mask = rulesets[zi].birth;
-                    s_mask = rulesets[zi].survival;
+            if (ecosystem_mode) {
+                int alive = grid[y][x] > 0;
+                int my_sp = alive ? species[y][x] : 0;
+
+                if (alive) {
+                    /* Survival: use this species' rules with interaction-weighted neighbors */
+                    int same = (my_sp == 1) ? n_a : n_b;
+                    int cross = (my_sp == 1) ? n_b : n_a;
+                    float eff_f = same + interaction * cross;
+                    int eff = (int)(eff_f >= 0 ? eff_f + 0.5f : eff_f - 0.5f);
+                    if (eff < 0) eff = 0;
+                    if (eff > 15) eff = 15;
+                    unsigned short s_mask = (my_sp == 1) ? species_a_survival : species_b_survival;
+                    if (s_mask & (1 << eff)) {
+                        int age = grid[y][x];
+                        next_grid[y][x] = (age < 255) ? age + 1 : 255;
+                        next_species[y][x] = (unsigned char)my_sp;
+                        population++;
+                    }
+                } else {
+                    /* Birth: check both species' rules; dominant neighbor count wins ties */
+                    float fa = n_a + interaction * n_b;
+                    float fb = n_b + interaction * n_a;
+                    int eff_a = (int)(fa >= 0 ? fa + 0.5f : fa - 0.5f);
+                    int eff_b = (int)(fb >= 0 ? fb + 0.5f : fb - 0.5f);
+                    if (eff_a < 0) eff_a = 0;
+                    if (eff_a > 15) eff_a = 15;
+                    if (eff_b < 0) eff_b = 0;
+                    if (eff_b > 15) eff_b = 15;
+                    int born_a = (species_a_birth & (1 << eff_a)) != 0;
+                    int born_b = (species_b_birth & (1 << eff_b)) != 0;
+                    if (born_a && born_b) {
+                        /* Both species want to birth — majority wins, random tiebreak */
+                        next_species[y][x] = (n_a > n_b) ? 1 : (n_b > n_a) ? 2 : (unsigned char)((rand() % 2) + 1);
+                        next_grid[y][x] = 1;
+                        population++;
+                    } else if (born_a) {
+                        next_species[y][x] = 1;
+                        next_grid[y][x] = 1;
+                        population++;
+                    } else if (born_b) {
+                        next_species[y][x] = 2;
+                        next_grid[y][x] = 1;
+                        population++;
+                    }
                 }
-            }
-            if ((alive && (s_mask & (1 << n))) ||
-                (!alive && (b_mask & (1 << n)))) {
-                /* alive: increment age, cap at 255 */
-                int age = grid[y][x];
-                next_grid[y][x] = (age < 255) ? age + 1 : 255;
-                population++;
+            } else {
+                int alive = grid[y][x] > 0;
+                /* Use per-cell zone rules if zones are active, else global */
+                unsigned short b_mask = birth_mask;
+                unsigned short s_mask = survival_mask;
+                if (zone_enabled) {
+                    int zi = zone[y][x];
+                    if (zi < N_RULESETS) {
+                        b_mask = rulesets[zi].birth;
+                        s_mask = rulesets[zi].survival;
+                    }
+                }
+                if ((alive && (s_mask & (1 << n))) ||
+                    (!alive && (b_mask & (1 << n)))) {
+                    /* alive: increment age, cap at 255 */
+                    int age = grid[y][x];
+                    next_grid[y][x] = (age < 255) ? age + 1 : 255;
+                    population++;
+                }
             }
         }
     }
@@ -613,6 +688,7 @@ static void grid_step(void) {
     }
 
     memcpy(grid, next_grid, sizeof(grid));
+    if (ecosystem_mode) memcpy(species, next_species, sizeof(species));
     generation++;
 
     /* Accumulate signal tracer */
@@ -636,6 +712,7 @@ static void grid_set(int x, int y) {
     if (x >= 0 && x < W && y >= 0 && y < H && !grid[y][x]) {
         grid[y][x] = 1;
         ghost[y][x] = 0;
+        if (ecosystem_mode) species[y][x] = (unsigned char)brush_species;
         population++;
     }
 }
@@ -644,6 +721,7 @@ static void grid_unset(int x, int y) {
     if (x >= 0 && x < W && y >= 0 && y < H && grid[y][x]) {
         grid[y][x] = 0;
         ghost[y][x] = GHOST_FRAMES;
+        species[y][x] = 0;
         population--;
     }
 }
@@ -926,6 +1004,64 @@ static RGB age_to_rgb(int age) {
     return heat_colors[N_HEAT_STOPS - 1];
 }
 
+/* Species A color: cool blue-cyan gradient */
+static const int    spa_ages[] = { 1,   5,   12,  25,  50,  80 };
+static const RGB spa_colors[] = {
+    { 20,  40, 200},   /* deep blue */
+    {  0, 100, 255},   /* blue */
+    {  0, 180, 255},   /* cyan-blue */
+    {100, 220, 255},   /* light cyan */
+    {180, 240, 255},   /* pale cyan */
+    {230, 250, 255},   /* near-white blue */
+};
+
+static RGB species_a_to_rgb(int age) {
+    if (age <= spa_ages[0]) return spa_colors[0];
+    if (age >= spa_ages[N_HEAT_STOPS - 1]) return spa_colors[N_HEAT_STOPS - 1];
+    for (int i = 0; i < N_HEAT_STOPS - 1; i++) {
+        if (age <= spa_ages[i + 1]) {
+            int a0 = spa_ages[i], a1 = spa_ages[i + 1];
+            float t = (float)(age - a0) / (float)(a1 - a0);
+            RGB c0 = spa_colors[i], c1 = spa_colors[i + 1];
+            RGB out;
+            out.r = (unsigned char)(c0.r + t * (c1.r - c0.r));
+            out.g = (unsigned char)(c0.g + t * (c1.g - c0.g));
+            out.b = (unsigned char)(c0.b + t * (c1.b - c0.b));
+            return out;
+        }
+    }
+    return spa_colors[N_HEAT_STOPS - 1];
+}
+
+/* Species B color: warm red-orange gradient */
+static const int    spb_ages[] = { 1,   5,   12,  25,  50,  80 };
+static const RGB spb_colors[] = {
+    {200,  20,  20},   /* deep red */
+    {255,  60,   0},   /* red-orange */
+    {255, 120,   0},   /* orange */
+    {255, 180,  40},   /* amber */
+    {255, 220, 100},   /* gold */
+    {255, 245, 220},   /* near-white warm */
+};
+
+static RGB species_b_to_rgb(int age) {
+    if (age <= spb_ages[0]) return spb_colors[0];
+    if (age >= spb_ages[N_HEAT_STOPS - 1]) return spb_colors[N_HEAT_STOPS - 1];
+    for (int i = 0; i < N_HEAT_STOPS - 1; i++) {
+        if (age <= spb_ages[i + 1]) {
+            int a0 = spb_ages[i], a1 = spb_ages[i + 1];
+            float t = (float)(age - a0) / (float)(a1 - a0);
+            RGB c0 = spb_colors[i], c1 = spb_colors[i + 1];
+            RGB out;
+            out.r = (unsigned char)(c0.r + t * (c1.r - c0.r));
+            out.g = (unsigned char)(c0.g + t * (c1.g - c0.g));
+            out.b = (unsigned char)(c0.b + t * (c1.b - c0.b));
+            return out;
+        }
+    }
+    return spb_colors[N_HEAT_STOPS - 1];
+}
+
 /* Ghost trail colors: fading gray/blue */
 static RGB ghost_to_rgb(int g) {
     /* g ranges from GHOST_FRAMES (just died, brightest) to 1 (about to vanish) */
@@ -1184,6 +1320,17 @@ static void save_state(void) {
         fputc(portals[i].active, f);
     }
 
+    /* Ecosystem data (appended for backward compat) */
+    fputc((unsigned char)ecosystem_mode, f);
+    if (ecosystem_mode) {
+        fwrite(species, 1, sizeof(species), f);
+        write_u16(f, species_a_birth);
+        write_u16(f, species_a_survival);
+        write_u16(f, species_b_birth);
+        write_u16(f, species_b_survival);
+        write_i32(f, (int)(interaction * 100.0f));
+    }
+
     fclose(f);
     char msg[80];
     snprintf(msg, sizeof(msg), "Saved %s", path);
@@ -1247,6 +1394,21 @@ static void load_state(int slot) {
         n_portals = 0;
     }
     portal_placing = 0;
+
+    /* Load ecosystem data if present (backward compat: may be at EOF) */
+    int eco = fgetc(f);
+    if (eco != EOF && eco > 0) {
+        ecosystem_mode = 1;
+        (void)!fread(species, 1, sizeof(species), f);
+        species_a_birth = read_u16(f);
+        species_a_survival = read_u16(f);
+        species_b_birth = read_u16(f);
+        species_b_survival = read_u16(f);
+        interaction = read_i32(f) / 100.0f;
+    } else {
+        ecosystem_mode = 0;
+        memset(species, 0, sizeof(species));
+    }
 
     fclose(f);
 
@@ -1479,6 +1641,7 @@ static void render_minimap(char **pp) {
             /* 4 subpixels: TL(sx0,sy0), TR(sx1,sy0), BL(sx0,sy1), BR(sx1,sy1) */
             int alive[4] = {0, 0, 0, 0};
             int border[4] = {0, 0, 0, 0};
+            int sp_q[4] = {0, 0, 0, 0}; /* species of first alive cell in quadrant */
             int spxs[4][2] = {{sx0,sy0},{sx1,sy0},{sx0,sy1},{sx1,sy1}};
 
             for (int q = 0; q < 4; q++) {
@@ -1499,7 +1662,10 @@ static void render_minimap(char **pp) {
 
                 for (int gy = gy0; gy < gy1 && !alive[q]; gy++)
                     for (int gx = gx0; gx < gx1 && !alive[q]; gx++) {
-                        if (grid[gy][gx] || (tracer_mode > 0 && tracer[gy][gx] > 10))
+                        if (grid[gy][gx]) {
+                            alive[q] = 1;
+                            if (ecosystem_mode) sp_q[q] = species[gy][gx];
+                        } else if (tracer_mode > 0 && tracer[gy][gx] > 10)
                             alive[q] = 1;
                         /* Show portal regions on minimap */
                         if (!alive[q] && n_portals > 0) {
@@ -1517,10 +1683,24 @@ static void render_minimap(char **pp) {
                 if (border[q]) any_border = 1;
             }
 
-            /* Color: yellow for viewport rect, dim green for cells, dark bg */
+            /* Color: yellow for viewport rect, species-colored or dim green for cells */
             if (any_border)
                 p += sprintf(p, "\033[93;48;2;20;20;30m");
-            else if (bits)
+            else if (bits && ecosystem_mode) {
+                /* Determine dominant species in this minimap cell */
+                int sa = 0, sb = 0;
+                for (int q = 0; q < 4; q++) {
+                    if (alive[q]) { if (sp_q[q] == 1) sa++; else if (sp_q[q] == 2) sb++; }
+                }
+                if (sa > 0 && sb > 0)
+                    p += sprintf(p, "\033[38;2;140;80;200;48;2;20;20;30m"); /* mixed: purple */
+                else if (sa > 0)
+                    p += sprintf(p, "\033[38;2;60;120;255;48;2;20;20;30m"); /* species A: blue */
+                else if (sb > 0)
+                    p += sprintf(p, "\033[38;2;255;80;40;48;2;20;20;30m");  /* species B: red */
+                else
+                    p += sprintf(p, "\033[38;2;0;140;0;48;2;20;20;30m");
+            } else if (bits)
                 p += sprintf(p, "\033[38;2;0;140;0;48;2;20;20;30m");
             else
                 p += sprintf(p, "\033[48;2;20;20;30m");
@@ -1892,7 +2072,12 @@ static int cell_color(int x, int y, RGB *out) {
     }
 
     if (grid[y][x]) {
-        if (heatmap_mode)
+        if (ecosystem_mode && species[y][x] > 0) {
+            if (species[y][x] == 1)
+                *out = species_a_to_rgb(grid[y][x]);
+            else
+                *out = species_b_to_rgb(grid[y][x]);
+        } else if (heatmap_mode)
             *out = age_to_rgb(grid[y][x]);
         else {
             /* flat green for non-heatmap */
@@ -2014,6 +2199,18 @@ static void render(int running, int speed_ms, int draw_mode) {
                  " \033[90m\xE2\x97\x8E%dP\033[0m", n_portals);
     }
 
+    /* Ecosystem mode indicator */
+    char eco_str[128] = "";
+    if (ecosystem_mode) {
+        const char *sp_name = (brush_species == 1) ? "A" : "B";
+        const char *sp_clr = (brush_species == 1) ? "38;2;60;120;255" : "38;2;255;80;40";
+        char int_sign = interaction >= 0 ? '+' : '-';
+        float int_abs = interaction >= 0 ? interaction : -interaction;
+        snprintf(eco_str, sizeof(eco_str),
+                 " \033[%sm\xe2\x97\x89" "ECO:%s %c%.1f\033[0m",
+                 sp_clr, sp_name, int_sign, int_abs);
+    }
+
     /* Zone mode indicator */
     char zone_str[80] = "";
     if (zone_mode) {
@@ -2041,10 +2238,10 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
                  state, wrap_str, draw_str, heat_str, tracer_str, freq_str, sym_str, zoom_str, map_str, zone_str,
-                 portal_str, emit_str, rule_display, generation, population, speed_ms);
+                 portal_str, emit_str, eco_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
     if (flash_active()) {
@@ -2068,7 +2265,8 @@ static void render(int running, int speed_ms, int draw_mode) {
     /* status bar line 2: compact help */
     p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
                      "[1-5]pre [d]draw [k]sym [g]graph [w]wrap [h]heat [T]trace [f]freq "
-                     "[/]rule [m]mut [b]edit [j]zone [e]emit [W]worm [z/x]zoom [n]map [<>]time [t]tbar "
+                     "[/]rule [m]mut [b]edit [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
+                     "[z/x]zoom [n]map [<>]time [t]tbar "
                      "C-s:save C-o:load [q]quit\033[0m\033[K\n");
 
     int usable_rows = term_rows - 3;
@@ -2543,6 +2741,29 @@ int main(void) {
         }
         else if (key == 'k' || key == 'K')
             symmetry = (symmetry + 1) % 4;
+        else if (key == 'a') {
+            ecosystem_mode = !ecosystem_mode;
+            if (ecosystem_mode) {
+                /* Assign existing live cells to species A by default */
+                for (int y = 0; y < H; y++)
+                    for (int x = 0; x < W; x++)
+                        if (grid[y][x] && species[y][x] == 0)
+                            species[y][x] = 1;
+            }
+            printf("\033[2J"); fflush(stdout);
+        }
+        else if (key == '6') {
+            if (ecosystem_mode)
+                brush_species = (brush_species == 1) ? 2 : 1;
+        }
+        else if (key == '{') {
+            interaction -= 0.1f;
+            if (interaction < -1.0f) interaction = -1.0f;
+        }
+        else if (key == '}') {
+            interaction += 0.1f;
+            if (interaction > 1.0f) interaction = 1.0f;
+        }
         else if (key == 'm' || key == 'M') {
             /* Mutate: randomly flip one bit in birth or survival mask (bits 0-8) */
             int which = rand() % 18; /* 0-8: birth bits, 9-17: survival bits */

@@ -15,6 +15,7 @@
  *   h           Toggle heatmap mode (age coloring + ghost trails)
  *   [ / ]       Cycle through rule presets (or zone brush in zone mode)
  *   m           Mutate — randomly flip one birth/survival bit
+ *   b           Toggle rule editor overlay (click B/S bits or preset names)
  *   k           Cycle symmetry: none → 2-fold → 4-fold → 8-fold (kaleidoscope)
  *   j           Toggle zone-paint mode (paint regions with different rulesets)
  *   e           Toggle emitter/absorber mode (left=emitter, right=absorber, middle=remove)
@@ -75,6 +76,12 @@ static int show_minimap = 1; /* minimap overlay when zoomed */
 static int zone_mode = 0; /* 0=off, 1=zone-paint mode */
 static int zone_brush = 0; /* which ruleset to paint in zone mode */
 static int zone_enabled = 0; /* whether per-cell zones are active */
+static int rule_editor = 0; /* 0=off, 1=rule editor overlay visible */
+
+/* Rule editor overlay geometry (computed at render time) */
+static int re_col0, re_row0; /* top-left corner (1-based terminal coords) */
+#define RE_WIDTH 40
+#define RE_HEIGHT 6
 
 /* Forward declarations for emitter/absorber use */
 static void grid_set(int x, int y);
@@ -1328,6 +1335,157 @@ static void render_timeline_bar(char **pp, int width) {
     *pp = p;
 }
 
+/* ── Rule editor overlay ───────────────────────────────────────────────────── */
+
+/* Check if a mouse click hits a B/S bit in the rule editor overlay.
+ * Returns 1 if handled (bit toggled), 0 otherwise. */
+static int rule_editor_click(int mx, int my) {
+    if (!rule_editor) return 0;
+
+    /* Birth row is at re_row0+1, Survive row at re_row0+2 (1-based terminal coords) */
+    int birth_row = re_row0 + 1;
+    int surv_row = re_row0 + 2;
+
+    if (my != birth_row && my != surv_row) return 0;
+
+    /* Layout: │ + " Birth:   " = 11 visible cols before first digit.
+     * Each digit takes 2 cols (digit char + space). */
+    int rel_x = mx - re_col0;
+    if (rel_x < 11 || rel_x >= 11 + 9 * 2) return 0;
+
+    int digit = (rel_x - 11) / 2;
+    if (digit < 0 || digit > 8) return 0;
+
+    if (my == birth_row) {
+        birth_mask ^= (1 << digit);
+    } else {
+        survival_mask ^= (1 << digit);
+    }
+    return 1;
+}
+
+/* Check if click hits a preset name in the rule editor.
+ * Presets are listed on rows re_row0+4 and re_row0+5 */
+static int rule_editor_preset_click(int mx, int my) {
+    if (!rule_editor) return 0;
+
+    /* Row re_row0+4: first 5 presets, row re_row0+5: next 5 */
+    int row1 = re_row0 + 4;
+    int row2 = re_row0 + 5;
+    if (my != row1 && my != row2) return 0;
+
+    /* Layout: │ + space = 2 cols before presets. Each preset name is %-7s = 7 chars */
+    int rel_x = mx - re_col0 - 2;
+    if (rel_x < 0 || rel_x >= 5 * 7) return 0;
+
+    int base = (my == row1) ? 0 : 5;
+    int preset = base + rel_x / 7;
+    if (preset < 0 || preset >= N_RULESETS) return 0;
+
+    birth_mask = rulesets[preset].birth;
+    survival_mask = rulesets[preset].survival;
+    current_ruleset = preset;
+    return 1;
+}
+
+static void render_rule_editor(char **pp) {
+    if (!rule_editor) return;
+    char *p = *pp;
+
+    /* Position: centered, starting at row 4 (below 2-line status bar + 1 grid row) */
+    re_col0 = (term_cols - RE_WIDTH) / 2;
+    if (re_col0 < 1) re_col0 = 1;
+    re_row0 = 4;
+
+    /* Style strings */
+    const char *bdr = "\033[38;2;120;140;200;48;2;15;15;25m";
+    const char *bg  = "\033[48;2;15;15;25m";
+    const char *dim = "\033[90;48;2;15;15;25m";
+    const char *rst = "\033[0m";
+    int right_col = re_col0 + RE_WIDTH - 1; /* column for right │ */
+
+    /* Helper macro: fill background to right border, then draw │ */
+    #define RE_CLOSE_ROW(row) do { \
+        p += sprintf(p, "%s", bg); \
+        for (int _c = 0; _c < 12; _c++) *p++ = ' '; /* generous padding */ \
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s", (row), right_col, bdr, rst); \
+    } while(0)
+
+    /* ── Top border ── */
+    p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 Rule Editor ", re_row0, re_col0, bdr);
+    for (int i = 0; i < RE_WIDTH - 16; i++) {
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80';
+    }
+    *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+    p += sprintf(p, "%s", rst);
+
+    /* ── Birth row (row+1) ── */
+    p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s", re_row0 + 1, re_col0, bdr, bg);
+    p += sprintf(p, " \033[97;48;2;15;15;25mBirth:   ");
+    for (int i = 0; i <= 8; i++) {
+        if (birth_mask & (1 << i))
+            p += sprintf(p, "\033[97;48;2;60;120;60m%d%s ", i, bg);
+        else
+            p += sprintf(p, "%s%d%s ", dim, i, bg);
+    }
+    RE_CLOSE_ROW(re_row0 + 1);
+
+    /* ── Survive row (row+2) ── */
+    p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s", re_row0 + 2, re_col0, bdr, bg);
+    p += sprintf(p, " \033[97;48;2;15;15;25mSurvive: ");
+    for (int i = 0; i <= 8; i++) {
+        if (survival_mask & (1 << i))
+            p += sprintf(p, "\033[97;48;2;60;60;120m%d%s ", i, bg);
+        else
+            p += sprintf(p, "%s%d%s ", dim, i, bg);
+    }
+    RE_CLOSE_ROW(re_row0 + 2);
+
+    /* ── Rule display row (row+3) ── */
+    char rule_str[32];
+    rule_to_string(rule_str, sizeof(rule_str));
+    int rs = find_matching_ruleset();
+
+    p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s", re_row0 + 3, re_col0, bdr, bg);
+    if (rs >= 0)
+        p += sprintf(p, " \033[95;48;2;15;15;25m%s \033[93;48;2;15;15;25m%s",
+                     rule_str, rulesets[rs].name);
+    else
+        p += sprintf(p, " \033[95;48;2;15;15;25m%s \033[33;48;2;15;15;25m(mutant)",
+                     rule_str);
+    RE_CLOSE_ROW(re_row0 + 3);
+
+    /* ── Preset rows (row+4, row+5) ── */
+    for (int row = 0; row < 2; row++) {
+        int base = row * 5;
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s ",
+                     re_row0 + 4 + row, re_col0, bdr, bg);
+        for (int i = base; i < base + 5 && i < N_RULESETS; i++) {
+            int is_cur = (rulesets[i].birth == birth_mask &&
+                          rulesets[i].survival == survival_mask);
+            if (is_cur)
+                p += sprintf(p, "\033[97;48;2;50;50;80m%-7s%s", rulesets[i].name, bg);
+            else {
+                RGB zc = zone_colors[i];
+                p += sprintf(p, "\033[38;2;%d;%d;%d;48;2;15;15;25m%-7s%s",
+                             zc.r, zc.g, zc.b, rulesets[i].name, bg);
+            }
+        }
+        RE_CLOSE_ROW(re_row0 + 4 + row);
+    }
+
+    /* ── Bottom border ── */
+    p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", re_row0 + 6, re_col0, bdr);
+    for (int i = 0; i < RE_WIDTH - 2; i++) {
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80';
+    }
+    *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+    p += sprintf(p, "%s", rst);
+
+    #undef RE_CLOSE_ROW
+    *pp = p;
+}
+
 /* ── Rendering ─────────────────────────────────────────────────────────────── */
 
 /* Larger buffer for true-color escape sequences */
@@ -1511,7 +1669,7 @@ static void render(int running, int speed_ms, int draw_mode) {
     /* status bar line 2: compact help */
     p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
                      "[1-5]pre [d]draw [k]sym [g]graph [w]wrap [h]heat "
-                     "[/]rule [m]mut [j]zone [e]emit [z/x]zoom [n]map [<>]time [t]tbar "
+                     "[/]rule [m]mut [b]edit [j]zone [e]emit [z/x]zoom [n]map [<>]time [t]tbar "
                      "C-s:save C-o:load [q]quit\033[0m\033[K\n");
 
     int usable_rows = term_rows - 3;
@@ -1690,6 +1848,9 @@ static void render(int running, int speed_ms, int draw_mode) {
 
     /* Minimap overlay (only when zoomed) */
     render_minimap(&p);
+
+    /* Rule editor overlay */
+    render_rule_editor(&p);
 
     *p = '\0';
 
@@ -1901,6 +2062,9 @@ int main(void) {
             }
             printf("\033[2J"); fflush(stdout);
         }
+        else if (key == 'b' || key == 'B') {
+            rule_editor = !rule_editor;
+        }
         else if (key == 'k' || key == 'K')
             symmetry = (symmetry + 1) % 4;
         else if (key == 'm' || key == 'M') {
@@ -1948,6 +2112,12 @@ int main(void) {
         else if (key == KEY_MOUSE) {
             MouseEvent *m = &last_mouse;
             int btn = m->button & 0x43;
+
+            /* Rule editor click handling (intercept before grid) */
+            if (rule_editor && m->type == 1 && (btn & 0x03) == 0) {
+                if (rule_editor_click(m->x, m->y) || rule_editor_preset_click(m->x, m->y))
+                    goto mouse_done;
+            }
 
             /* Scroll wheel: in emit mode adjusts absorb radius; otherwise zoom */
             if (emit_mode && m->type == 1 && (btn == 64 || btn == 65)) {
@@ -2042,6 +2212,7 @@ int main(void) {
                     }
                 }
             }
+            mouse_done: ;
         }
 
         long long now = now_ms();

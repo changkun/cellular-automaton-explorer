@@ -28,6 +28,7 @@ Requires only `gcc` and a POSIX terminal.
 | `h` | Toggle heatmap mode (age coloring + ghost trails) |
 | `[` / `]` | Cycle through rule presets (or zone brush in zone mode) |
 | `m` | Mutate — randomly flip one birth/survival bit |
+| `b` | Toggle rule editor overlay (click B/S bits or preset names) |
 | `j` | Toggle zone-paint mode (paint regions with different rulesets) |
 | `k` | Cycle symmetry: none → 2-fold → 4-fold → 8-fold (kaleidoscope) |
 | `z` / `x` | Zoom in / out (1x → 2x half-block → 4x quarter-block) |
@@ -79,6 +80,19 @@ Requires only `gcc` and a POSIX terminal.
 Press `m` to mutate any ruleset — randomly flips one birth or survival bit,
 creating hybrid rules that may exhibit entirely novel behavior. The status bar
 shows `(mutant)` when the active rule doesn't match any preset.
+
+### Interactive Rule Editor
+
+Press `b` to open the **rule editor overlay** — a visual panel where you can click
+individual birth and survival bits to toggle them on/off. Click any preset name
+to load it instantly. The simulation continues running underneath, so you see
+the effect of each change in real time.
+
+- **Birth row**: Click digits 0–8 to toggle which neighbor counts cause cell birth
+- **Survive row**: Click digits 0–8 to toggle which neighbor counts let cells survive
+- **Presets**: Click any of the 10 preset names to load that ruleset
+- Active bits are highlighted (green for birth, blue for survival)
+- Combined with zone-paint mode, design exact rules then paint them into regions
 
 ## Multi-Rule Zones
 

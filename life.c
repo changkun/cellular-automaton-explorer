@@ -50,6 +50,7 @@
  *                 +/- adjust brush temperature, {/} adjust global temperature
  *                 [/] adjust brush radius
  *   u           Toggle 2D Fourier spectrum analyzer (spatial frequency analysis)
+ *   F           Toggle box-counting fractal dimension analyzer
  *   Ctrl-E      Export current grid as RLE file (auto-numbered export_NNN.rle)
  *   Arrow keys  Pan viewport across the full 400×200 grid
  *   0           Re-center viewport on grid center
@@ -155,6 +156,23 @@ static float fourier_radial_max = 0.0f;          /* max radial bin value */
 /* FFT workspace — static to avoid stack overflow */
 static float fft_re[FFT_H][FFT_W];
 static float fft_im[FFT_H][FFT_W];
+
+/* ── Box-Counting Fractal Dimension ───────────────────────────────────────── */
+/* Estimate fractal dimension D_box via box-counting: cover the grid with boxes
+   of size ε = 2,4,8,16,32,64,128 and count N(ε) = occupied boxes at each scale.
+   D_box = -slope of log(N) vs log(ε) regression.  Per-cell overlay shows which
+   scale contributes most structural detail (finest occupied scale). */
+#define FRACTAL_N_SCALES 7  /* ε = 2,4,8,16,32,64,128 */
+
+static float fractal_grid[MAX_H][MAX_W];  /* per-cell finest scale (normalized 0–1) */
+static int   fractal_mode = 0;            /* 0=off, 1=on */
+static int   fractal_stale = 1;           /* 1=needs recomputation */
+static float fractal_dbox = 0.0f;         /* estimated fractal dimension */
+static float fractal_r2 = 0.0f;           /* R² goodness of fit */
+static int   fractal_n_boxes[FRACTAL_N_SCALES];  /* N(ε) per scale */
+static float fractal_log_eps[FRACTAL_N_SCALES];  /* log(ε) per scale */
+static float fractal_log_n[FRACTAL_N_SCALES];    /* log(N(ε)) per scale */
+static int   fractal_total_alive = 0;     /* total alive cells */
 
 /* ── Pattern Census ───────────────────────────────────────────────────────── */
 static int census_mode = 0;    /* 0=off, 1=on */
@@ -1028,6 +1046,7 @@ static void grid_step(void) {
     entropy_stale = 1;
     lyapunov_stale = 1;
     fourier_stale = 1;
+    fractal_stale = 1;
 }
 
 /* ── Census scan implementation ───────────────────────────────────────────── */
@@ -2601,6 +2620,174 @@ static void fourier_compute(void) {
     fourier_stale = 0;
 }
 
+/* ── Box-Counting Fractal Dimension computation ───────────────────────────── */
+
+/* Map fractal scale value (0.0–1.0) to RGB:
+   deep purple (coarse) → teal (mid) → gold (fine-scale detail) → white (peak) */
+static RGB fractal_to_rgb(float v) {
+    if (v <= 0.0f) return (RGB){8, 4, 16};
+    if (v >= 1.0f) return (RGB){255, 250, 220};
+    if (v < 0.33f) {
+        float t = v / 0.33f;
+        return (RGB){(unsigned char)(8 + t * 42),
+                     (unsigned char)(4 + t * 100),
+                     (unsigned char)(16 + t * 104)};  /* purple → teal */
+    }
+    if (v < 0.66f) {
+        float t = (v - 0.33f) / 0.33f;
+        return (RGB){(unsigned char)(50 + t * 180),
+                     (unsigned char)(104 + t * 96),
+                     (unsigned char)(120 - t * 80)};  /* teal → gold */
+    }
+    float t = (v - 0.66f) / 0.34f;
+    return (RGB){(unsigned char)(230 + t * 25),
+                 (unsigned char)(200 + t * 50),
+                 (unsigned char)(40 + t * 180)};       /* gold → white */
+}
+
+static void fractal_compute(void) {
+    static const int box_sizes[FRACTAL_N_SCALES] = {2, 4, 8, 16, 32, 64, 128};
+
+    memset(fractal_grid, 0, sizeof(fractal_grid));
+    fractal_total_alive = 0;
+
+    /* Count total alive cells */
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++)
+            if (grid[y][x]) fractal_total_alive++;
+
+    if (fractal_total_alive == 0) {
+        fractal_dbox = 0.0f;
+        fractal_r2 = 0.0f;
+        memset(fractal_n_boxes, 0, sizeof(fractal_n_boxes));
+        fractal_stale = 0;
+        return;
+    }
+
+    /* For each scale, count occupied boxes and record per-cell finest occupied scale */
+    for (int s = 0; s < FRACTAL_N_SCALES; s++) {
+        int eps = box_sizes[s];
+        int nboxes = 0;
+        int bx_count = (W + eps - 1) / eps;
+        int by_count = (H + eps - 1) / eps;
+
+        for (int by = 0; by < by_count; by++) {
+            for (int bx = 0; bx < bx_count; bx++) {
+                int occupied = 0;
+                int y0 = by * eps, y1 = y0 + eps;
+                int x0 = bx * eps, x1 = x0 + eps;
+                if (y1 > H) y1 = H;
+                if (x1 > W) x1 = W;
+                for (int y = y0; y < y1 && !occupied; y++)
+                    for (int x = x0; x < x1 && !occupied; x++)
+                        if (grid[y][x]) occupied = 1;
+                if (occupied) {
+                    nboxes++;
+                    /* For the finest scale (s=0 is finest), mark cells */
+                    if (s == 0) {
+                        /* At the finest scale, all alive cells in this box
+                           get a baseline detail value */
+                        for (int y = y0; y < y1; y++)
+                            for (int x = x0; x < x1; x++)
+                                if (grid[y][x])
+                                    fractal_grid[y][x] = 1.0f;
+                    }
+                }
+            }
+        }
+        fractal_n_boxes[s] = nboxes;
+        fractal_log_eps[s] = logf((float)eps);
+        fractal_log_n[s] = (nboxes > 0) ? logf((float)nboxes) : 0.0f;
+    }
+
+    /* Per-cell overlay: show "structural detail" — cells that exist at fine
+       scales near the structure boundary get higher values.  We use scale isolation:
+       at each scale, mark cells near boundary boxes (adjacent box occupied vs not). */
+    /* Simple approach: density ratio at each scale → cells in sparse regions
+       (low local density at coarse scale) are structurally interesting */
+    for (int s = 0; s < FRACTAL_N_SCALES; s++) {
+        int eps = box_sizes[s];
+        int bx_count = (W + eps - 1) / eps;
+        int by_count = (H + eps - 1) / eps;
+
+        for (int by = 0; by < by_count; by++) {
+            for (int bx = 0; bx < bx_count; bx++) {
+                int y0 = by * eps, y1 = y0 + eps;
+                int x0 = bx * eps, x1 = x0 + eps;
+                if (y1 > H) y1 = H;
+                if (x1 > W) x1 = W;
+
+                /* Count alive in this box */
+                int alive = 0, total = (y1 - y0) * (x1 - x0);
+                for (int y = y0; y < y1; y++)
+                    for (int x = x0; x < x1; x++)
+                        if (grid[y][x]) alive++;
+
+                if (alive > 0 && total > 0) {
+                    /* Sparseness at this scale: lower fill ratio = more fractal detail */
+                    float fill = (float)alive / (float)total;
+                    float detail = (1.0f - fill) * (1.0f - (float)s / (float)FRACTAL_N_SCALES);
+                    /* Boost cells in partially filled coarse boxes */
+                    for (int y = y0; y < y1; y++)
+                        for (int x = x0; x < x1; x++)
+                            if (grid[y][x] && detail > fractal_grid[y][x])
+                                fractal_grid[y][x] = detail;
+                }
+            }
+        }
+    }
+
+    /* Normalize fractal_grid to 0–1 */
+    float fmax = 0.001f;
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++)
+            if (fractal_grid[y][x] > fmax) fmax = fractal_grid[y][x];
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++)
+            fractal_grid[y][x] /= fmax;
+
+    /* Linear regression: log(N) = a + b * log(ε),  D_box = -b */
+    float sum_x = 0, sum_y = 0, sum_xx = 0, sum_xy = 0;
+    int n_valid = 0;
+    for (int s = 0; s < FRACTAL_N_SCALES; s++) {
+        if (fractal_n_boxes[s] > 0) {
+            sum_x += fractal_log_eps[s];
+            sum_y += fractal_log_n[s];
+            sum_xx += fractal_log_eps[s] * fractal_log_eps[s];
+            sum_xy += fractal_log_eps[s] * fractal_log_n[s];
+            n_valid++;
+        }
+    }
+    if (n_valid >= 2) {
+        float denom = n_valid * sum_xx - sum_x * sum_x;
+        if (denom > 0.0001f) {
+            float slope = (n_valid * sum_xy - sum_x * sum_y) / denom;
+            float intercept = (sum_y - slope * sum_x) / n_valid;
+            fractal_dbox = -slope;
+
+            /* R² computation */
+            float mean_y = sum_y / n_valid;
+            float ss_tot = 0, ss_res = 0;
+            for (int s = 0; s < FRACTAL_N_SCALES; s++) {
+                if (fractal_n_boxes[s] > 0) {
+                    float pred = intercept + slope * fractal_log_eps[s];
+                    ss_res += (fractal_log_n[s] - pred) * (fractal_log_n[s] - pred);
+                    ss_tot += (fractal_log_n[s] - mean_y) * (fractal_log_n[s] - mean_y);
+                }
+            }
+            fractal_r2 = (ss_tot > 0.0001f) ? (1.0f - ss_res / ss_tot) : 1.0f;
+        } else {
+            fractal_dbox = 0.0f;
+            fractal_r2 = 0.0f;
+        }
+    } else {
+        fractal_dbox = 0.0f;
+        fractal_r2 = 0.0f;
+    }
+
+    fractal_stale = 0;
+}
+
 /* ── Save / Load (.life files) ─────────────────────────────────────────────── */
 
 /*
@@ -3922,6 +4109,21 @@ static int cell_color(int x, int y, RGB *out) {
         return 0;
     }
 
+    /* Fractal dimension overlay: box-counting detail per cell */
+    if (fractal_mode) {
+        float fv = fractal_grid[y][x];
+        if (fv > 0.005f || grid[y][x]) {
+            *out = fractal_to_rgb(fv);
+            if (grid[y][x]) {
+                out->r = (unsigned char)(out->r < 220 ? out->r + 35 : 255);
+                out->g = (unsigned char)(out->g < 220 ? out->g + 35 : 255);
+                out->b = (unsigned char)(out->b < 220 ? out->b + 35 : 255);
+            }
+            return grid[y][x] ? 1 : 13; /* 13 = fractal ghost */
+        }
+        return 0;
+    }
+
     /* Temperature field overlay: show thermal landscape as blue→red wash */
     if (temp_mode) {
         float t = temp_global + temp_grid[y][x];
@@ -4072,6 +4274,12 @@ static void render(int running, int speed_ms, int draw_mode) {
                  " \033[38;2;80;200;255m\xe2\x89\x88" "FFT:\xce\xbb%.1f\033[0m",
                  fourier_dominant_wl);
 
+    /* Fractal dimension indicator */
+    char fractal_str[96] = "";
+    if (fractal_mode)
+        snprintf(fractal_str, sizeof(fractal_str),
+                 " \033[38;2;230;200;40mD\xe2\x82\x93=%.3f\033[0m", fractal_dbox);
+
     /* Census indicator */
     char census_str[64] = "";
     if (census_mode)
@@ -4198,9 +4406,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, census_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
+                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, census_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -5152,6 +5360,188 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", frst);
     }
 
+    /* ── Box-Counting Fractal Dimension overlay panel ────────────────────── */
+    if (fractal_mode) {
+        int fd_w = 44;
+        int fd_col = term_cols - fd_w - 2;
+        /* Stack below other active panels */
+        int fd_row = 3;
+        if (entropy_mode) fd_row += 8;
+        if (temp_mode)    fd_row += 9;
+        if (lyapunov_mode) fd_row += 8;
+        if (fourier_mode) fd_row += 18;
+        if (fd_col < 1) fd_col = 1;
+
+        const char *fdbdr = "\033[38;2;230;200;40;48;2;8;8;4m";
+        const char *fdbg  = "\033[48;2;8;8;4m";
+        const char *fdrst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 Fractal D\xe2\x82\x93 ",
+                     fd_row, fd_col, fdbdr);
+        for (int i = 14; i < fd_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", fdrst);
+
+        /* Row 1: D_box value + R² + alive count */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     fd_row + 1, fd_col, fdbdr, fdbg);
+        p += sprintf(p, " \033[38;2;230;200;40mD\xe2\x82\x93=\033[38;2;255;255;200m%.4f"
+                     "  \033[38;2;230;200;40mR\xc2\xb2=\033[38;2;255;255;200m%.3f"
+                     "  \033[38;2;120;120;80mn=\033[38;2;180;180;140m%d",
+                     fractal_dbox, fractal_r2, fractal_total_alive);
+        /* Pad */
+        {
+            /* Approximate chars used: D₀=X.XXXX  R²=X.XXX  n=XXXXX = ~35 */
+            int used = 35;
+            for (int i = used; i < fd_w - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", fdbdr, fdrst);
+
+        /* Row 2: Interpretation */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     fd_row + 2, fd_col, fdbdr, fdbg);
+        const char *interp;
+        if (fractal_dbox < 0.5f)       interp = "sparse / scattered";
+        else if (fractal_dbox < 1.0f)  interp = "line-like structures";
+        else if (fractal_dbox < 1.3f)  interp = "thin fractal / filaments";
+        else if (fractal_dbox < 1.6f)  interp = "moderate fractal complexity";
+        else if (fractal_dbox < 1.8f)  interp = "rich fractal structure";
+        else                           interp = "space-filling / dense";
+        p += sprintf(p, " \033[38;2;180;160;60m%s", interp);
+        {
+            int slen = (int)strlen(interp);
+            for (int i = slen + 1; i < fd_w - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", fdbdr, fdrst);
+
+        /* Row 3: Log-log plot header */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     fd_row + 3, fd_col, fdbdr, fdbg);
+        p += sprintf(p, " \033[38;2;140;130;50mlog(\xce\xb5)");
+        for (int i = 0; i < 10; i++) *p++ = ' ';
+        p += sprintf(p, "\033[38;2;140;130;50mlog(N) vs log(\xce\xb5)");
+        for (int i = 0; i < 4; i++) *p++ = ' ';
+        p += sprintf(p, "%s\xe2\x94\x82%s", fdbdr, fdrst);
+
+        /* Rows 4-7: Log-log scatter plot (4 rows high, 40 cols wide) */
+        /* Find range of log values for plotting */
+        float lx_min = 1e9f, lx_max = -1e9f, ly_min = 1e9f, ly_max = -1e9f;
+        for (int s = 0; s < FRACTAL_N_SCALES; s++) {
+            if (fractal_n_boxes[s] > 0) {
+                if (fractal_log_eps[s] < lx_min) lx_min = fractal_log_eps[s];
+                if (fractal_log_eps[s] > lx_max) lx_max = fractal_log_eps[s];
+                if (fractal_log_n[s] < ly_min) ly_min = fractal_log_n[s];
+                if (fractal_log_n[s] > ly_max) ly_max = fractal_log_n[s];
+            }
+        }
+        if (lx_max <= lx_min) { lx_min = 0; lx_max = 5; }
+        if (ly_max <= ly_min) { ly_min = 0; ly_max = 12; }
+        /* Add small margin */
+        float lx_range = lx_max - lx_min;
+        float ly_range = ly_max - ly_min;
+        if (lx_range < 0.1f) lx_range = 0.1f;
+        if (ly_range < 0.1f) ly_range = 0.1f;
+
+        for (int row = 0; row < 4; row++) {
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s ",
+                         fd_row + 4 + row, fd_col, fdbdr, fdbg);
+            /* Rasterize: 40 × 4 plot area */
+            char plot_chars[40];
+            memset(plot_chars, 0, sizeof(plot_chars));
+
+            /* Plot regression line */
+            for (int px = 0; px < 40; px++) {
+                float lx = lx_min + (float)px / 39.0f * lx_range;
+                /* predicted: log(N) = log(N_intercept) - D_box * log(eps) */
+                /* Use regression: y = sum_y/n + slope * (x - sum_x/n) */
+                float pred_ly = ly_max - fractal_dbox * (lx - lx_min);
+                /* Actually use proper regression */
+                int n_valid = 0;
+                float sx = 0, sy2 = 0;
+                for (int s = 0; s < FRACTAL_N_SCALES; s++)
+                    if (fractal_n_boxes[s] > 0) { sx += fractal_log_eps[s]; sy2 += fractal_log_n[s]; n_valid++; }
+                float mean_lx = n_valid > 0 ? sx / n_valid : 0;
+                float mean_ly = n_valid > 0 ? sy2 / n_valid : 0;
+                float pred = mean_ly + (-fractal_dbox) * (lx - mean_lx);
+                int py = (int)((pred - ly_min) / ly_range * 3.0f);
+                py = 3 - py; /* invert: row 0 is top */
+                if (py == row && px >= 0 && px < 40)
+                    plot_chars[px] = 1; /* regression line */
+            }
+
+            /* Plot data points */
+            for (int s = 0; s < FRACTAL_N_SCALES; s++) {
+                if (fractal_n_boxes[s] > 0) {
+                    int px = (int)((fractal_log_eps[s] - lx_min) / lx_range * 39.0f);
+                    int py = (int)((fractal_log_n[s] - ly_min) / ly_range * 3.0f);
+                    py = 3 - py;
+                    if (px >= 0 && px < 40 && py == row)
+                        plot_chars[px] = 2; /* data point */
+                }
+            }
+
+            for (int px = 0; px < 40; px++) {
+                if (plot_chars[px] == 2) {
+                    /* Data point: bright gold */
+                    p += sprintf(p, "\033[38;2;255;220;60m\xe2\x97\x8f");
+                } else if (plot_chars[px] == 1) {
+                    /* Regression line: dim teal */
+                    p += sprintf(p, "\033[38;2;60;120;100m\xe2\x94\x80");
+                } else {
+                    /* Empty: dot grid */
+                    p += sprintf(p, "\033[38;2;30;28;16m\xc2\xb7");
+                }
+            }
+            *p++ = ' ';
+            p += sprintf(p, "%s\xe2\x94\x82%s", fdbdr, fdrst);
+        }
+
+        /* Row 8: Scale legend (ε values) */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     fd_row + 8, fd_col, fdbdr, fdbg);
+        p += sprintf(p, " \033[38;2;120;110;50m\xce\xb5: ");
+        {
+            static const int box_sizes[FRACTAL_N_SCALES] = {2, 4, 8, 16, 32, 64, 128};
+            for (int s = 0; s < FRACTAL_N_SCALES; s++) {
+                p += sprintf(p, "%d", box_sizes[s]);
+                if (s < FRACTAL_N_SCALES - 1) *p++ = ' ';
+            }
+        }
+        /* Pad remaining */
+        {
+            int used = 4 + 3 + 2 + 2 + 3 + 3 + 3 + 4 + 6; /* approximate "ε: 2 4 8 16 32 64 128" */
+            for (int i = used; i < fd_w - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", fdbdr, fdrst);
+
+        /* Row 9: N(ε) values as horizontal bar chart summary */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     fd_row + 9, fd_col, fdbdr, fdbg);
+        p += sprintf(p, " \033[38;2;120;110;50mN: ");
+        {
+            for (int s = 0; s < FRACTAL_N_SCALES; s++) {
+                int nb = fractal_n_boxes[s];
+                if (nb > 9999)
+                    p += sprintf(p, "\033[38;2;200;180;80m%dk", nb / 1000);
+                else
+                    p += sprintf(p, "\033[38;2;200;180;80m%d", nb);
+                if (s < FRACTAL_N_SCALES - 1) *p++ = ' ';
+            }
+        }
+        {
+            int used = 38; /* approximate */
+            for (int i = used; i < fd_w - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", fdbdr, fdrst);
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", fd_row + 10, fd_col, fdbdr);
+        for (int i = 0; i < fd_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", fdrst);
+    }
+
     /* ── Population Dynamics Dashboard overlay ─────────────────────────────── */
     if (dashboard_mode && hist_count > 1) {
         int db_w = 62;      /* panel width */
@@ -5613,6 +6003,12 @@ int main(int argc, char **argv) {
                 fourier_compute(); /* compute on toggle-on */
             }
         }
+        else if (key == 'F') {
+            fractal_mode = !fractal_mode;
+            if (fractal_mode) {
+                fractal_compute(); /* compute on toggle-on */
+            }
+        }
         else if (key == ']') {
             if (temp_mode) {
                 temp_brush_radius = temp_brush_radius < 20 ? temp_brush_radius + 1 : 20;
@@ -6013,6 +6409,11 @@ int main(int argc, char **argv) {
         /* Auto-refresh Fourier spectrum every 8 generations (2D FFT on padded grid) */
         if (fourier_mode && fourier_stale && (generation % 8 == 0 || !running)) {
             fourier_compute();
+        }
+
+        /* Auto-refresh fractal dimension every 8 generations (box-counting over 7 scales) */
+        if (fractal_mode && fractal_stale && (generation % 8 == 0 || !running)) {
+            fractal_compute();
         }
 
         render(running, speed_ms, draw_mode);

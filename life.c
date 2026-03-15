@@ -132,14 +132,104 @@ static const CensusPattern census_patterns[CENSUS_MAX_PAT] = {
 static int census_counts[CENSUS_MAX_PAT]; /* raw counts per pattern template */
 
 /* Deduplicated counts for display (merge both phases of same oscillator) */
-#define CENSUS_DISPLAY_MAX 10
-static struct { const char *name; int count; } census_display[CENSUS_DISPLAY_MAX];
+#define CENSUS_DISPLAY_MAX 16
+static struct { const char *name; int count; int type; /* 0=still,1=osc,2=ship */ } census_display[CENSUS_DISPLAY_MAX];
 static int census_n_display = 0;
 static int census_total = 0; /* total identified structures */
 static int census_unmatched = 0; /* live cells not part of any recognized pattern */
 
 /* Temporary grid to mark already-claimed cells during census scan */
 static unsigned char census_claimed[MAX_H][MAX_W];
+
+/* ── Spaceship / Glider Detection ────────────────────────────────────────── */
+/* Detect moving structures by matching a known template at (x,y) in frame N,
+   then confirming it shifted by the expected displacement in frame N+1.
+   Each spaceship "class" has multiple phases and a displacement per full cycle. */
+
+#define SHIP_MAX_W 7
+#define SHIP_MAX_H 5
+#define SHIP_MAX_PHASES 4
+#define SHIP_MAX_TYPES 4
+
+typedef struct {
+    int w, h;
+    unsigned char bits[SHIP_MAX_H][SHIP_MAX_W];
+} ShipPhase;
+
+typedef struct {
+    const char *name;
+    int n_phases;           /* number of phases in one full cycle */
+    int dx, dy;             /* displacement per full cycle (phase 0 → phase 0) */
+    ShipPhase phases[SHIP_MAX_PHASES];
+} ShipType;
+
+/* Glider: 4 phases, moves (1,1) per full cycle (SE direction as canonical) */
+static const ShipType ship_types[SHIP_MAX_TYPES] = {
+    { "Glider", 4, 1, 1, {
+        { 3, 3, {{0,1,0},{0,0,1},{1,1,1}} },           /* phase 0 */
+        { 3, 3, {{1,0,1},{0,1,1},{0,1,0}} },           /* phase 1 (after 1 gen) */
+        { 3, 3, {{0,0,1},{1,0,1},{0,1,1}} },           /* phase 2 */
+        { 3, 3, {{1,0,0},{0,1,1},{1,1,0}} },           /* phase 3 — next gen is phase 0 at (+1,+1) */
+    }},
+    /* LWSS: 4 phases, moves (2,0) per full cycle (E direction canonical) */
+    { "LWSS", 4, 2, 0, {
+        { 5, 4, {{0,1,0,0,1},{1,0,0,0,0},{1,0,0,0,1},{1,1,1,1,0}} },
+        { 5, 4, {{1,1,0,0,0},{0,0,0,0,0},{1,0,0,1,0},{0,1,1,1,1}} },
+        { 5, 4, {{0,0,1,0,0},{1,0,0,0,0},{0,0,0,0,1},{0,1,1,1,1}} },
+        { 5, 4, {{1,0,0,1,0},{0,0,0,0,1},{0,0,0,0,1},{0,1,1,1,1}} },
+    }},
+    /* MWSS: 4 phases, moves (2,0) per cycle */
+    { "MWSS", 4, 2, 0, {
+        { 6, 5, {{0,0,1,0,0,0},{1,0,0,0,1,0},{0,0,0,0,0,1},{1,0,0,0,0,1},{0,1,1,1,1,1}} },
+        { 6, 5, {{0,0,0,0,0,0},{0,1,1,0,0,0},{1,0,0,0,0,0},{1,0,0,0,1,0},{0,1,1,1,1,1}} },
+        { 6, 5, {{0,0,0,1,0,0},{0,0,0,0,0,0},{1,0,0,0,0,0},{0,0,0,0,0,1},{0,1,1,1,1,1}} },
+        { 6, 5, {{0,0,0,0,0,0},{0,1,0,0,1,0},{0,0,0,0,0,1},{0,0,0,0,0,1},{0,1,1,1,1,1}} },
+    }},
+    /* HWSS: 4 phases, moves (2,0) per cycle */
+    { "HWSS", 4, 2, 0, {
+        { 7, 5, {{0,0,1,1,0,0,0},{1,0,0,0,0,1,0},{0,0,0,0,0,0,1},{1,0,0,0,0,0,1},{0,1,1,1,1,1,1}} },
+        { 7, 5, {{0,0,0,0,0,0,0},{0,1,1,1,0,0,0},{1,0,0,0,0,0,0},{1,0,0,0,0,1,0},{0,1,1,1,1,1,1}} },
+        { 7, 5, {{0,0,0,1,1,0,0},{0,0,0,0,0,0,0},{1,0,0,0,0,0,0},{0,0,0,0,0,0,1},{0,1,1,1,1,1,1}} },
+        { 7, 5, {{0,0,0,0,0,0,0},{0,1,0,0,0,1,0},{0,0,0,0,0,0,1},{0,0,0,0,0,0,1},{0,1,1,1,1,1,1}} },
+    }},
+};
+
+/* Detected spaceships for overlay rendering */
+#define SHIP_DETECT_MAX 256
+typedef struct {
+    int x, y;       /* position of matched phase in current frame */
+    int w, h;       /* bounding box of the matched phase */
+    int dir;        /* direction index: 0=↑ 1=↗ 2=→ 3=↘ 4=↓ 5=↙ 6=← 7=↖ */
+    int type_idx;   /* index into ship_types */
+} ShipDetection;
+
+static ShipDetection ship_detections[SHIP_DETECT_MAX];
+static int ship_n_detections = 0;
+static int ship_counts[SHIP_MAX_TYPES]; /* per-type counts for display */
+
+/* Map (dx,dy) displacement to direction index and arrow character */
+static int ship_dir_from_delta(int dx, int dy) {
+    /* Normalize signs */
+    int sx = (dx > 0) ? 1 : (dx < 0) ? -1 : 0;
+    int sy = (dy > 0) ? 1 : (dy < 0) ? -1 : 0;
+    /* Map to 8-direction index */
+    if (sx ==  0 && sy == -1) return 0; /* ↑ */
+    if (sx ==  1 && sy == -1) return 1; /* ↗ */
+    if (sx ==  1 && sy ==  0) return 2; /* → */
+    if (sx ==  1 && sy ==  1) return 3; /* ↘ */
+    if (sx ==  0 && sy ==  1) return 4; /* ↓ */
+    if (sx == -1 && sy ==  1) return 5; /* ↙ */
+    if (sx == -1 && sy ==  0) return 6; /* ← */
+    if (sx == -1 && sy == -1) return 7; /* ↖ */
+    return 2; /* default → */
+}
+static const char *ship_arrows[] = {"↑","↗","→","↘","↓","↙","←","↖"};
+
+/* Overlay grid: which cells are part of a detected spaceship (for cyan coloring) */
+static unsigned char census_ship[MAX_H][MAX_W]; /* 0=no, 1=spaceship cell */
+
+/* Forward declaration */
+static void census_ship_scan(void);
 
 /* Forward declaration — defined after grid_step where H/W/topology are available */
 static void census_scan(void);
@@ -907,6 +997,12 @@ static void census_scan(void) {
         } else if (census_n_display < CENSUS_DISPLAY_MAX) {
             census_display[census_n_display].name = census_patterns[pi].name;
             census_display[census_n_display].count = census_counts[pi];
+            /* Determine type: still life (0) or oscillator (1) */
+            int is_osc = (strcmp(census_patterns[pi].name, "Blinker") == 0 ||
+                          strcmp(census_patterns[pi].name, "Toad") == 0 ||
+                          strcmp(census_patterns[pi].name, "Beacon") == 0 ||
+                          strcmp(census_patterns[pi].name, "Clock") == 0);
+            census_display[census_n_display].type = is_osc ? 1 : 0;
             census_n_display++;
         }
         census_total += census_counts[pi];
@@ -920,6 +1016,180 @@ static void census_scan(void) {
                 census_unmatched++;
 
     census_stale = 0;
+
+    /* Run spaceship detection after static pattern census */
+    census_ship_scan();
+}
+
+/* ── Spaceship detection: compare consecutive timeline frames ─────────────── */
+static int ship_match_at(const unsigned char frame[MAX_H][MAX_W],
+                         const ShipPhase *ph, int x, int y) {
+    /* Check pattern interior: exact alive/dead match */
+    for (int py = 0; py < ph->h; py++) {
+        for (int px = 0; px < ph->w; px++) {
+            int gy = (y + py) % H;
+            int gx = (x + px) % W;
+            if (gy < 0) gy += H;
+            if (gx < 0) gx += W;
+            int alive = (frame[gy][gx] > 0) ? 1 : 0;
+            if (alive != ph->bits[py][px])
+                return 0;
+        }
+    }
+    /* Check 1-cell dead border (top/bottom rows) */
+    for (int px = -1; px <= ph->w; px++) {
+        int gx2 = (x + px + W) % W;
+        int gy_top = (y - 1 + H) % H;
+        int gy_bot = (y + ph->h) % H;
+        if (topology != TOPO_FLAT || y > 0)
+            if (frame[gy_top][gx2]) return 0;
+        if (topology != TOPO_FLAT || y + ph->h < H)
+            if (frame[gy_bot][gx2]) return 0;
+    }
+    /* Check left/right border columns */
+    for (int py = 0; py < ph->h; py++) {
+        int gy2 = (y + py) % H;
+        int gx_left = (x - 1 + W) % W;
+        int gx_right = (x + ph->w) % W;
+        if (topology != TOPO_FLAT || x > 0)
+            if (frame[gy2][gx_left]) return 0;
+        if (topology != TOPO_FLAT || x + ph->w < W)
+            if (frame[gy2][gx_right]) return 0;
+    }
+    return 1;
+}
+
+static void census_ship_scan(void) {
+    memset(census_ship, 0, sizeof(census_ship));
+    memset(ship_counts, 0, sizeof(ship_counts));
+    ship_n_detections = 0;
+
+    /* Need at least 2 frames to detect motion */
+    if (tl_len < 2) return;
+
+    /* Frame 0 = current (newest), Frame 1 = previous generation */
+    TimelineFrame *f_cur = timeline_get(0);
+    TimelineFrame *f_prev = timeline_get(1);
+    if (!f_cur || !f_prev) return;
+
+    /* For each spaceship type, try all 4 rotations/reflections of displacement
+       to detect all 4 (or 8) travel directions */
+    for (int ti = 0; ti < SHIP_MAX_TYPES; ti++) {
+        const ShipType *st = &ship_types[ti];
+        int n_ph = st->n_phases;
+
+        /* Try matching each phase in the previous frame, then confirm the
+           next phase (with displacement) in the current frame.
+           For a glider with 4 phases and displacement (1,1) per full cycle:
+           - Match phase P at (x,y) in f_prev
+           - Expect phase (P+1)%4 in f_cur
+           - Per-step displacement = (dx/n_phases, dy/n_phases) — but for gliders
+             the displacement happens non-uniformly across phases.
+           Instead: just try all 8 reflections of each phase pattern and confirm
+           by checking whether the NEXT phase (reflected) appears shifted by 1 step. */
+
+        /* For simplicity and correctness: try matching phase 0 in f_prev,
+           then check phase 1 at the same position in f_cur. The displacement
+           between consecutive phases is effectively (0,0) for the bounding box
+           because the pattern slides within or just outside its bounding box.
+           The TRUE approach: match ANY phase in prev frame, then match next phase
+           in cur frame allowing small positional shifts (-1..+1 in each axis). */
+
+        for (int phase = 0; phase < n_ph; phase++) {
+            const ShipPhase *cur_phase_pat = &st->phases[(phase + 1) % n_ph];
+            const ShipPhase *prev_phase_pat = &st->phases[phase];
+
+            for (int y = 0; y < H; y++) {
+                for (int x = 0; x < W; x++) {
+                    /* Skip if cells already claimed by static census or another ship */
+                    int already = 0;
+                    for (int py = 0; py < prev_phase_pat->h && !already; py++)
+                        for (int px = 0; px < prev_phase_pat->w && !already; px++)
+                            if (prev_phase_pat->bits[py][px] &&
+                                census_claimed[(y+py) % H][(x+px) % W])
+                                already = 1;
+                    if (already) continue;
+
+                    /* Match this phase in the previous frame */
+                    if (!ship_match_at(f_prev->grid, prev_phase_pat, x, y))
+                        continue;
+
+                    /* Try to find next phase in current frame at nearby offsets */
+                    int found = 0;
+                    int best_ox = 0, best_oy = 0;
+                    for (int oy = -2; oy <= 2 && !found; oy++) {
+                        for (int ox = -2; ox <= 2 && !found; ox++) {
+                            int nx = (x + ox + W) % W;
+                            int ny = (y + oy + H) % H;
+                            if (ship_match_at(f_cur->grid, cur_phase_pat, nx, ny)) {
+                                found = 1;
+                                best_ox = ox;
+                                best_oy = oy;
+                            }
+                        }
+                    }
+
+                    if (!found) continue;
+
+                    /* Compute effective displacement direction.
+                       For full-cycle displacement, scale by n_phases.
+                       But single-step displacement is what we actually observed. */
+                    int eff_dx = best_ox;
+                    int eff_dy = best_oy;
+                    /* If displacement is (0,0) this phase, use the canonical direction */
+                    if (eff_dx == 0 && eff_dy == 0) {
+                        eff_dx = st->dx;
+                        eff_dy = st->dy;
+                    }
+
+                    int dir = ship_dir_from_delta(eff_dx, eff_dy);
+
+                    /* Record detection — mark cells in CURRENT frame */
+                    int cx = (x + best_ox + W) % W;
+                    int cy = (y + best_oy + H) % H;
+                    if (ship_n_detections < SHIP_DETECT_MAX) {
+                        ship_detections[ship_n_detections].x = cx;
+                        ship_detections[ship_n_detections].y = cy;
+                        ship_detections[ship_n_detections].w = cur_phase_pat->w;
+                        ship_detections[ship_n_detections].h = cur_phase_pat->h;
+                        ship_detections[ship_n_detections].dir = dir;
+                        ship_detections[ship_n_detections].type_idx = ti;
+                        ship_n_detections++;
+                    }
+                    ship_counts[ti]++;
+
+                    /* Claim cells in current frame */
+                    for (int py = 0; py < cur_phase_pat->h; py++)
+                        for (int px = 0; px < cur_phase_pat->w; px++)
+                            if (cur_phase_pat->bits[py][px]) {
+                                int gy = (cy + py) % H;
+                                int gx = (cx + px) % W;
+                                census_ship[gy][gx] = 1;
+                                census_claimed[gy][gx] = 1;
+                            }
+                }
+            }
+        }
+    }
+
+    /* Add spaceship counts to census_display */
+    for (int ti = 0; ti < SHIP_MAX_TYPES; ti++) {
+        if (ship_counts[ti] == 0) continue;
+        if (census_n_display < CENSUS_DISPLAY_MAX) {
+            census_display[census_n_display].name = ship_types[ti].name;
+            census_display[census_n_display].count = ship_counts[ti];
+            census_display[census_n_display].type = 2; /* spaceship */
+            census_n_display++;
+        }
+        census_total += ship_counts[ti];
+    }
+
+    /* Recount unmatched (some cells may now be claimed by spaceships) */
+    census_unmatched = 0;
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++)
+            if (grid[y][x] && !census_claimed[y][x])
+                census_unmatched++;
 }
 
 /* ── Genetic Rule Explorer — evaluation & evolution ───────────────────────── */
@@ -2783,6 +3053,18 @@ static int cell_color(int x, int y, RGB *out) {
         return 0; /* truly dead — no period */
     }
 
+    /* Census spaceship overlay: cyan for detected moving structures */
+    if (census_mode && grid[y][x] && census_ship[y][x]) {
+        int age = grid[y][x];
+        /* Bright cyan, modulated slightly by cell age for visual depth */
+        int base = 160 + (age > 40 ? 40 : age) * 2;
+        if (base > 255) base = 255;
+        out->r = 0;
+        out->g = (unsigned char)(base * 4 / 5);
+        out->b = (unsigned char)base;
+        return 1;
+    }
+
     if (grid[y][x]) {
         if (ecosystem_mode && species[y][x] > 0) {
             if (species[y][x] == 1)
@@ -3391,12 +3673,14 @@ static void render(int running, int speed_ms, int draw_mode) {
         /* Pattern entries */
         int row_i = 1;
         for (int d = 0; d < census_n_display && row_i < cen_h - 1; d++, row_i++) {
-            /* Color based on pattern type: still lifes green, oscillators amber */
-            int is_osc = (strcmp(census_display[d].name, "Blinker") == 0 ||
-                          strcmp(census_display[d].name, "Toad") == 0 ||
-                          strcmp(census_display[d].name, "Beacon") == 0 ||
-                          strcmp(census_display[d].name, "Clock") == 0);
-            const char *clr = is_osc ? "\033[38;2;255;200;80m" : "\033[38;2;80;255;160m";
+            /* Color by type: green=still life, amber=oscillator, cyan=spaceship */
+            const char *clr;
+            if (census_display[d].type == 2)
+                clr = "\033[38;2;80;220;255m"; /* cyan for spaceships */
+            else if (census_display[d].type == 1)
+                clr = "\033[38;2;255;200;80m"; /* amber for oscillators */
+            else
+                clr = "\033[38;2;80;255;160m"; /* green for still lifes */
             p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s %s%-10s\033[38;2;200;200;200m %3d%s",
                          cen_row + row_i, cen_col, bdr, bg,
                          clr, census_display[d].name, census_display[d].count, bg);
@@ -3421,6 +3705,29 @@ static void render(int running, int speed_ms, int draw_mode) {
         for (int i = 0; i < cen_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
         *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
         p += sprintf(p, "%s", rst);
+
+        /* Spaceship direction arrows overlay — place a Unicode arrow at the
+           center of each detected spaceship's bounding box */
+        if (zoom == 0 && ship_n_detections > 0) {
+            for (int si = 0; si < ship_n_detections; si++) {
+                ShipDetection *sd = &ship_detections[si];
+                /* Center of the bounding box in grid coords */
+                int cx = sd->x + sd->w / 2;
+                int cy = sd->y + sd->h / 2;
+                /* Convert grid coords to screen coords (accounting for viewport) */
+                int sx = cx - view_x;
+                int sy = cy - view_y;
+                if (sx < 0 || sy < 0) continue;
+                /* Screen position: each cell is 2 chars wide, rows start at line 3 */
+                int scol = 1 + sx * 2;
+                int srow = 3 + sy;
+                if (srow < 3 || srow > term_rows - 1) continue;
+                if (scol < 1 || scol > term_cols - 2) continue;
+                /* Render cyan arrow */
+                p += sprintf(p, "\033[%d;%dH\033[38;2;80;220;255m%s\033[0m",
+                             srow, scol, ship_arrows[sd->dir]);
+            }
+        }
     }
 
     /* Genetic Rule Explorer overlay (center of screen) */

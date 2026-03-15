@@ -1,8 +1,8 @@
 CC = gcc
-CFLAGS = -O2 -Wall
+CFLAGS = -O2 -Wall -Wextra
 
 life: life.c
-	$(CC) $(CFLAGS) -o $@ $<
+	$(CC) $(CFLAGS) -o $@ $< -lm
 
 clean:
 	rm -f life

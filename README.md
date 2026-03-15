@@ -26,8 +26,9 @@ Requires only `gcc` and a POSIX terminal.
 | `d` | Toggle draw mode (mouse painting) |
 | `g` | Toggle population sparkline graph |
 | `h` | Toggle heatmap mode (age coloring + ghost trails) |
-| `[` / `]` | Cycle through rule presets (B/S notation) |
+| `[` / `]` | Cycle through rule presets (or zone brush in zone mode) |
 | `m` | Mutate — randomly flip one birth/survival bit |
+| `j` | Toggle zone-paint mode (paint regions with different rulesets) |
 | `k` | Cycle symmetry: none → 2-fold → 4-fold → 8-fold (kaleidoscope) |
 | `z` / `x` | Zoom in / out (1x → 2x half-block → 4x quarter-block) |
 | `n` | Toggle minimap overlay (full-grid thumbnail + viewport rect) |
@@ -72,6 +73,24 @@ Press `m` to mutate any ruleset — randomly flips one birth or survival bit,
 creating hybrid rules that may exhibit entirely novel behavior. The status bar
 shows `(mutant)` when the active rule doesn't match any preset.
 
+## Multi-Rule Zones
+
+Press `j` to enter **zone-paint mode**, where mouse painting assigns different rulesets
+to regions of the grid. Each cell remembers its zone, and during simulation, cells use
+their zone's birth/survival rules — creating emergent behavior at zone boundaries.
+
+- **Left-click/drag** paints the current zone brush (shown in status bar)
+- **Right-click/drag** resets zones back to the default (Conway)
+- **`[`/`]`** cycles the zone brush through all 10 rulesets
+- **`1`–`5`** loads preset zone layouts (split, quadrants, rings, stripes, checkerboard)
+- Symmetry modes work with zone painting for mandala-like zone patterns
+- Press `c` twice (once to clear cells, once to clear zones) to fully reset
+- Zone tinting is visible when zone mode is active (color-coded backgrounds)
+
+Try painting Conway on the left and Maze on the right, then randomize — watch
+gliders from Conway crash into maze corridors! Or use preset `3` (concentric rings)
+for a psychedelic multi-rule target pattern.
+
 ## Implementation Details
 
 - Double-buffered grid updates for correct neighbor counting
@@ -84,6 +103,7 @@ shows `(mutant)` when the active rule doesn't match any preset.
 - Population sparkline using Unicode block elements (▁▂▃▅▇█) with red→yellow→green color gradient
 - Toroidal wrapping mode — gliders and patterns loop around edges
 - Kaleidoscope drawing — 2/4/8-fold symmetric mouse painting with reflections around grid center
+- Multi-rule zones — paint different rulesets onto regions; cells use per-zone rules with emergent boundary interactions
 - Zoom and pan — 3 zoom levels using Unicode half-block (▀▄) and quarter-block (▘▝▖▗) characters for 2x and 4x density
 - Minimap overlay — quarter-block thumbnail of full grid with yellow viewport rectangle, auto-shows when zoomed
 - Full 400×200 simulation grid with viewport navigation (arrow keys + mouse scroll)

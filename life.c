@@ -13,9 +13,10 @@
  *   g           Toggle population sparkline graph
  *   w           Toggle toroidal wrapping
  *   h           Toggle heatmap mode (age coloring + ghost trails)
- *   [ / ]       Cycle through rule presets (B/S notation)
+ *   [ / ]       Cycle through rule presets (or zone brush in zone mode)
  *   m           Mutate — randomly flip one birth/survival bit
  *   k           Cycle symmetry: none → 2-fold → 4-fold → 8-fold (kaleidoscope)
+ *   j           Toggle zone-paint mode (paint regions with different rulesets)
  *   z / x       Zoom in / out (3 levels: 1x, 2x half-block, 4x quarter)
  *   n           Toggle minimap overlay (shows full grid + viewport rect when zoomed)
  *   Arrow keys  Pan viewport across the full 400×200 grid
@@ -39,6 +40,7 @@
 #include <sys/select.h>
 #include <signal.h>
 #include <time.h>
+#include <math.h>
 
 /* ── Grid ──────────────────────────────────────────────────────────────────── */
 
@@ -48,6 +50,9 @@
 /* grid stores cell age: 0=dead, 1+=generations alive (capped at 255) */
 static unsigned char grid[MAX_H][MAX_W];
 static unsigned char next_grid[MAX_H][MAX_W];
+
+/* zone grid: stores ruleset index (0..N_RULESETS-1) per cell */
+static unsigned char zone[MAX_H][MAX_W]; /* default 0 = first ruleset */
 
 /* ghost trails: 0=none, 1..GHOST_FRAMES=fading (GHOST_FRAMES=just died) */
 #define GHOST_FRAMES 5
@@ -60,6 +65,9 @@ static int wrap_mode = 0; /* toroidal wrapping */
 static int heatmap_mode = 1; /* age heatmap + ghost trails (on by default) */
 static int symmetry = 0; /* 0=none, 1=2-fold, 2=4-fold, 3=8-fold */
 static int show_minimap = 1; /* minimap overlay when zoomed */
+static int zone_mode = 0; /* 0=off, 1=zone-paint mode */
+static int zone_brush = 0; /* which ruleset to paint in zone mode */
+static int zone_enabled = 0; /* whether per-cell zones are active */
 
 /* ── Viewport (zoom + pan) ─────────────────────────────────────────────────── */
 
@@ -191,10 +199,16 @@ static int find_matching_ruleset(void) {
 static void grid_clear(void) {
     memset(grid, 0, sizeof(grid));
     memset(ghost, 0, sizeof(ghost));
+    /* zones are preserved across clear — use 'c' twice or toggle zone_mode to reset */
     generation = 0;
     population = 0;
     hist_count = 0;
     hist_pos = 0;
+}
+
+static void zones_clear(void) {
+    memset(zone, 0, sizeof(zone));
+    zone_enabled = 0;
 }
 
 static void grid_randomize(double density) {
@@ -234,8 +248,18 @@ static void grid_step(void) {
                     }
                 }
             int alive = grid[y][x] > 0;
-            if ((alive && (survival_mask & (1 << n))) ||
-                (!alive && (birth_mask & (1 << n)))) {
+            /* Use per-cell zone rules if zones are active, else global */
+            unsigned short b_mask = birth_mask;
+            unsigned short s_mask = survival_mask;
+            if (zone_enabled) {
+                int zi = zone[y][x];
+                if (zi < N_RULESETS) {
+                    b_mask = rulesets[zi].birth;
+                    s_mask = rulesets[zi].survival;
+                }
+            }
+            if ((alive && (s_mask & (1 << n))) ||
+                (!alive && (b_mask & (1 << n)))) {
                 /* alive: increment age, cap at 255 */
                 int age = grid[y][x];
                 next_grid[y][x] = (age < 255) ? age + 1 : 255;
@@ -567,6 +591,97 @@ static RGB ghost_to_rgb(int g) {
     return (RGB){ brightness, brightness, blue_tint };
 }
 
+/* ── Zone colors & painting ────────────────────────────────────────────────── */
+
+/* Distinct hue per zone (used for subtle background tinting) */
+static const RGB zone_colors[] = {
+    {  60,  80, 180 },  /* 0: Conway — blue */
+    { 160,  60, 180 },  /* 1: HighLife — purple */
+    {  60, 160, 160 },  /* 2: Day&Night — teal */
+    { 200, 120,  30 },  /* 3: Seeds — orange */
+    { 140, 100,  60 },  /* 4: Diamoeba — brown */
+    { 180,  50,  80 },  /* 5: Morley — rose */
+    { 100, 160,  50 },  /* 6: 2x2 — olive */
+    {  50, 140, 100 },  /* 7: Maze — sea green */
+    { 180, 140,  50 },  /* 8: Coral — gold */
+    { 100,  80, 160 },  /* 9: Anneal — lavender */
+};
+
+/* Paint a zone at (x,y) with current zone_brush */
+static void zone_paint(int x, int y) {
+    if (x >= 0 && x < W && y >= 0 && y < H) {
+        zone[y][x] = (unsigned char)zone_brush;
+        zone_enabled = 1;
+    }
+}
+
+/* Paint a 3x3 zone brush for easier coverage */
+static void zone_paint_brush(int x, int y) {
+    for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++)
+            zone_paint(x + dx, y + dy);
+}
+
+/* Preset zone layouts for quick demos */
+static void zone_preset(int id) {
+    zone_enabled = 1;
+    if (id == 1) {
+        /* Vertical split: left=Conway, right=HighLife */
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++)
+                zone[y][x] = (x < W/2) ? 0 : 1;
+    } else if (id == 2) {
+        /* 4 quadrants: Conway/Seeds/Maze/Day&Night */
+        int rules[4] = {0, 3, 7, 2};
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++)
+                zone[y][x] = rules[(y < H/2 ? 0 : 2) + (x < W/2 ? 0 : 1)];
+    } else if (id == 3) {
+        /* Concentric rings: different rules radiating from center */
+        int cx = W/2, cy = H/2;
+        int ring_rules[] = {0, 8, 7, 1, 2, 3, 4, 5, 6, 9};
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++) {
+                int dx = x - cx, dy = y - cy;
+                int dist = (int)(sqrt((double)(dx*dx + dy*dy)));
+                int ring = dist / 20;
+                if (ring >= 10) ring = 9;
+                zone[y][x] = ring_rules[ring];
+            }
+    } else if (id == 4) {
+        /* Horizontal stripes */
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++)
+                zone[y][x] = (y / 25) % N_RULESETS;
+    } else if (id == 5) {
+        /* Checkerboard */
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++)
+                zone[y][x] = ((x / 25) + (y / 25)) % N_RULESETS;
+    }
+}
+
+/* Symmetric zone painting (uses sym_apply logic but paints zones) */
+static void zone_paint_sym(int gx, int gy) {
+    int cx = W / 2, cy = H / 2;
+    int dx = gx - cx, dy = gy - cy;
+
+    zone_paint_brush(gx, gy);
+
+    if (symmetry >= 1)
+        zone_paint_brush(cx - dx, gy);
+    if (symmetry >= 2) {
+        zone_paint_brush(gx, cy - dy);
+        zone_paint_brush(cx - dx, cy - dy);
+    }
+    if (symmetry >= 3) {
+        zone_paint_brush(cx + dy, cy + dx);
+        zone_paint_brush(cx - dy, cy + dx);
+        zone_paint_brush(cx + dy, cy - dx);
+        zone_paint_brush(cx - dy, cy - dx);
+    }
+}
+
 /* ── Sparkline rendering ───────────────────────────────────────────────────── */
 
 /* Unicode block elements for sparkline: 8 levels */
@@ -749,7 +864,7 @@ static void render_minimap(char **pp) {
 /* Larger buffer for true-color escape sequences */
 static char render_buf[MAX_H * MAX_W * 40 + 16384];
 
-/* Get cell color for rendering (returns 1 if alive, fills rgb; 2 if ghost) */
+/* Get cell color for rendering (returns 1 if alive, fills rgb; 2 if ghost; 3 if zone bg) */
 static int cell_color(int x, int y, RGB *out) {
     if (x < 0 || x >= W || y < 0 || y >= H) return 0;
     if (grid[y][x]) {
@@ -759,11 +874,28 @@ static int cell_color(int x, int y, RGB *out) {
             /* flat green for non-heatmap */
             *out = (RGB){0, 200, 0};
         }
+        /* Blend zone tint when zones are active */
+        if (zone_enabled && zone_mode) {
+            RGB zc = zone_colors[zone[y][x] % N_RULESETS];
+            /* Subtle tint: 80% cell color + 20% zone color */
+            out->r = (unsigned char)(out->r * 4/5 + zc.r * 1/5);
+            out->g = (unsigned char)(out->g * 4/5 + zc.g * 1/5);
+            out->b = (unsigned char)(out->b * 4/5 + zc.b * 1/5);
+        }
         return 1;
     }
     if (heatmap_mode && ghost[y][x]) {
         *out = ghost_to_rgb(ghost[y][x]);
         return 2; /* ghost */
+    }
+    /* Show zone background tint when in zone mode */
+    if (zone_enabled && zone_mode) {
+        RGB zc = zone_colors[zone[y][x] % N_RULESETS];
+        /* Very dim tint for empty cells */
+        out->r = zc.r / 6;
+        out->g = zc.g / 6;
+        out->b = zc.b / 6;
+        return 3; /* zone background */
     }
     return 0;
 }
@@ -804,21 +936,36 @@ static void render(int running, int speed_ms, int draw_mode) {
     const char *map_str = (zoom > 1 && show_minimap)
         ? " \033[94m\u25A3MAP\033[0m" : "";
 
+    /* Zone mode indicator */
+    char zone_str[80] = "";
+    if (zone_mode) {
+        RGB zc = zone_colors[zone_brush % N_RULESETS];
+        snprintf(zone_str, sizeof(zone_str),
+                 " \033[38;2;%d;%d;%dm\u25A8ZONE:%s\033[0m",
+                 zc.r, zc.g, zc.b, rulesets[zone_brush].name);
+    } else if (zone_enabled) {
+        snprintf(zone_str, sizeof(zone_str),
+                 " \033[90m\u25A8ZONES\033[0m");
+    }
+
     /* Rule string */
     char rule_str[32];
     rule_to_string(rule_str, sizeof(rule_str));
     int rs = find_matching_ruleset();
     char rule_display[80];
-    if (rs >= 0)
+    if (zone_enabled && !zone_mode) {
+        snprintf(rule_display, sizeof(rule_display),
+                 "\033[90mmulti-zone\033[0m");
+    } else if (rs >= 0)
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[90m(%s)\033[0m", rule_str, rulesets[rs].name);
     else
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, wrap_str, draw_str, heat_str, sym_str, zoom_str, map_str,
+                 state, wrap_str, draw_str, heat_str, sym_str, zoom_str, map_str, zone_str,
                  rule_display, generation, population, speed_ms);
 
     /* sparkline right after stats */
@@ -832,7 +979,7 @@ static void render(int running, int speed_ms, int draw_mode) {
     /* status bar line 2: compact help */
     p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
                      "[1-5]pre [d]draw [k]sym [g]graph [w]wrap [h]heat "
-                     "[/]rule [m]mut [z/x]zoom [n]map [\u2190\u2191\u2192\u2193]pan [0]center [q]quit\033[0m\033[K\n");
+                     "[/]rule [m]mut [j]zone [z/x]zoom [n]map [\u2190\u2191\u2192\u2193]pan [0]center [q]quit\033[0m\033[K\n");
 
     int usable_rows = term_rows - 3;
     if (usable_rows < 5) usable_rows = 5;
@@ -849,6 +996,8 @@ static void render(int running, int speed_ms, int draw_mode) {
                     p += sprintf(p, "\033[48;2;%d;%d;%dm  \033[0m", c.r, c.g, c.b);
                 } else if (t == 2) {
                     p += sprintf(p, "\033[38;2;%d;%d;%dm\xC2\xB7 \033[0m", c.r, c.g, c.b);
+                } else if (t == 3) {
+                    p += sprintf(p, "\033[48;2;%d;%d;%dm  \033[0m", c.r, c.g, c.b);
                 } else {
                     *p++ = ' '; *p++ = ' ';
                 }
@@ -872,6 +1021,14 @@ static void render(int running, int speed_ms, int draw_mode) {
                     /* both alive: fg=top, bg=bottom, print ▀ */
                     p += sprintf(p, "\033[38;2;%d;%d;%d;48;2;%d;%d;%dm\xe2\x96\x80\033[0m",
                                  ct.r, ct.g, ct.b, cb.r, cb.g, cb.b);
+                } else if (tt == 1 && tb == 3) {
+                    /* top alive, bottom zone bg */
+                    p += sprintf(p, "\033[38;2;%d;%d;%d;48;2;%d;%d;%dm\xe2\x96\x80\033[0m",
+                                 ct.r, ct.g, ct.b, cb.r, cb.g, cb.b);
+                } else if (tb == 1 && tt == 3) {
+                    /* bottom alive, top zone bg */
+                    p += sprintf(p, "\033[38;2;%d;%d;%d;48;2;%d;%d;%dm\xe2\x96\x84\033[0m",
+                                 cb.r, cb.g, cb.b, ct.r, ct.g, ct.b);
                 } else if (tt == 1) {
                     /* top alive only */
                     p += sprintf(p, "\033[38;2;%d;%d;%dm\xe2\x96\x80\033[0m",
@@ -885,6 +1042,16 @@ static void render(int running, int speed_ms, int draw_mode) {
                     RGB gc = tt == 2 ? ct : cb;
                     p += sprintf(p, "\033[38;2;%d;%d;%dm\xC2\xB7\033[0m",
                                  gc.r, gc.g, gc.b);
+                } else if (tt == 3 && tb == 3) {
+                    /* both zone bg */
+                    p += sprintf(p, "\033[38;2;%d;%d;%d;48;2;%d;%d;%dm\xe2\x96\x80\033[0m",
+                                 ct.r, ct.g, ct.b, cb.r, cb.g, cb.b);
+                } else if (tt == 3) {
+                    p += sprintf(p, "\033[38;2;%d;%d;%dm\xe2\x96\x80\033[0m",
+                                 ct.r, ct.g, ct.b);
+                } else if (tb == 3) {
+                    p += sprintf(p, "\033[38;2;%d;%d;%dm\xe2\x96\x84\033[0m",
+                                 cb.r, cb.g, cb.b);
                 } else {
                     *p++ = ' ';
                 }
@@ -922,13 +1089,26 @@ static void render(int running, int speed_ms, int draw_mode) {
                 int gx0 = view_x + col * 2;
                 int gx1 = gx0 + 1;
 
-                /* Check which quadrants are alive */
+                /* Check which quadrants are alive or zone-tinted */
                 RGB dummy;
-                int tl = (cell_color(gx0, gy0, &dummy) == 1);
-                int tr = (cell_color(gx1, gy0, &dummy) == 1);
-                int bl = (cell_color(gx0, gy1, &dummy) == 1);
-                int br = (cell_color(gx1, gy1, &dummy) == 1);
+                int tl_t = cell_color(gx0, gy0, &dummy);
+                int tr_t = cell_color(gx1, gy0, &dummy);
+                int bl_t = cell_color(gx0, gy1, &dummy);
+                int br_t = cell_color(gx1, gy1, &dummy);
+                int tl = (tl_t == 1);
+                int tr = (tr_t == 1);
+                int bl = (bl_t == 1);
+                int br = (br_t == 1);
                 int bits = tl | (tr << 1) | (bl << 2) | (br << 3);
+
+                /* In zone mode, also show zone bg for empty cells */
+                int zone_bits = 0;
+                if (zone_enabled && zone_mode && bits != 15) {
+                    if (!tl && tl_t == 3) zone_bits |= 1;
+                    if (!tr && tr_t == 3) zone_bits |= 2;
+                    if (!bl && bl_t == 3) zone_bits |= 4;
+                    if (!br && br_t == 3) zone_bits |= 8;
+                }
 
                 if (bits && heatmap_mode) {
                     /* Average color of alive cells */
@@ -943,6 +1123,19 @@ static void render(int running, int speed_ms, int draw_mode) {
                     } else {
                         p += sprintf(p, "\033[37m");
                     }
+                } else if (zone_bits && !bits) {
+                    /* Pure zone background — use average zone color */
+                    int rr = 0, gg = 0, bb = 0, cnt = 0;
+                    int coords[4][2] = {{gx0,gy0},{gx1,gy0},{gx0,gy1},{gx1,gy1}};
+                    for (int q = 0; q < 4; q++) {
+                        if (zone_bits & (1 << q)) {
+                            RGB zc;
+                            cell_color(coords[q][0], coords[q][1], &zc);
+                            rr += zc.r; gg += zc.g; bb += zc.b; cnt++;
+                        }
+                    }
+                    if (cnt) p += sprintf(p, "\033[38;2;%d;%d;%dm", rr/cnt, gg/cnt, bb/cnt);
+                    bits = zone_bits; /* use zone_bits for char selection */
                 } else if (bits) {
                     p += sprintf(p, "\033[92m"); /* green */
                 }
@@ -1035,12 +1228,21 @@ int main(void) {
             running = 1;
         }
         else if (key == 'c' || key == 'C') {
+            if (population == 0 && generation == 0) {
+                /* Second clear: also reset zones */
+                zones_clear();
+            }
             grid_clear();
             running = 0;
         }
         else if (key >= '1' && key <= '5') {
-            load_pattern(key - '0');
-            running = 1;
+            if (zone_mode) {
+                zone_preset(key - '0');
+                printf("\033[2J"); fflush(stdout);
+            } else {
+                load_pattern(key - '0');
+                running = 1;
+            }
         }
         else if (key == '+' || key == '=')
             speed_ms = speed_ms > 20 ? speed_ms - 20 : 20;
@@ -1055,17 +1257,32 @@ int main(void) {
         else if (key == 'h' || key == 'H')
             heatmap_mode = !heatmap_mode;
         else if (key == ']') {
-            current_ruleset = (current_ruleset + 1) % N_RULESETS;
-            birth_mask = rulesets[current_ruleset].birth;
-            survival_mask = rulesets[current_ruleset].survival;
+            if (zone_mode) {
+                zone_brush = (zone_brush + 1) % N_RULESETS;
+            } else {
+                current_ruleset = (current_ruleset + 1) % N_RULESETS;
+                birth_mask = rulesets[current_ruleset].birth;
+                survival_mask = rulesets[current_ruleset].survival;
+            }
         }
         else if (key == '[') {
-            current_ruleset = (current_ruleset - 1 + N_RULESETS) % N_RULESETS;
-            birth_mask = rulesets[current_ruleset].birth;
-            survival_mask = rulesets[current_ruleset].survival;
+            if (zone_mode) {
+                zone_brush = (zone_brush - 1 + N_RULESETS) % N_RULESETS;
+            } else {
+                current_ruleset = (current_ruleset - 1 + N_RULESETS) % N_RULESETS;
+                birth_mask = rulesets[current_ruleset].birth;
+                survival_mask = rulesets[current_ruleset].survival;
+            }
         }
         else if (key == 'n' || key == 'N')
             show_minimap = !show_minimap;
+        else if (key == 'j' || key == 'J') {
+            zone_mode = !zone_mode;
+            if (zone_mode) {
+                draw_mode = 1; /* enable drawing when entering zone mode */
+            }
+            printf("\033[2J"); fflush(stdout); /* redraw for zone tinting */
+        }
         else if (key == 'k' || key == 'K')
             symmetry = (symmetry + 1) % 4;
         else if (key == 'm' || key == 'M') {
@@ -1151,15 +1368,40 @@ int main(void) {
                     gy = view_y + (m->y - 3) * 2;
                 }
 
-                if (m->type == 1) { /* press */
-                    int mbtn = btn & 0x03;
-                    if (mbtn == 0) { mouse_held = 1; sym_apply(gx, gy, grid_set); }
-                    else if (mbtn == 2) { mouse_held = 2; sym_apply(gx, gy, grid_unset); }
-                } else if (m->type == 3) { /* drag */
-                    if (mouse_held == 1) sym_apply(gx, gy, grid_set);
-                    else if (mouse_held == 2) sym_apply(gx, gy, grid_unset);
-                } else if (m->type == 2) { /* release */
-                    mouse_held = 0;
+                if (zone_mode) {
+                    /* Zone painting mode: left=paint zone, right=reset to zone 0 */
+                    if (m->type == 1) {
+                        int mbtn = btn & 0x03;
+                        if (mbtn == 0) { mouse_held = 1; zone_paint_sym(gx, gy); }
+                        else if (mbtn == 2) {
+                            mouse_held = 2;
+                            int save = zone_brush;
+                            zone_brush = 0;
+                            zone_paint_sym(gx, gy);
+                            zone_brush = save;
+                        }
+                    } else if (m->type == 3) {
+                        if (mouse_held == 1) zone_paint_sym(gx, gy);
+                        else if (mouse_held == 2) {
+                            int save = zone_brush;
+                            zone_brush = 0;
+                            zone_paint_sym(gx, gy);
+                            zone_brush = save;
+                        }
+                    } else if (m->type == 2) {
+                        mouse_held = 0;
+                    }
+                } else {
+                    if (m->type == 1) { /* press */
+                        int mbtn = btn & 0x03;
+                        if (mbtn == 0) { mouse_held = 1; sym_apply(gx, gy, grid_set); }
+                        else if (mbtn == 2) { mouse_held = 2; sym_apply(gx, gy, grid_unset); }
+                    } else if (m->type == 3) { /* drag */
+                        if (mouse_held == 1) sym_apply(gx, gy, grid_set);
+                        else if (mouse_held == 2) sym_apply(gx, gy, grid_unset);
+                    } else if (m->type == 2) { /* release */
+                        mouse_held = 0;
+                    }
                 }
             }
         }

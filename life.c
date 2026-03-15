@@ -9,7 +9,13 @@
  *   1-5         Load preset pattern
  *                 1=Glider  2=Pulsar  3=Gosper Gun  4=R-pentomino  5=Acorn
  *   +/-         Speed up / slow down
+ *   d           Toggle draw mode (left-click=place, right-click=erase)
+ *   g           Toggle population sparkline graph
+ *   w           Toggle toroidal wrapping
  *   q / ESC     Quit
+ *
+ *   Mouse:      Left-click to place cells, right-click to erase
+ *               Click+drag to paint/erase continuously
  *
  * Build:  gcc -O2 -o life life.c
  * Run:    ./life
@@ -31,15 +37,40 @@
 #define MAX_H 200
 
 static unsigned char grid[MAX_H][MAX_W];
-static unsigned char next[MAX_H][MAX_W];
+static unsigned char next_grid[MAX_H][MAX_W];
 static int W, H;
 static int generation;
 static int population;
+static int wrap_mode = 0; /* toroidal wrapping */
+
+/* ── Population history (for sparkline) ────────────────────────────────────── */
+
+#define HIST_LEN 120
+static int pop_history[HIST_LEN];
+static int hist_pos = 0;
+static int hist_count = 0;
+static int show_graph = 1;
+
+static void hist_push(int pop) {
+    pop_history[hist_pos] = pop;
+    hist_pos = (hist_pos + 1) % HIST_LEN;
+    if (hist_count < HIST_LEN) hist_count++;
+}
+
+static int hist_get(int age) {
+    /* age=0 is most recent */
+    int idx = (hist_pos - 1 - age + HIST_LEN * 2) % HIST_LEN;
+    return pop_history[idx];
+}
+
+/* ── Grid operations ───────────────────────────────────────────────────────── */
 
 static void grid_clear(void) {
     memset(grid, 0, sizeof(grid));
     generation = 0;
     population = 0;
+    hist_count = 0;
+    hist_pos = 0;
 }
 
 static void grid_randomize(double density) {
@@ -52,9 +83,15 @@ static void grid_randomize(double density) {
             }
 }
 
+static inline int wrap_coord(int v, int max) {
+    if (v < 0) return v + max;
+    if (v >= max) return v - max;
+    return v;
+}
+
 static void grid_step(void) {
     population = 0;
-    memset(next, 0, sizeof(next));
+    memset(next_grid, 0, sizeof(next_grid));
     for (int y = 0; y < H; y++) {
         for (int x = 0; x < W; x++) {
             int n = 0;
@@ -62,23 +99,37 @@ static void grid_step(void) {
                 for (int dx = -1; dx <= 1; dx++) {
                     if (dx == 0 && dy == 0) continue;
                     int nx = x + dx, ny = y + dy;
-                    if (nx >= 0 && nx < W && ny >= 0 && ny < H)
+                    if (wrap_mode) {
+                        nx = wrap_coord(nx, W);
+                        ny = wrap_coord(ny, H);
                         n += grid[ny][nx];
+                    } else {
+                        if (nx >= 0 && nx < W && ny >= 0 && ny < H)
+                            n += grid[ny][nx];
+                    }
                 }
             if (n == 3 || (n == 2 && grid[y][x])) {
-                next[y][x] = 1;
+                next_grid[y][x] = 1;
                 population++;
             }
         }
     }
-    memcpy(grid, next, sizeof(grid));
+    memcpy(grid, next_grid, sizeof(grid));
     generation++;
+    hist_push(population);
 }
 
 static void grid_set(int x, int y) {
     if (x >= 0 && x < W && y >= 0 && y < H && !grid[y][x]) {
         grid[y][x] = 1;
         population++;
+    }
+}
+
+static void grid_unset(int x, int y) {
+    if (x >= 0 && x < W && y >= 0 && y < H && grid[y][x]) {
+        grid[y][x] = 0;
+        population--;
     }
 }
 
@@ -160,11 +211,23 @@ static void load_pattern(int id) {
 static struct termios orig_termios;
 static int term_raw = 0;
 
+static void mouse_disable(void) {
+    printf("\033[?1000l\033[?1002l\033[?1006l");
+    fflush(stdout);
+}
+
+static void mouse_enable(void) {
+    /* 1000=button events, 1002=button+motion (drag), 1006=SGR extended coords */
+    printf("\033[?1000h\033[?1002h\033[?1006h");
+    fflush(stdout);
+}
+
 static void term_restore(void) {
     if (term_raw) {
         tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
         term_raw = 0;
     }
+    mouse_disable();
     printf("\033[?25h");   /* show cursor */
     printf("\033[0m");     /* reset colors */
     printf("\033[2J\033[H"); /* clear */
@@ -194,18 +257,75 @@ static void get_term_size(int *cols, int *rows) {
     }
 }
 
-static int read_key(void) {
+/* ── Input handling (keyboard + SGR mouse) ─────────────────────────────────── */
+
+/* Read a single byte, non-blocking. Returns 0 if nothing. */
+static int read_byte(void) {
     unsigned char c;
-    if (read(STDIN_FILENO, &c, 1) == 1) {
-        if (c == 27) { /* ESC */
-            unsigned char seq[2];
-            if (read(STDIN_FILENO, &seq[0], 1) != 1) return 27;
-            if (read(STDIN_FILENO, &seq[1], 1) != 1) return 27;
-            return -1; /* ignore arrow keys etc. */
-        }
-        return c;
+    if (read(STDIN_FILENO, &c, 1) == 1) return c;
+    return -1;
+}
+
+/* Parse SGR mouse: ESC [ < Cb ; Cx ; Cy M/m */
+typedef struct {
+    int type;   /* 0=none, 1=press, 2=release, 3=drag */
+    int button; /* 0=left, 2=right, 1=middle, 64=scroll-up, 65=scroll-down */
+    int x, y;   /* 1-based terminal coordinates */
+} MouseEvent;
+
+static MouseEvent parse_sgr_mouse(void) {
+    MouseEvent ev = {0, 0, 0, 0};
+    /* We've already consumed ESC [ < — now read "Cb;Cx;CyM" or "Cb;Cx;Cym" */
+    char buf[64];
+    int len = 0;
+    for (;;) {
+        int c = read_byte();
+        if (c < 0) break;
+        if (len < 63) buf[len++] = (char)c;
+        if (c == 'M' || c == 'm') break;
     }
-    return 0;
+    buf[len] = '\0';
+
+    int cb = 0, cx = 0, cy = 0;
+    char trail = 'M';
+    if (sscanf(buf, "%d;%d;%d%c", &cb, &cx, &cy, &trail) >= 3) {
+        ev.button = cb & 0x43; /* button bits */
+        ev.x = cx;
+        ev.y = cy;
+        if (trail == 'm') {
+            ev.type = 2; /* release */
+        } else if (cb & 32) {
+            ev.type = 3; /* drag (motion with button held) */
+        } else {
+            ev.type = 1; /* press */
+        }
+    }
+    return ev;
+}
+
+/* High-level key/mouse reader. Returns key char, or 0 if nothing, or -2 for mouse. */
+static MouseEvent last_mouse;
+
+static int read_input(void) {
+    int c = read_byte();
+    if (c < 0) return 0;
+    if (c == 27) { /* ESC sequence */
+        int c2 = read_byte();
+        if (c2 < 0) return 27; /* bare ESC */
+        if (c2 == '[') {
+            int c3 = read_byte();
+            if (c3 == '<') {
+                /* SGR mouse */
+                last_mouse = parse_sgr_mouse();
+                return -2;
+            }
+            /* Other CSI sequences — ignore */
+            while (c3 >= 0 && c3 < 0x40) c3 = read_byte(); /* consume params */
+            return -1;
+        }
+        return 27;
+    }
+    return c;
 }
 
 /* ── Color palette (cycles each generation) ────────────────────────────────── */
@@ -220,43 +340,107 @@ static const char *alive_colors[] = {
 };
 #define N_COLORS 6
 
+/* ── Sparkline rendering ───────────────────────────────────────────────────── */
+
+/* Unicode block elements for sparkline: 8 levels */
+static const char *spark_chars[] = {
+    "\u2581", "\u2582", "\u2583", "\u2584",
+    "\u2585", "\u2586", "\u2587", "\u2588"
+};
+
+static void render_sparkline(char **pp, int width) {
+    char *p = *pp;
+    if (hist_count < 2) {
+        *pp = p;
+        return;
+    }
+
+    int n = hist_count < width ? hist_count : width;
+
+    /* Find min/max in visible range */
+    int mn = hist_get(0), mx = hist_get(0);
+    for (int i = 0; i < n; i++) {
+        int v = hist_get(i);
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+    }
+
+    /* Render right-to-left (newest on right) */
+    p += sprintf(p, "\033[90m");
+    for (int i = n - 1; i >= 0; i--) {
+        int v = hist_get(i);
+        int level;
+        if (mx == mn)
+            level = 3;
+        else
+            level = (v - mn) * 7 / (mx - mn);
+        if (level < 0) level = 0;
+        if (level > 7) level = 7;
+
+        /* Color gradient: low=red, mid=yellow, high=green */
+        if (level <= 2)
+            p += sprintf(p, "\033[91m");
+        else if (level <= 4)
+            p += sprintf(p, "\033[93m");
+        else
+            p += sprintf(p, "\033[92m");
+
+        const char *ch = spark_chars[level];
+        while (*ch) *p++ = *ch++;
+    }
+    p += sprintf(p, "\033[0m");
+    *pp = p;
+}
+
 /* ── Rendering ─────────────────────────────────────────────────────────────── */
 
-static char render_buf[MAX_H * MAX_W * 20 + 4096];
+static char render_buf[MAX_H * MAX_W * 20 + 8192];
 
-static void render(int running, int speed_ms) {
+static void render(int running, int speed_ms, int draw_mode) {
     char *p = render_buf;
 
     /* cursor home */
     p += sprintf(p, "\033[H");
 
-    /* status bar */
+    /* status bar line 1 */
     const char *state = running
-        ? "\033[92m> RUNNING\033[0m"
-        : "\033[93m= PAUSED\033[0m";
-    p += sprintf(p, " %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
-                     "Speed \033[96m%dms\033[0m  "
-                     "[\033[37mSPACE\033[0m play  \033[37ms\033[0m step  "
-                     "\033[37mr\033[0m rand  \033[37m1-5\033[0m presets  "
-                     "\033[37mq\033[0m quit]\033[K\n",
-                 state, generation, population, speed_ms);
+        ? "\033[92m\u25B6 RUN\033[0m"
+        : "\033[93m\u23F8 PAUSE\033[0m";
+    const char *wrap_str = wrap_mode
+        ? " \033[95m\u221E\033[0m"  /* infinity symbol for toroidal */
+        : "";
+    const char *draw_str = draw_mode
+        ? " \033[96m\u270E DRAW\033[0m"
+        : "";
+    p += sprintf(p, " %s%s%s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+                     "\033[90m%dms\033[0m",
+                 state, wrap_str, draw_str, generation, population, speed_ms);
+
+    /* sparkline right after stats */
+    if (show_graph && hist_count > 1) {
+        p += sprintf(p, "  ");
+        render_sparkline(&p, 40);
+    }
+
+    p += sprintf(p, "\033[K\n");
+
+    /* status bar line 2: compact help */
+    p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
+                     "[1-5]pre [d]draw [g]graph [w]wrap [+/-]spd [q]quit\033[0m\033[K\n");
 
     const char *color = alive_colors[generation % N_COLORS];
 
     for (int y = 0; y < H; y++) {
         for (int x = 0; x < W; x++) {
             if (grid[y][x]) {
-                /* alive cell: colored block */
                 const char *c = color;
                 while (*c) *p++ = *c++;
                 *p++ = ' '; *p++ = ' ';
-                /* reset */
                 *p++ = '\033'; *p++ = '['; *p++ = '0'; *p++ = 'm';
             } else {
                 *p++ = ' '; *p++ = ' ';
             }
         }
-        /* clear to end of line + newline */
         *p++ = '\033'; *p++ = '['; *p++ = 'K'; *p++ = '\n';
     }
     *p = '\0';
@@ -277,13 +461,12 @@ static void apply_resize(void) {
     int cols, rows;
     get_term_size(&cols, &rows);
     int nw = cols / 2;
-    int nh = rows - 2;
+    int nh = rows - 3; /* 2 status lines + margin */
     if (nw > MAX_W) nw = MAX_W;
     if (nh > MAX_H) nh = MAX_H;
     if (nw < 10) nw = 10;
     if (nh < 5) nh = 5;
 
-    /* Preserve cells that fit */
     unsigned char tmp[MAX_H][MAX_W];
     memcpy(tmp, grid, sizeof(grid));
     memset(grid, 0, sizeof(grid));
@@ -315,22 +498,26 @@ int main(void) {
     int cols, rows;
     get_term_size(&cols, &rows);
     W = cols / 2;
-    H = rows - 2;
+    H = rows - 3;
     if (W > MAX_W) W = MAX_W;
     if (H > MAX_H) H = MAX_H;
 
     grid_randomize(0.25);
+    hist_push(population);
 
     signal(SIGWINCH, handle_winch);
 
     term_raw_mode();
+    mouse_enable();
     printf("\033[?25l");  /* hide cursor */
     printf("\033[2J\033[H");
     fflush(stdout);
 
     int running = 1;
     int speed_ms = 100;
+    int draw_mode = 1;  /* mouse drawing on by default */
     long long last_step = now_ms();
+    int mouse_held = 0; /* 0=none, 1=left(place), 2=right(erase) */
 
     for (;;) {
         if (resize_flag) {
@@ -338,8 +525,8 @@ int main(void) {
             apply_resize();
         }
 
-        int key = read_key();
-        if (key == 'q' || key == 'Q' || key == 27 || key == 3) /* q/ESC/Ctrl-C */
+        int key = read_input();
+        if (key == 'q' || key == 'Q' || key == 27 || key == 3)
             break;
         else if (key == ' ' || key == 'p' || key == 'P')
             running = !running;
@@ -361,6 +548,30 @@ int main(void) {
             speed_ms = speed_ms > 20 ? speed_ms - 20 : 20;
         else if (key == '-' || key == '_')
             speed_ms = speed_ms < 1000 ? speed_ms + 20 : 1000;
+        else if (key == 'd' || key == 'D')
+            draw_mode = !draw_mode;
+        else if (key == 'g' || key == 'G')
+            show_graph = !show_graph;
+        else if (key == 'w' || key == 'W')
+            wrap_mode = !wrap_mode;
+        else if (key == -2 && draw_mode) {
+            /* Mouse event */
+            MouseEvent *m = &last_mouse;
+            /* Convert terminal coords to grid coords (1-based, 2 chars per cell) */
+            int gx = (m->x - 1) / 2;
+            int gy = m->y - 3; /* 2 status lines + 1-based */
+
+            if (m->type == 1) { /* press */
+                int btn = m->button & 0x03;
+                if (btn == 0) { mouse_held = 1; grid_set(gx, gy); }
+                else if (btn == 2) { mouse_held = 2; grid_unset(gx, gy); }
+            } else if (m->type == 3) { /* drag */
+                if (mouse_held == 1) grid_set(gx, gy);
+                else if (mouse_held == 2) grid_unset(gx, gy);
+            } else if (m->type == 2) { /* release */
+                mouse_held = 0;
+            }
+        }
 
         long long now = now_ms();
         if (running && now - last_step >= speed_ms) {
@@ -368,7 +579,7 @@ int main(void) {
             last_step = now;
         }
 
-        render(running, speed_ms);
+        render(running, speed_ms, draw_mode);
         usleep(16000); /* ~60 fps cap */
     }
 

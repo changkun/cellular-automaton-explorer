@@ -31,6 +31,8 @@
  *   W           Toggle wormhole portal placement (left=entrance, right=exit, middle=remove)
  *                 Paired portals create non-local neighbor coupling
  *   v           Toggle pattern census overlay (counts known structures)
+ *   G           Genetic rule explorer — evolve interesting rulesets
+ *                 Press G again to breed next generation, 1-5 to load rule, q to close
  *   S           Toggle stamp mode (place classic patterns from library)
  *                 [/] cycle pattern, scroll wheel rotates 0°/90°/180°/270°
  *                 Left-click places pattern, right-click cancels stamp mode
@@ -141,6 +143,30 @@ static unsigned char census_claimed[MAX_H][MAX_W];
 
 /* Forward declaration — defined after grid_step where H/W/wrap_mode are available */
 static void census_scan(void);
+
+/* ── Genetic Rule Explorer ────────────────────────────────────────────────── */
+#define GENPOP_SIZE 20       /* population of candidate rules per generation */
+#define GENBEST_SIZE 5       /* top N shown in overlay / used as parents */
+#define GENEVAL_STEPS 200    /* simulation steps per evaluation */
+#define GENEVAL_W 80         /* mini-grid width for evaluation */
+#define GENEVAL_H 60         /* mini-grid height for evaluation */
+
+typedef struct {
+    unsigned short birth;
+    unsigned short survival;
+    float score;             /* fitness score (higher = more interesting) */
+    char label[24];          /* B.../S... string */
+} GeneCandidate;
+
+static int gene_mode = 0;        /* 0=off, 1=running search, 2=showing results */
+static int gene_gen = 0;         /* evolution generation counter */
+static GeneCandidate gene_best[GENBEST_SIZE]; /* top candidates to display */
+static int gene_selected = -1;   /* highlighted candidate (-1=none) */
+static int gene_search_done = 0; /* flag: search iteration complete */
+
+/* Forward declarations */
+static void gene_search_step(void);
+static void gene_format_rule(char *buf, int buflen, unsigned short b, unsigned short s);
 
 static int W = MAX_W, H = MAX_H; /* simulation always uses full grid */
 static int generation;
@@ -861,6 +887,253 @@ static void census_scan(void) {
                 census_unmatched++;
 
     census_stale = 0;
+}
+
+/* ── Genetic Rule Explorer — evaluation & evolution ───────────────────────── */
+
+static void gene_format_rule(char *buf, int buflen, unsigned short b, unsigned short s) {
+    char *p = buf;
+    char *end = buf + buflen - 1;
+    *p++ = 'B';
+    for (int i = 0; i <= 8 && p < end; i++)
+        if (b & (1 << i)) *p++ = '0' + i;
+    *p++ = '/';
+    *p++ = 'S';
+    for (int i = 0; i <= 8 && p < end; i++)
+        if (s & (1 << i)) *p++ = '0' + i;
+    *p = '\0';
+}
+
+/* Evaluate a rule's "interestingness" via mini-simulation */
+static float gene_evaluate(unsigned short b, unsigned short s) {
+    static unsigned char mg[GENEVAL_H][GENEVAL_W];
+    static unsigned char mg2[GENEVAL_H][GENEVAL_W];
+
+    /* Seed the mini-grid with R-pentomino + random 10% fill in center region */
+    memset(mg, 0, sizeof(mg));
+    int cx = GENEVAL_W / 2, cy = GENEVAL_H / 2;
+    /* R-pentomino */
+    mg[cy-1][cx] = 1; mg[cy-1][cx+1] = 1;
+    mg[cy][cx-1] = 1; mg[cy][cx] = 1;
+    mg[cy+1][cx] = 1;
+    /* Random scatter in center 20x20 */
+    for (int dy = -10; dy < 10; dy++)
+        for (int dx = -10; dx < 10; dx++)
+            if (rand() % 10 == 0)
+                mg[cy+dy][cx+dx] = 1;
+
+    int pop_history[GENEVAL_STEPS];
+    memset(pop_history, 0, sizeof(pop_history));
+    int pop = 0;
+    for (int y = 0; y < GENEVAL_H; y++)
+        for (int x = 0; x < GENEVAL_W; x++)
+            if (mg[y][x]) pop++;
+    pop_history[0] = pop;
+
+    /* Run simulation */
+    for (int step = 1; step < GENEVAL_STEPS; step++) {
+        memset(mg2, 0, sizeof(mg2));
+        pop = 0;
+        for (int y = 0; y < GENEVAL_H; y++) {
+            for (int x = 0; x < GENEVAL_W; x++) {
+                int n = 0;
+                for (int dy = -1; dy <= 1; dy++)
+                    for (int dx = -1; dx <= 1; dx++) {
+                        if (dx == 0 && dy == 0) continue;
+                        int ny = y + dy, nx = x + dx;
+                        if (ny < 0 || ny >= GENEVAL_H || nx < 0 || nx >= GENEVAL_W) continue;
+                        if (mg[ny][nx]) n++;
+                    }
+                int alive = mg[y][x];
+                if ((alive && (s & (1 << n))) || (!alive && (b & (1 << n)))) {
+                    mg2[y][x] = 1;
+                    pop++;
+                }
+            }
+        }
+        memcpy(mg, mg2, sizeof(mg));
+        pop_history[step] = pop;
+
+        /* Early exit: extinction or explosion */
+        if (pop == 0) break;
+        if (pop > (GENEVAL_W * GENEVAL_H * 3) / 4) break;
+    }
+
+    /* ── Scoring ── */
+    float score = 0.0f;
+
+    /* Count valid steps first */
+    int valid_steps = 1; /* at least step 0 */
+    for (int i = 1; i < GENEVAL_STEPS; i++) {
+        if (pop_history[i] == 0 && i > 0) break;
+        valid_steps = i + 1;
+    }
+
+    /* 1. Population stability: penalize extinction and explosion */
+    int final_pop = pop_history[valid_steps - 1];
+    int total_cells = GENEVAL_W * GENEVAL_H;
+    if (final_pop == 0) return 0.0f;  /* boring: everything dies */
+    if (final_pop > total_cells * 3 / 4) return 0.0f;  /* boring: fills up */
+
+    /* Prefer populations in 5-50% range */
+    float density = (float)final_pop / total_cells;
+    if (density >= 0.05f && density <= 0.50f)
+        score += 20.0f;
+    else
+        score += 5.0f;
+
+    /* 2. Population variance — measure dynamism */
+    float mean_pop = 0;
+    for (int i = 0; i < valid_steps; i++)
+        mean_pop += pop_history[i];
+    mean_pop /= valid_steps;
+    float variance = 0;
+    for (int i = 0; i < valid_steps; i++) {
+        float d = pop_history[i] - mean_pop;
+        variance += d * d;
+    }
+    variance /= valid_steps;
+    float cv = (mean_pop > 0) ? sqrtf(variance) / mean_pop : 0; /* coefficient of variation */
+    /* Sweet spot: some variation (0.05-0.5) is interesting, too stable or too wild is less so */
+    if (cv >= 0.02f && cv <= 0.5f)
+        score += 30.0f * (1.0f - fabsf(cv - 0.15f) / 0.5f);
+    else if (cv > 0.5f)
+        score += 5.0f;
+
+    /* 3. Oscillation detection: compare late-phase snapshots */
+    if (valid_steps >= 50) {
+        int matches = 0;
+        for (int period = 1; period <= 12; period++) {
+            int pops_match = 0;
+            for (int i = valid_steps - 20; i < valid_steps; i++) {
+                if (i - period >= 0 && pop_history[i] == pop_history[i - period])
+                    pops_match++;
+            }
+            if (pops_match >= 15) matches++; /* likely periodic */
+        }
+        score += matches * 5.0f; /* bonus for periodicity */
+    }
+
+    /* 4. Longevity bonus: survived longer = more interesting */
+    score += (float)valid_steps / GENEVAL_STEPS * 15.0f;
+
+    /* 5. Structural complexity: count distinct population values in last 50 steps */
+    if (valid_steps > 50) {
+        int distinct = 0;
+        int seen[256]; memset(seen, 0, sizeof(seen));
+        for (int i = valid_steps - 50; i < valid_steps; i++) {
+            int bucket = pop_history[i] % 256;
+            if (!seen[bucket]) { seen[bucket] = 1; distinct++; }
+        }
+        score += (distinct > 20 ? 20 : distinct) * 0.5f;
+    }
+
+    return score;
+}
+
+/* Mutate a rule: flip 1-3 random bits */
+static void gene_mutate(unsigned short *b, unsigned short *s, int strength) {
+    int flips = 1 + (rand() % strength);
+    for (int i = 0; i < flips; i++) {
+        int which = rand() % 18;
+        if (which < 9)
+            *b ^= (unsigned short)(1 << which);
+        else
+            *s ^= (unsigned short)(1 << (which - 9));
+    }
+}
+
+/* Crossover: combine two parents' B/S masks */
+static void gene_crossover(unsigned short b1, unsigned short s1,
+                           unsigned short b2, unsigned short s2,
+                           unsigned short *bo, unsigned short *so) {
+    /* Uniform crossover: each bit randomly from parent 1 or 2 */
+    *bo = 0; *so = 0;
+    for (int i = 0; i <= 8; i++) {
+        if (rand() % 2)
+            *bo |= (b1 & (unsigned short)(1 << i));
+        else
+            *bo |= (b2 & (unsigned short)(1 << i));
+        if (rand() % 2)
+            *so |= (s1 & (unsigned short)(1 << i));
+        else
+            *so |= (s2 & (unsigned short)(1 << i));
+    }
+}
+
+/* Run one evolution generation */
+static void gene_search_step(void) {
+    GeneCandidate pool[GENPOP_SIZE];
+
+    if (gene_gen == 0) {
+        /* First generation: seed from current rule + random mutations + random rules */
+        for (int i = 0; i < GENPOP_SIZE; i++) {
+            if (i == 0) {
+                /* Current rule as-is */
+                pool[i].birth = birth_mask;
+                pool[i].survival = survival_mask;
+            } else if (i < GENPOP_SIZE / 2) {
+                /* Mutations of current rule */
+                pool[i].birth = birth_mask;
+                pool[i].survival = survival_mask;
+                gene_mutate(&pool[i].birth, &pool[i].survival, 1 + (i / 4));
+            } else if (i < GENPOP_SIZE * 3 / 4) {
+                /* Mutations of known interesting presets */
+                int pi = rand() % N_RULESETS;
+                pool[i].birth = rulesets[pi].birth;
+                pool[i].survival = rulesets[pi].survival;
+                gene_mutate(&pool[i].birth, &pool[i].survival, 2);
+            } else {
+                /* Fully random */
+                pool[i].birth = (unsigned short)(rand() & 0x1FF);    /* bits 0-8 */
+                pool[i].survival = (unsigned short)(rand() & 0x1FF);
+            }
+        }
+    } else {
+        /* Breed from previous best */
+        for (int i = 0; i < GENPOP_SIZE; i++) {
+            if (i < GENBEST_SIZE) {
+                /* Keep the elites with minor mutation */
+                pool[i].birth = gene_best[i].birth;
+                pool[i].survival = gene_best[i].survival;
+                if (i > 0) gene_mutate(&pool[i].birth, &pool[i].survival, 1);
+            } else if (i < GENPOP_SIZE * 3 / 4) {
+                /* Crossover of two random elites + mutation */
+                int p1 = rand() % GENBEST_SIZE;
+                int p2 = rand() % GENBEST_SIZE;
+                gene_crossover(gene_best[p1].birth, gene_best[p1].survival,
+                               gene_best[p2].birth, gene_best[p2].survival,
+                               &pool[i].birth, &pool[i].survival);
+                gene_mutate(&pool[i].birth, &pool[i].survival, 1);
+            } else {
+                /* Fresh random to maintain diversity */
+                pool[i].birth = (unsigned short)(rand() & 0x1FF);
+                pool[i].survival = (unsigned short)(rand() & 0x1FF);
+            }
+        }
+    }
+
+    /* Evaluate all candidates */
+    for (int i = 0; i < GENPOP_SIZE; i++) {
+        pool[i].score = gene_evaluate(pool[i].birth, pool[i].survival);
+        gene_format_rule(pool[i].label, sizeof(pool[i].label), pool[i].birth, pool[i].survival);
+    }
+
+    /* Selection sort top GENBEST_SIZE */
+    for (int i = 0; i < GENBEST_SIZE; i++) {
+        int best = i;
+        for (int j = i + 1; j < GENPOP_SIZE; j++)
+            if (pool[j].score > pool[best].score) best = j;
+        if (best != i) {
+            GeneCandidate tmp = pool[i];
+            pool[i] = pool[best];
+            pool[best] = tmp;
+        }
+        gene_best[i] = pool[i];
+    }
+
+    gene_gen++;
+    gene_search_done = 1;
 }
 
 static void grid_set(int x, int y) {
@@ -2568,6 +2841,15 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(census_str, sizeof(census_str),
                  " \033[38;2;100;220;160m\u2630CENSUS\033[0m");
 
+    /* Genetic explorer indicator */
+    char gene_str[64] = "";
+    if (gene_mode == 1)
+        snprintf(gene_str, sizeof(gene_str),
+                 " \033[38;2;255;160;40m\u2042EVOLVE...\033[0m");
+    else if (gene_mode == 2)
+        snprintf(gene_str, sizeof(gene_str),
+                 " \033[38;2;255;160;40m\u2042EVOLVE G%d\033[0m", gene_gen);
+
     /* Zoom indicator */
     char zoom_str[32] = "";
     if (zoom > 1)
@@ -2658,9 +2940,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, wrap_str, draw_str, heat_str, tracer_str, freq_str, census_str, sym_str, zoom_str, map_str, zone_str,
+                 state, wrap_str, draw_str, heat_str, tracer_str, freq_str, census_str, gene_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -2685,7 +2967,7 @@ static void render(int running, int speed_ms, int draw_mode) {
     /* status bar line 2: compact help */
     p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
                      "[1-5]pre [d]draw [k]sym [g]graph [w]wrap [h]heat [T]trace [f]freq "
-                     "[/]rule [m]mut [b]edit [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
+                     "[/]rule [m]mut [b]edit [G]evolve [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
                      "[S]stamp [v]census [z/x]zoom [n]map [<>]time [t]tbar [P]snap C-p:seq "
                      "C-s:save C-o:load [q]quit\033[0m\033[K\n");
 
@@ -3045,6 +3327,64 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", rst);
     }
 
+    /* Genetic Rule Explorer overlay (center of screen) */
+    if (gene_mode == 2 && gene_search_done) {
+        int ge_w = 36;
+        int ge_h = GENBEST_SIZE + 4; /* border + header + entries + footer + border */
+        int ge_col = (term_cols - ge_w) / 2;
+        int ge_row = (term_rows - ge_h) / 2;
+        if (ge_col < 1) ge_col = 1;
+        if (ge_row < 3) ge_row = 3;
+
+        const char *bdr = "\033[38;2;255;160;40;48;2;20;14;4m";
+        const char *bg = "\033[48;2;20;14;4m";
+        const char *rst2 = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 Evolve G%d ",
+                     ge_row, ge_col, bdr, gene_gen);
+        int title_len = 12;
+        { int t = gene_gen; while (t >= 10) { title_len++; t /= 10; } }
+        for (int i = title_len; i < ge_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", rst2);
+
+        /* Header */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s \033[38;2;200;200;200m#  Rule             Score%s",
+                     ge_row + 1, ge_col, bdr, bg, bg);
+        for (int i = 26; i < ge_w - 1; i++) *p++ = ' ';
+        p += sprintf(p, "%s\xe2\x94\x82%s", bdr, rst2);
+
+        /* Candidate entries */
+        for (int i = 0; i < GENBEST_SIZE; i++) {
+            int row = ge_row + 2 + i;
+            int is_sel = (gene_selected == i);
+            const char *hi = is_sel ? "\033[48;2;60;40;10m" : bg;
+            const char *nclr = is_sel ? "\033[38;2;255;255;200m" : "\033[38;2;255;200;80m";
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s %s%d  %-18s %5.1f%s",
+                         row, ge_col, bdr, hi,
+                         nclr, i + 1, gene_best[i].label, (double)gene_best[i].score, hi);
+            /* pad */
+            int entry_len = 28;
+            { float sc = gene_best[i].score; if (sc >= 10) entry_len++; if (sc >= 100) entry_len++; }
+            for (int j = entry_len; j < ge_w - 1; j++) *p++ = ' ';
+            p += sprintf(p, "%s\xe2\x94\x82%s", bdr, rst2);
+        }
+
+        /* Footer with instructions */
+        int frow = ge_row + 2 + GENBEST_SIZE;
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s \033[38;2;140;140;100m1-5:load G:evolve q:close%s",
+                     frow, ge_col, bdr, bg, bg);
+        for (int i = 26; i < ge_w - 1; i++) *p++ = ' ';
+        p += sprintf(p, "%s\xe2\x94\x82%s", bdr, rst2);
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", frow + 1, ge_col, bdr);
+        for (int i = 0; i < ge_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", rst2);
+    }
+
     *p = '\0';
 
     (void)!write(STDOUT_FILENO, render_buf, p - render_buf);
@@ -3111,7 +3451,34 @@ int main(void) {
         }
 
         int key = read_input();
-        if (key == 'q' || key == 'Q' || key == 27 || key == 3)
+        if (gene_mode == 2 && (key == 'q' || key == 'Q' || key == 27)) {
+            /* Close genetic explorer overlay without quitting */
+            gene_mode = 0;
+            gene_search_done = 0;
+            printf("\033[2J"); fflush(stdout);
+        }
+        else if (gene_mode == 2 && key >= '1' && key <= '5') {
+            /* Load selected candidate rule from gene overlay */
+            int idx = key - '1';
+            if (idx < GENBEST_SIZE && gene_best[idx].score > 0) {
+                birth_mask = gene_best[idx].birth;
+                survival_mask = gene_best[idx].survival;
+                current_ruleset = find_matching_ruleset();
+                if (current_ruleset < 0) current_ruleset = 0;
+                char msg[64];
+                snprintf(msg, sizeof(msg), "Loaded %s", gene_best[idx].label);
+                flash_set(msg);
+                gene_mode = 0;
+                gene_search_done = 0;
+                printf("\033[2J"); fflush(stdout);
+            }
+        }
+        else if (gene_mode == 2 && key == 'G') {
+            /* Evolve another generation while overlay is showing */
+            gene_search_step();
+            printf("\033[2J"); fflush(stdout);
+        }
+        else if (key == 'q' || key == 'Q' || key == 27 || key == 3)
             break;
         else if (key == ' ' || key == 'p') {
             if (replay_mode) {
@@ -3295,6 +3662,19 @@ int main(void) {
         }
         else if (key == 'b' || key == 'B') {
             rule_editor = !rule_editor;
+        }
+        else if (key == 'G') {
+            if (gene_mode == 0) {
+                /* Start genetic search */
+                gene_mode = 1;
+                gene_gen = 0;
+                gene_search_done = 0;
+                gene_selected = -1;
+                gene_search_step();
+                gene_mode = 2; /* show results */
+                printf("\033[2J"); fflush(stdout);
+            }
+            /* gene_mode==2 'G' is handled above in the priority block */
         }
         else if (key == 'v' || key == 'V') {
             census_mode = !census_mode;

@@ -50,6 +50,9 @@ Requires only `gcc` and a POSIX terminal.
 | `S` | Toggle pattern stamp mode (place classic structures) |
 | `[` / `]` | Cycle stamp pattern (in stamp mode) |
 | Scroll wheel | Rotate stamp 0°/90°/180°/270° (in stamp mode) |
+| `G` | Genetic rule explorer — evolve interesting rulesets |
+| `G` (in overlay) | Breed next generation of candidate rules |
+| `1`–`5` (in overlay) | Load a discovered rule into the simulation |
 | `Ctrl-S` | Save state to numbered `.life` file |
 | `Ctrl-O` | Load most recent `.life` save |
 | `Arrow keys` | Pan viewport across the full 400×200 grid |

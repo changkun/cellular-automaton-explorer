@@ -1,2 +1,23 @@
 # Compiled binary
 life
+
+# Save files
+*.life
+
+# Screenshots and animation frames
+*.ppm
+
+# RLE exports
+export_*.rle
+
+# macOS
+.DS_Store
+
+# Editor swap files
+*.swp
+*.swo
+*~
+
+# IDE
+.vscode/
+.idea/

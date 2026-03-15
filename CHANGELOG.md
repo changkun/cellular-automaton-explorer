@@ -1,0 +1,205 @@
+# Changelog
+
+Development history organized by round. Each round adds one or two major
+features. The project grew from ~790 lines (Round 1) to ~10,800 lines
+(Round 42).
+
+## Round 42 — Auto-Demo Mode
+
+Guided tour through 10 curated scenes showcasing pattern + overlay
+combinations. Press `D` to start, any key to exit.
+
+## Round 41 — Cell Probe Inspector
+
+Unified per-cell metric display. Click any cell with `?` active to see all
+14+ analysis values at once.
+
+## Round 40 — Kolmogorov Complexity
+
+LZ77-style compression of local neighborhoods to estimate algorithmic
+complexity. Per-cell heatmap from compressible (blue) to incompressible (red).
+
+## Round 39 — Renormalization Group Flow
+
+Real-space RG via majority-rule block decimation at 2×, 4×, 8× scales.
+Criticality score detects scale-invariant (critical) configurations.
+
+## Round 38 — Topological Feature Map
+
+Connected component labeling (β₀) and enclosed hole detection (β₁) via
+4-connected flood fill. Each component uniquely colored.
+
+## Round 37 — Composite Complexity Index
+
+Fuses entropy, Lyapunov, surprise, and frequency into a per-cell
+edge-of-chaos score with concave edge-boost transform.
+
+## Round 36 — Mutual Information Network
+
+Inter-region coupling map. Grid partitioned into 20×10 blocks, MI computed
+for all ~20K block pairs. Top-40 couplings rendered as Bresenham lines.
+
+## Round 35 — Prediction Surprise Field
+
+Per-cell transition surprisal based on accumulated 32-frame statistics.
+Highlights where outcomes defy the learned distribution.
+
+## Round 34 — Causal Light Cone
+
+Backward/forward dependency cones from a selected cell. Visualizes
+relativistic-style information propagation limits.
+
+## Round 33 — Phase-Space Attractor
+
+Takens delay embedding of population time series. Auto-tuned delay τ,
+correlation dimension D₂ via Grassberger-Procaccia.
+
+## Round 32 — Information Flow Field
+
+Transfer entropy causal vectors between cells. Arrow glyphs show net
+information flow direction with source/sink/vorticity detection.
+
+## Round 31 — Wolfram Class Detector
+
+Real-time automaton classification into Wolfram Classes I–IV based on
+population dynamics, entropy, and Lyapunov analysis.
+
+## Round 30 — Fractal Dimension Analyzer
+
+Box-counting method at scales 2–128 with log-log regression for D_box
+and R² goodness-of-fit.
+
+## Round 29 — 2D Fourier Spectrum
+
+Spatial FFT of grid density with radial power distribution display.
+
+## Round 28 — Lyapunov Sensitivity Map
+
+Shadow grid perturbation tracking for divergence visualization. Positive
+exponent = chaos, zero = edge, negative = stability.
+
+## Round 27 — Temperature Field
+
+Stochastic noise field with paintable hot/cold regions. Enables
+phase-transition experiments in cellular automata.
+
+## Round 26 — Shannon Entropy Heatmap
+
+Per-cell local Shannon entropy of 3×3 neighborhoods with distribution panel.
+
+## Round 25 — Population Dynamics Dashboard
+
+Per-species population graphing overlay with statistics.
+
+## Round 24 — RLE Import/Export
+
+Standard Game of Life Run Length Encoded pattern format support. Import via
+command-line argument, export via `Ctrl-E`.
+
+## Round 23 — Spaceship Detection
+
+Extended pattern census with glider and spaceship recognition.
+
+## Round 22 — Topological Surface Modes
+
+Flat, torus, Klein bottle, Möbius strip, and projective plane boundary
+conditions.
+
+## Round 21 — Braille Ultra-Density Rendering
+
+8× zoom using Braille Unicode characters for maximum information density.
+
+## Round 20 — Genetic Rule Explorer
+
+Genetic algorithm evolving 20 candidate rulesets per generation toward
+"interesting" behavior (population stability, oscillation, complexity).
+
+## Round 19 — Pattern Census Overlay
+
+Real-time structure recognition via bitmask matching with dead-border
+verification. Identifies 14 pattern templates (8 still lifes + 6 oscillator
+phases).
+
+## Round 18 — PPM Screenshot Capture
+
+Single-frame and full-timeline PPM export with auto-numbered filenames.
+
+## Round 17 — Pattern Stamp Tool
+
+Library of 20 classic patterns with 4 rotations each. Preview overlay,
+integration with symmetry and species modes.
+
+## Round 16 — Dual-Species Ecosystem
+
+Red and Blue populations with independent B/S rules and tunable inter-species
+interaction coefficient (-1.0 hostile to +1.0 cooperative).
+
+## Round 15 — Wormhole Portals
+
+Paired non-local spatial couplings with additive neighbor model. Up to 8
+portal pairs with animated ring visualization.
+
+## Round 14 — Frequency Analysis
+
+Per-cell oscillation period detection via autocorrelation over 64 frames.
+Color spectrum from ice blue (still) to hot red (chaotic).
+
+## Round 13 — Signal Tracer
+
+Persistent motion trail visualization with purple → magenta → pink palette.
+Accumulate, freeze, and clear modes.
+
+## Round 12 — Interactive Rule Editor
+
+Clickable B/S bit grid and preset name buttons. Live simulation underneath.
+
+## Round 11 — Save/Load
+
+Binary `.life` files with magic header, version byte, and auto-numbered slots.
+
+## Round 10 — Time-Travel Replay
+
+256-frame history ring buffer with rewind, fast-forward, and branching from
+any historical point. Timeline scrubber bar.
+
+## Round 9 — Emitters & Absorbers
+
+Point cell sources (4 patterns) and circular kill zones for open dissipative
+dynamics.
+
+## Round 8 — Multi-Rule Zones
+
+Per-cell ruleset assignment with preset zone layouts. Emergent boundary
+behavior between different rule regions.
+
+## Round 7 — Minimap Overlay
+
+Quarter-block thumbnail of full grid with yellow viewport rectangle.
+
+## Round 6 — Zoom & Pan
+
+3 zoom levels (1×, 2× half-block, 4× quarter-block) with arrow key and
+mouse navigation.
+
+## Round 5 — Kaleidoscope Drawing
+
+2/4/8-fold symmetric mouse painting with reflections around grid center.
+
+## Round 4 — Rule Mutation
+
+Live B/S bit flipping to explore the rule space. Status bar mutant indicator.
+
+## Round 3 — Cell-Age Heatmap & Ghost Trails
+
+24-bit true-color thermal gradient for cell age. 5-frame fading markers
+where cells die.
+
+## Round 2 — Mouse Painting, Sparkline, Toroidal Wrapping
+
+Interactive drawing mode, population sparkline with Unicode blocks, and
+toroidal (wrapping) boundary conditions.
+
+## Round 1 — Foundation
+
+Core Game of Life simulation with 10 rule presets, 5 starting patterns,
+keyboard controls, ANSI rendering. ~790 lines.

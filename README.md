@@ -1,92 +1,199 @@
-# Life-like Cellular Automaton Explorer — Terminal Edition
+# Life — Cellular Automaton Explorer
 
-A fully interactive, zero-dependency cellular automaton explorer that runs in any terminal.
-Written in C with ANSI escape codes for rendering. Supports Conway's Game of Life
-and 9 other Life-like rulesets, live rule mutation, and kaleidoscope drawing.
+A fully interactive, zero-dependency cellular automaton explorer for the terminal.
+10,000+ lines of pure C. No libraries. No frameworks. Just ANSI escape codes and `math.h`.
 
-![Terminal simulation](https://upload.wikimedia.org/wikipedia/commons/e/e5/Gospers_glider_gun.gif)
+Supports Conway's Game of Life and 9 other Life-like rulesets, 20+ scientific
+analysis overlays, time-travel replay, multi-rule zones, wormhole portals,
+dual-species ecosystems, genetic rule evolution, and more — all at 60 fps in
+your terminal.
 
-## Build & Run
+## Table of Contents
 
+- [Quick Start](#quick-start)
+- [Features at a Glance](#features-at-a-glance)
+- [Controls](#controls)
+  - [Keyboard](#keyboard)
+  - [Mouse](#mouse)
+- [Rule Presets](#rule-presets)
+  - [Interactive Rule Editor](#interactive-rule-editor)
+- [Simulation Features](#simulation-features)
+  - [Multi-Rule Zones](#multi-rule-zones)
+  - [Emitters & Absorbers](#emitters--absorbers)
+  - [Wormhole Portals](#wormhole-portals)
+  - [Dual-Species Ecosystem](#dual-species-ecosystem)
+  - [Temperature Field](#temperature-field)
+  - [Pattern Stamp Tool](#pattern-stamp-tool)
+  - [Genetic Rule Explorer](#genetic-rule-explorer)
+- [Scientific Analysis Overlays](#scientific-analysis-overlays)
+  - [Entropy Heatmap](#entropy-heatmap)
+  - [Lyapunov Sensitivity](#lyapunov-sensitivity)
+  - [Fourier Spectrum](#fourier-spectrum)
+  - [Fractal Dimension](#fractal-dimension)
+  - [Frequency Analysis](#frequency-analysis)
+  - [Wolfram Class Detector](#wolfram-class-detector)
+  - [Information Flow Field](#information-flow-field)
+  - [Phase-Space Attractor](#phase-space-attractor)
+  - [Causal Light Cone](#causal-light-cone)
+  - [Prediction Surprise](#prediction-surprise)
+  - [Mutual Information Network](#mutual-information-network)
+  - [Composite Complexity Index](#composite-complexity-index)
+  - [Topological Feature Map](#topological-feature-map)
+  - [Renormalization Group Flow](#renormalization-group-flow)
+  - [Kolmogorov Complexity](#kolmogorov-complexity)
+  - [Cell Probe Inspector](#cell-probe-inspector)
+- [Visualization](#visualization)
+  - [Heatmap & Ghost Trails](#heatmap--ghost-trails)
+  - [Signal Tracer](#signal-tracer)
+  - [Pattern Census](#pattern-census)
+  - [Population Sparkline](#population-sparkline)
+  - [Minimap](#minimap)
+  - [Auto-Demo Mode](#auto-demo-mode)
+- [Time-Travel Replay](#time-travel-replay)
+- [File I/O](#file-io)
+  - [Save & Load](#save--load)
+  - [RLE Import/Export](#rle-importexport)
+  - [Screenshot Capture](#screenshot-capture)
+- [Build Options](#build-options)
+- [Requirements](#requirements)
+- [Architecture](#architecture)
+- [Further Reading](#further-reading)
+- [License](#license)
+
+---
+
+## Quick Start
+
+```bash
+make        # compile
+./life      # run
 ```
-make && ./life
+
+Press `SPACE` to play/pause, `r` to randomize, `d` to draw with the mouse,
+`h` for heatmap mode. Press `D` for a guided demo tour. `q` to quit.
+
+Load an RLE pattern file:
+
+```bash
+./life pattern.rle
 ```
 
-Requires only `gcc` and a POSIX terminal.
+## Features at a Glance
+
+| Category | Features |
+|----------|----------|
+| **Simulation** | 10 rule presets, live mutation, multi-rule zones, emitters/absorbers, wormhole portals, dual-species ecosystems, temperature field |
+| **Analysis** | Shannon entropy, Lyapunov exponents, 2D FFT, fractal dimension, frequency detection, Wolfram classification, transfer entropy, phase-space attractors, causal light cones, prediction surprise, mutual information, composite complexity, topological features, renormalization group, Kolmogorov complexity |
+| **Interaction** | Mouse drawing, zoom/pan, kaleidoscope symmetry, pattern stamps, genetic rule search, time-travel replay |
+| **Visualization** | 24-bit true-color heatmaps, ghost trails, signal tracer, population sparkline, minimap, auto-demo mode |
+| **I/O** | Binary save/load, RLE import/export, PPM screenshots, timeline animation export |
 
 ## Controls
+
+### Keyboard
+
+#### Core
 
 | Key | Action |
 |-----|--------|
 | `SPACE` / `p` | Play / Pause |
 | `s` | Step one generation (while paused) |
 | `r` | Randomize grid |
-| `c` | Clear grid |
-| `w` | Toggle toroidal wrapping (∞ indicator) |
-| `d` | Toggle draw mode (mouse painting) |
-| `g` | Toggle population sparkline graph |
-| `y` | Toggle population dynamics dashboard (graph + stats overlay) |
-| `h` | Toggle heatmap mode (age coloring + ghost trails) |
-| `[` / `]` | Cycle through rule presets (or zone brush in zone mode) |
-| `m` | Mutate — randomly flip one birth/survival bit |
-| `b` | Toggle rule editor overlay (click B/S bits or preset names) |
-| `j` | Toggle zone-paint mode (paint regions with different rulesets) |
-| `k` | Cycle symmetry: none → 2-fold → 4-fold → 8-fold (kaleidoscope) |
-| `z` / `x` | Zoom in / out (1x → 2x half-block → 4x quarter-block) |
-| `n` | Toggle minimap overlay (full-grid thumbnail + viewport rect) |
-| `e` | Cycle emitter/absorber mode (off → emitter → absorber) |
-| `[` / `]` | Cycle emitter pattern or absorber radius |
-| `<` / `,` | Rewind through history (enters replay mode) |
-| `>` / `.` | Fast-forward through history |
-| `t` | Toggle timeline scrubber bar |
-| `T` | Cycle signal tracer: off → accumulate → frozen → clear+off |
-| `f` | Toggle frequency analysis overlay (period detection heatmap) |
-| `W` | Toggle wormhole portal placement mode |
-| `a` | Toggle dual-species ecosystem mode |
-| `6` | Toggle brush species (A ↔ B) in ecosystem mode |
-| `{` / `}` | Adjust cross-species interaction coefficient (-1.0 to +1.0) |
-| `P` | Screenshot — save viewport as PPM image (`frame_NNNN.ppm`) |
-| `Ctrl-P` | Dump full timeline buffer as numbered PPM image sequence |
-| `v` | Toggle live pattern census overlay |
-| `S` | Toggle pattern stamp mode (place classic structures) |
-| `[` / `]` | Cycle stamp pattern (in stamp mode) |
-| Scroll wheel | Rotate stamp 0°/90°/180°/270° (in stamp mode) |
-| `C` | Toggle Wolfram class detector (auto-classify I/II/III/IV) |
-| `O` | Toggle information flow field (transfer entropy causal vectors) |
-| `A` | Toggle phase-space attractor (Takens delay embedding portrait) |
-| `9` | Toggle causal light cone — click cell to trace backward/forward cones |
-| `!` | Toggle prediction surprise field (per-cell transition surprisal heatmap) |
-| `@` | Toggle mutual information network (inter-region coupling map) |
-| `#` | Toggle composite complexity index (edge-of-chaos heatmap) |
-| `$` | Toggle topological feature map (connected components + holes, β₀/β₁) |
-| `%` | Toggle renormalization group flow (multi-scale structure analysis) |
-| `+`/`-` (in cone) | Adjust forward cone depth |
-| `G` | Genetic rule explorer — evolve interesting rulesets |
-| `G` (in overlay) | Breed next generation of candidate rules |
-| `1`–`5` (in overlay) | Load a discovered rule into the simulation |
-| `Ctrl-S` | Save state to numbered `.life` file |
-| `Ctrl-O` | Load most recent `.life` save |
-| `Arrow keys` | Pan viewport across the full 400×200 grid |
-| `0` | Re-center viewport |
-| `1`–`5` | Load preset pattern |
+| `c` | Clear grid (press twice to also clear zones/portals) |
 | `+` / `-` | Speed up / slow down (20ms–1000ms) |
 | `q` / `ESC` | Quit |
 
-### Mouse (draw mode)
+#### Drawing & Placement
+
+| Key | Action |
+|-----|--------|
+| `d` | Toggle draw mode (mouse painting) |
+| `k` | Cycle symmetry: none → 2-fold → 4-fold → 8-fold |
+| `S` | Toggle stamp mode (place classic patterns) |
+| `e` | Cycle emitter/absorber placement mode |
+| `W` | Toggle wormhole portal placement |
+
+#### Navigation
+
+| Key | Action |
+|-----|--------|
+| `z` / `x` | Zoom in / out (1× → 2× → 4×) |
+| Arrow keys | Pan viewport |
+| `0` | Re-center viewport |
+| `n` | Toggle minimap overlay |
+
+#### Rules & Simulation
+
+| Key | Action |
+|-----|--------|
+| `[` / `]` | Cycle rule presets (or zone/stamp/emitter selection) |
+| `m` | Mutate — randomly flip one B/S bit |
+| `b` | Toggle rule editor overlay |
+| `j` | Toggle zone-paint mode |
+| `w` | Cycle topology: flat → torus → Klein bottle → Möbius → projective |
+| `a` | Toggle dual-species ecosystem mode |
+| `6` | Switch brush species (A ↔ B) |
+| `{` / `}` | Adjust cross-species interaction (-1.0 to +1.0) |
+| `X` | Toggle temperature field |
+| `G` | Genetic rule explorer |
+
+#### Visualization
+
+| Key | Action |
+|-----|--------|
+| `h` | Toggle heatmap (cell-age coloring + ghost trails) |
+| `g` | Toggle population sparkline |
+| `y` | Toggle population dynamics dashboard |
+| `t` | Toggle timeline scrubber bar |
+| `T` | Cycle signal tracer: off → accumulate → frozen → clear |
+| `v` | Toggle pattern census overlay |
+| `D` | Auto-demo mode (guided tour) |
+
+#### Analysis Overlays
+
+| Key | Action |
+|-----|--------|
+| `i` | Entropy heatmap (local Shannon entropy) |
+| `u` | 2D Fourier spectrum |
+| `f` | Frequency analysis (oscillation period detection) |
+| `F` | Fractal dimension (box-counting) |
+| `C` | Wolfram class detector (I/II/III/IV) |
+| `O` | Information flow (transfer entropy vectors) |
+| `A` | Phase-space attractor (Takens embedding) |
+| `9` | Causal light cone |
+| `!` | Prediction surprise (per-cell surprisal) |
+| `@` | Mutual information network |
+| `#` | Composite complexity index |
+| `$` | Topological feature map (β₀ components, β₁ holes) |
+| `%` | Renormalization group flow |
+| `^` | Kolmogorov complexity (LZ77 compression) |
+| `?` | Cell probe inspector (all metrics for clicked cell) |
+
+#### File I/O
+
+| Key | Action |
+|-----|--------|
+| `P` | Screenshot (PPM) |
+| `Ctrl-P` | Dump full 256-frame timeline as image sequence |
+| `Ctrl-S` | Save state to `.life` file |
+| `Ctrl-O` | Load most recent save |
+| `Ctrl-E` | Export grid as RLE file |
+
+#### Replay
+
+| Key | Action |
+|-----|--------|
+| `<` / `,` | Rewind (enters replay mode) |
+| `>` / `.` | Fast-forward |
+| `SPACE` | Resume live simulation from current point (branch) |
+
+### Mouse
 
 | Action | Effect |
 |--------|--------|
-| Left-click / drag | Place cells |
-| Right-click / drag | Erase cells |
-| Scroll wheel | Zoom in / out |
-
-## Preset Patterns
-
-1. **Glider** — the classic spaceship
-2. **Pulsar** — period-3 oscillator
-3. **Gosper Glider Gun** — infinite growth, streams gliders
-4. **R-pentomino** — chaotic methuselah (stabilizes after 1103 generations)
-5. **Acorn** — another methuselah (stabilizes after 5206 generations)
+| Left-click / drag | Place cells (or stamps, emitters, portals) |
+| Right-click / drag | Erase cells (or cancel placement) |
+| Scroll wheel | Zoom, rotate stamps, adjust portal/absorber radius |
 
 ## Rule Presets
 
@@ -103,216 +210,69 @@ Requires only `gcc` and a POSIX terminal.
 | Coral | B3/S45678 | Slow coral-reef growth |
 | Anneal | B4678/S35678 | Annealing — noisy regions smooth into blobs |
 
-Press `m` to mutate any ruleset — randomly flips one birth or survival bit,
-creating hybrid rules that may exhibit entirely novel behavior. The status bar
-shows `(mutant)` when the active rule doesn't match any preset.
+Press `m` to mutate any ruleset — randomly flips one birth or survival bit.
+The status bar shows `(mutant)` when the active rule doesn't match any preset.
 
 ### Interactive Rule Editor
 
-Press `b` to open the **rule editor overlay** — a visual panel where you can click
-individual birth and survival bits to toggle them on/off. Click any preset name
-to load it instantly. The simulation continues running underneath, so you see
-the effect of each change in real time.
+Press `b` to open the rule editor overlay — click individual B/S bits to
+toggle them, or click any preset name to load it instantly. The simulation
+keeps running so you see each change in real time.
 
-- **Birth row**: Click digits 0–8 to toggle which neighbor counts cause cell birth
-- **Survive row**: Click digits 0–8 to toggle which neighbor counts let cells survive
-- **Presets**: Click any of the 10 preset names to load that ruleset
-- Active bits are highlighted (green for birth, blue for survival)
-- Combined with zone-paint mode, design exact rules then paint them into regions
+## Simulation Features
 
-## Multi-Rule Zones
+### Multi-Rule Zones
 
-Press `j` to enter **zone-paint mode**, where mouse painting assigns different rulesets
-to regions of the grid. Each cell remembers its zone, and during simulation, cells use
-their zone's birth/survival rules — creating emergent behavior at zone boundaries.
+Press `j` to enter zone-paint mode. Paint different rulesets onto regions of
+the grid. Each cell uses its zone's B/S rules during simulation, creating
+emergent behavior at zone boundaries.
 
-- **Left-click/drag** paints the current zone brush (shown in status bar)
-- **Right-click/drag** resets zones back to the default (Conway)
-- **`[`/`]`** cycles the zone brush through all 10 rulesets
-- **`1`–`5`** loads preset zone layouts (split, quadrants, rings, stripes, checkerboard)
-- Symmetry modes work with zone painting for mandala-like zone patterns
-- Press `c` twice (once to clear cells, once to clear zones) to fully reset
-- Zone tinting is visible when zone mode is active (color-coded backgrounds)
+- `[`/`]` cycles the zone brush through all 10 rulesets
+- `1`–`5` loads preset zone layouts (split, quadrants, rings, stripes, checkerboard)
+- Works with kaleidoscope symmetry for mandala-like zone patterns
 
-Try painting Conway on the left and Maze on the right, then randomize — watch
-gliders from Conway crash into maze corridors! Or use preset `3` (concentric rings)
-for a psychedelic multi-rule target pattern.
+### Emitters & Absorbers
 
-## Emitters & Absorbers
+Press `e` to cycle through placement modes. Emitters are point sources that
+spawn cells at configurable intervals (dot, cross, random, glider patterns).
+Absorbers are circular kill zones that remove all cells within radius.
 
-Press `e` to cycle through **emitter** and **absorber** placement modes. These transform
-the automaton from a closed system into an open dissipative one with steady-state flows.
+Place emitters on one side and absorbers on the other to create rivers of cells
+through multi-rule zones.
 
-- **Emitters** — point sources that spawn cells at configurable intervals. Four patterns:
-  dot, cross, random 3×3, and glider (auto-varies direction by position).
-- **Absorbers** — circular kill zones that continuously remove all cells within radius.
-  Scroll wheel adjusts radius (1–10 cells).
+### Wormhole Portals
 
-Place emitters on one side and absorbers on the other to create rivers of cells.
-Combine with multi-rule zones for complex flow interactions at rule boundaries.
+Press `W` to enter portal placement mode. Left-click to place entrance (cyan),
+click again for exit (magenta). Up to 8 portal pairs. Cells near portals see
+extra neighbors from the paired endpoint, enabling:
 
-## Time-Travel Replay
+- Glider tunneling between distant regions
+- Cross-zone rule bleeding
+- Oscillation disruption from non-local influence
+- Emergent boundary effects at portal perimeters
 
-The simulation automatically records every generation into a 256-frame history ring buffer.
+### Dual-Species Ecosystem
 
-| Key | Action |
-|-----|--------|
-| `<` / `,` | Rewind (enters replay mode) |
-| `>` / `.` | Fast-forward |
-| `s` | Step forward one frame in replay |
-| `SPACE` | Resume live simulation from current point (**branch**) |
-| `t` | Toggle timeline scrubber bar |
+Press `a` to toggle ecosystem mode — two populations (Red/Blue) coexist with
+independent B/S rules and tunable inter-species interaction.
 
-The status bar shows `⏪ REPLAY` when browsing history. The timeline scrubber displays a
-playhead (`●`) showing your position. Pressing SPACE at any point **branches** — it restores
-that historical state, truncates the future, and resumes live simulation from there. This
-lets you rewind to a critical moment, change parameters, and compare outcomes.
+| Interaction | Behavior |
+|-------------|----------|
+| -1.0 | Hostile — cross-species neighbors count negatively |
+| 0.0 | Neutral — species ignore each other |
+| +1.0 | Cooperative — full mutualism |
 
-## Signal Tracer
+Adjust with `{`/`}`. Press `6` to switch brush species.
 
-Press `T` to cycle through tracer modes:
+### Temperature Field
 
-1. **Off** (default) — no trail rendering
-2. **Accumulate** — alive cells build up trail intensity each generation. Dead cells display
-   a purple-to-pink gradient showing where structures have traveled. Glider streams become
-   visible rivers, emitter outputs become flow fields, and zone boundaries show collision patterns.
-3. **Frozen** — trails remain visible but stop accumulating, letting you observe existing
-   trails while the simulation continues evolving underneath
-4. Press `T` again to clear all trails and return to off
+Press `X` to toggle stochastic noise. Paint hot/cold regions with the mouse.
+Cells in hot regions have a probability of spontaneous birth/death, enabling
+phase-transition experiments.
 
-The tracer uses a distinct purple→magenta→pink palette so it doesn't conflict with the
-thermal heatmap (blue→red→white). Combine with 8-fold symmetry and emitters for stunning
-mandala-like trail art.
+### Pattern Stamp Tool
 
-## Frequency Analysis Overlay
-
-Press `f` to toggle the **frequency analysis overlay** — a visualization that reveals the
-hidden temporal structure of the automaton by color-coding every cell based on its oscillation
-period, detected via autocorrelation over the last 64 frames of timeline history.
-
-| Color | Meaning |
-|-------|---------|
-| Ice blue | Still life — permanently alive, never changes |
-| Emerald green | Period 2 — blinkers, toads, beacons |
-| Gold | Period 3 — pulsars |
-| Orange | Period 4–5 |
-| Coral | Period 6–12 |
-| Magenta | Period 13–32 |
-| Hot red | Chaotic — toggles without clear periodicity |
-
-Currently-alive cells are rendered brighter; cells in their "off" phase of an oscillation are
-rendered dimmer, so you can see the full spatial extent of each oscillating structure. A legend
-panel appears in the bottom-left corner.
-
-This mode is especially revealing for patterns like:
-- **Gosper Glider Gun** — the gun itself shows as period-30 (magenta), the stream as chaotic (red)
-- **Pulsars** — beautiful gold p3 structures
-- **R-pentomino aftermath** — still-life debris (blue) surrounded by oscillators (green/gold)
-
-The analysis auto-refreshes every 8 generations while the simulation runs.
-
-## Wormhole Portals
-
-Press `W` to enter **portal placement mode** — create paired wormholes that tunnel cells
-between distant grid regions, breaking the fundamental locality assumption of cellular automata.
-
-### Placement
-- **Left-click** once to place the entrance (cyan ring), click again to place the exit (magenta ring)
-- **Right-click** cancels mid-placement or removes an existing portal under the cursor
-- **Scroll wheel** adjusts portal radius (2–6 cells)
-- Up to 8 portal pairs can coexist
-
-### How it works
-Cells within a portal's radius see **extra neighbors** from the paired endpoint, mapped by
-positional offset — a cell 2 units left of entrance A sees neighbors 2 units left of exit B.
-Coupling is bidirectional: both endpoints contribute neighbors to each other.
-
-Because portal neighbors are *additive* (on top of the normal 8), cells near portals can have
-**>8 effective neighbors**, creating overpopulation pressure under standard rules. This produces:
-
-- **Glider tunneling** — streams enter one portal and emerge from the other
-- **Cross-zone bleeding** — connect two different ruleset zones and watch their physics interfere
-- **Oscillation disruption** — stable oscillators near portals destabilize from non-local influence
-- **Emergent boundary effects** — the portal perimeter itself becomes a site of unusual activity
-
-Portals are saved/loaded with `.life` files and render at all zoom levels with animated
-swirling rings (cyan for entrances, magenta for exits). Press `c` twice to clear portals
-along with zones and emitters.
-
-## Dual-Species Ecosystem
-
-Press `a` to toggle **ecosystem mode** — a dual-species system where Red and Blue populations
-coexist on the same grid with independent birth/survival rules and tunable inter-species interaction.
-
-### Species
-- **Species A** (blue-cyan gradient): defaults to Conway rules (B3/S23)
-- **Species B** (red-orange gradient): defaults to HighLife rules (B36/S23)
-
-Each species counts its own neighbors and cross-species neighbors separately. The effective
-neighbor count is computed as `same + interaction × cross`, where the interaction coefficient
-ranges from -1.0 (hostile) to +1.0 (cooperative).
-
-### Interaction spectrum
-
-| Value | Behavior |
-|-------|----------|
-| -1.0 | Hostile — cross-species neighbors count negatively (overpopulation pressure) |
-| 0.0 | Neutral — species completely ignore each other |
-| +1.0 | Cooperative — cross-species neighbors help equally (full mutualism) |
-
-Adjust with `{` / `}` in increments of 0.1.
-
-### Drawing & controls
-- Press `6` to switch the brush between species A and B
-- Drawing, emitters, and randomize all respect the active brush species
-- Randomize assigns species 50/50 randomly
-- When toggling ecosystem mode on, existing live cells default to species A
-
-### Emergent behaviors
-- **Territorial boundaries** — species carve out regions, with contested frontiers
-- **Predator-prey oscillations** — hostile interaction creates population cycling
-- **Extinction cascades** — one species can drive the other to extinction under strong competition
-- **Symbiotic structures** — cooperative interaction lets mixed-species configurations stabilize
-- **HighLife replicators vs Conway gliders** — the two default rulesets produce dramatically different growth patterns that interact at species boundaries
-
-The minimap shows species A in blue, species B in red, and mixed regions in purple.
-Species data is fully integrated with timeline replay and save/load.
-
-## Live Pattern Census Overlay
-
-Press `v` to toggle the **pattern census overlay** — a real-time structure recognition system
-that scans the grid and identifies known Game of Life patterns by exact bitmask matching.
-
-### Recognized Patterns
-
-| Category | Patterns |
-|----------|----------|
-| Still lifes (green) | Block, Beehive, Loaf, Boat, Tub, Ship, Barge, Long Boat |
-| Oscillators (amber) | Blinker (both phases), Toad (both phases), Beacon (both phases) |
-
-The census uses **dead-border verification** — patterns are only counted when they are properly
-isolated (surrounded by dead cells), ensuring accurate identification of distinct structures
-rather than false positives from larger aggregates.
-
-### Display
-
-The overlay panel shows color-coded counts:
-- **Green** — still life counts (8 types)
-- **Amber** — oscillator counts (3 types, detecting both phase orientations)
-- **Unclaimed** — live cells that don't belong to any recognized pattern
-
-### Performance
-
-The census updates every **16 generations** to maintain smooth rendering, using a `census_stale`
-flag to avoid redundant scans. The 14 pattern templates (8 still lifes + 6 oscillator phases)
-are matched against the full 400×200 grid each update cycle.
-
-## Pattern Stamp Tool
-
-Press `S` to enter **stamp mode** — a library of 20 classic Game of Life patterns that can be
-rotated and placed at any grid position for precise compositional experimentation.
-
-### Pattern Library
+Press `S` to enter stamp mode. Library of 20 classic patterns:
 
 | Category | Patterns |
 |----------|----------|
@@ -322,214 +282,301 @@ rotated and placed at any grid position for precise compositional experimentatio
 | Methuselahs | R-pentomino, Diehard, Acorn, Pi-heptomino |
 | Other | Gosper Gun, Pulsar |
 
-### Controls
+`[`/`]` to cycle patterns, scroll to rotate, left-click to place.
 
-- **`[` / `]`** — cycle through patterns
-- **Scroll wheel** — rotate (0°/90°/180°/270°)
-- **Left-click** — place pattern (respects kaleidoscope symmetry + active species)
-- **Right-click** — exit stamp mode
+### Genetic Rule Explorer
 
-A gold-bordered **preview overlay** in the bottom-right shows the selected pattern's shape,
-name, and current rotation. Stamps integrate with kaleidoscope symmetry (place mandala-like
-arrangements), ecosystem mode (stamp as active species), and wormhole portals (aim gliders
-at portal entrances).
+Press `G` to evolve interesting rulesets via genetic algorithm. 20 candidate
+rules per generation are scored for "interestingness" (population stability,
+oscillation, complexity). Press `G` to breed the next generation, `1`–`5` to
+load a discovered rule.
 
-## Screenshot & Animation Capture
+## Scientific Analysis Overlays
 
-Press `P` to save the current viewport as a **PPM image** file, or `Ctrl-P` to export the
-entire 256-frame timeline buffer as a numbered image sequence.
+The explorer includes 15+ information-theoretic, dynamical systems, topological,
+and algorithmic analysis overlays. Each recomputes at configurable intervals
+(4–16 generations) to maintain 60 fps rendering.
 
-- **`P`** — single screenshot → `frame_0001.ppm`, `frame_0002.ppm`, etc.
-- **`Ctrl-P`** — full timeline dump → `frame_0001.ppm` through `frame_0256.ppm`
+### Entropy Heatmap
 
-Files use binary PPM (`P6`) format — zero dependencies, readable by ImageMagick, GIMP, ffmpeg,
-and most image viewers. Captures exactly what the viewport shows, including all active rendering
-modes (heatmap, species colors, zone tinting, frequency overlay, signal tracer, portals, ghost trails).
+Toggle: `i`. Shannon entropy of each cell's 3×3 Moore neighborhood. Blue (low
+entropy, uniform) through red/white (high entropy, disordered). Reveals the
+boundary between order and chaos at cellular resolution.
 
-### Converting output
+### Lyapunov Sensitivity
 
-```bash
-# Animated GIF from timeline sequence
-convert -delay 5 frame_*.ppm animation.gif
+Toggle: (via entropy overlay). Measures perturbation growth by maintaining a
+shadow grid with a single flipped bit and tracking divergence over time.
+Positive Lyapunov exponent = chaos; zero = edge; negative = stability.
 
-# Video from timeline sequence
-ffmpeg -framerate 30 -i frame_%04d.ppm output.mp4
-```
+### Fourier Spectrum
 
-Auto-numbered files skip existing slots (up to 9999), so multiple captures accumulate safely.
-Status bar flashes confirmation with filename and dimensions.
+Toggle: `u`. 2D FFT of grid density, showing radial power distribution across
+spatial frequencies. Reveals periodic spatial structures invisible in real space.
 
-## Save & Load
+### Fractal Dimension
 
-Press `Ctrl-S` to save the full simulation state to a numbered `.life` file (`save_001.life`,
-`save_002.life`, etc.). Press `Ctrl-O` to load the most recent save. Everything is preserved:
-grid state, cell ages, ghost trails, zones, emitters, absorbers, ruleset, symmetry, and wrapping.
+Toggle: `F`. Box-counting method at scales 2–128, computing D_box via
+log-log regression. D_box ≈ 1.0 for lines, ≈ 1.5 for coastlines, ≈ 2.0 for
+space-filling patterns. Includes R² goodness-of-fit.
 
-- Saves use a compact binary format with magic header and version byte
-- Auto-numbered slots (up to 999) prevent accidental overwrites
-- Status bar flashes green confirmation on save/load
-- Enables sharing interesting configurations and resuming experiments
+### Frequency Analysis
 
-## Information Flow Field
+Toggle: `f`. Per-cell oscillation period detection via autocorrelation over
+the last 64 frames.
 
-Toggle with `O`. Computes **transfer entropy** between each cell and its cardinal
-neighbors over a sliding temporal window, producing a **directional causal influence
-vector field** that reveals how information propagates through the automaton.
+| Color | Period |
+|-------|--------|
+| Ice blue | Still life (never changes) |
+| Emerald | Period 2 (blinkers, toads) |
+| Gold | Period 3 (pulsars) |
+| Orange–coral | Period 4–12 |
+| Magenta | Period 13–32 |
+| Hot red | Chaotic (no clear period) |
 
-**What it shows:**
-- **Arrow glyphs** at block centers (every 4 cells) showing net information flow direction
-- **Color-coded by direction** (HSV hue = angle) and **brightness by magnitude**
-- **Overlay panel** with global mean flow, max magnitude, vorticity (curl), source/sink counts
-- **Direction histogram** showing dominant flow direction across the grid
+### Wolfram Class Detector
 
-**Key concepts:**
-- **Transfer entropy** TE(X→Y) measures how much knowing X's past reduces uncertainty about Y's future, beyond what Y's own past already tells us. This captures *directional causal influence*.
-- **Sources** are regions that export information (high outward TE) — often glider launchers or emitters
-- **Sinks** are regions that absorb information (high inward TE) — often absorbers or colliders
-- **Vorticity** measures rotational flow patterns — swirling information currents
+Toggle: `C`. Automatically classifies the automaton's behavior:
 
-Unlike other analyzers that measure *properties* (entropy, dimension, sensitivity), the flow field measures *directed relationships* — showing that cell A is causing changes in cell B but not vice versa.
+- **Class I** — death (population → 0)
+- **Class II** — periodic (stable oscillation)
+- **Class III** — chaotic (aperiodic, high entropy)
+- **Class IV** — complex (edge of chaos, long transients)
 
-### Phase-Space Attractor (Takens Delay Embedding)
+### Information Flow Field
 
-Toggle with `A`. Reconstructs the system's **dynamical attractor** from the population time series using Takens' delay embedding theorem. The 1D population history `pop(t)` is embedded into 2D coordinates `(pop(t), pop(t+τ))`, producing a **phase portrait** that reveals the topology of the underlying dynamics.
+Toggle: `O`. Transfer entropy between each cell and its cardinal neighbors,
+producing directional causal influence vectors. Arrow glyphs show net
+information flow direction, color-coded by angle.
 
-**How it works:**
-1. **Delay τ auto-tuning** — scans the autocorrelation function and picks τ at the first zero-crossing (or 1/e decay), ensuring the two embedding axes carry independent information
-2. **Phase portrait rendering** — the trajectory is rasterized into an 80×80 bin canvas, centered on the viewport, with log-scaled density coloring (dark blue → cyan → yellow → white)
-3. **Correlation dimension D₂** — estimated via the Grassberger-Procaccia algorithm on the point cloud, giving a fractal dimension of the attractor that complements the box-counting D_box from the fractal analyzer
+- **Sources** — regions exporting information (glider launchers, emitters)
+- **Sinks** — regions absorbing information (absorbers, colliders)
+- **Vorticity** — rotational flow patterns
 
-**What the shapes mean:**
-- **Single dot** → fixed point (dead grid or stable population)
-- **Closed loop** → periodic orbit (oscillating population, e.g. blinker-dominated grids)
-- **Thick ring / torus** → quasi-periodic dynamics (multiple incommensurate frequencies)
-- **Space-filling cloud** → strange attractor / chaotic dynamics (positive Lyapunov, fractal D₂)
+### Phase-Space Attractor
 
-The HUD panel shows embedding parameters (d, τ), trajectory length, correlation dimension D₂ with automatic classification, population range, and canvas fill percentage.
+Toggle: `A`. Reconstructs the dynamical attractor from population time series
+via Takens delay embedding: `(pop(t), pop(t+τ))`.
 
-### Prediction Surprise Field
+| Shape | Dynamics |
+|-------|----------|
+| Single dot | Fixed point (dead or stable) |
+| Closed loop | Periodic orbit |
+| Thick ring | Quasi-periodic |
+| Space-filling cloud | Strange attractor / chaos |
 
-Toggle with `!`. Accumulates transition statistics over a **32-frame sliding window** — tracking which 9-bit Moore neighborhood configurations lead to which outcomes — then colors each cell by its **information-theoretic surprisal**: -log₂ P(outcome | neighborhood).
+Includes correlation dimension D₂ via Grassberger-Procaccia algorithm.
 
-- **Dark blue** cells: near-zero surprise — perfectly predictable transitions (still lifes, oscillators)
-- **Cyan → yellow** cells: moderate surprise — partially predictable dynamics
-- **Red / white** cells: high surprise — the leading edge of gliders, phase boundaries, novel configurations
+### Causal Light Cone
 
-The overlay panel shows mean/max surprisal in bits, plus counts of predictable (< 0.1 bits) vs surprising (> 0.8 bits) cells.
+Toggle: `9`. Click a cell to trace its backward (past dependencies) and
+forward (future influence) light cones. `+`/`-` adjust cone depth.
 
-**What it reveals vs other analyzers:**
-- **Entropy** measures spatial disorder (how mixed a neighborhood is right now)
-- **Lyapunov** measures perturbation sensitivity (how a 1-bit flip propagates)
-- **Surprise** measures **temporal unpredictability** — how well the system's own recent history predicts the next state
+### Prediction Surprise
 
-High-entropy regions aren't necessarily surprising (random noise is high-entropy but predictable *as noise*). Surprise reveals where a specific outcome defied the learned distribution — the true frontier of unpredictability.
+Toggle: `!`. Accumulates transition statistics over 32 frames, then colors
+each cell by surprisal: `-log₂ P(outcome | neighborhood)`.
+
+- **Dark blue** — perfectly predictable (still lifes, oscillators)
+- **Red/white** — high surprise (glider edges, phase boundaries)
 
 ### Mutual Information Network
 
-Toggle with `@`. Partitions the grid into a **20×10 coarse block grid** (20×20 cells per block, 200 blocks total) and computes **mutual information** between all block-pair population time series over the 256-frame history buffer, revealing mesoscale coupling structure invisible to single-cell analyzers.
-
-For each block pair, populations are quantized into 8 bins and MI is computed as:
-`MI(X;Y) = Σ p(x,y) log₂(p(x,y) / (p(x)·p(y)))`
-
-The top-40 strongest couplings are rendered as **Bresenham lines** between block centers, colored by coupling strength:
-- **Dark blue**: weak coupling — low mutual information
-- **Cyan → green**: moderate coupling — partial synchronization
-- **Yellow → magenta → white**: strong coupling — tightly entrained regions
-
-The overlay panel displays max MI, mean MI, network density (fraction of pairs above 0.1-bit threshold), clustering coefficient of the coupling graph, and the top-5 strongest couplings with block coordinates.
-
-**What it reveals vs other analyzers:**
-- **Entropy/Lyapunov/Surprise** examine individual cells or local neighborhoods
-- **Information flow** tracks directed causal influence between adjacent cells
-- **MI Network** reveals **long-range synchronization** — how distant regions co-vary over time, exposing oscillator entrainment, glider communication channels, and emergent mesoscale structure
-
-Recomputes every 8 generations while running. Requires ≥16 frames of history for meaningful results.
+Toggle: `@`. Partitions the grid into 20×10 blocks, computes MI between all
+block-pair population time series over 256 frames. Top-40 strongest couplings
+rendered as colored lines. Reveals long-range synchronization invisible to
+local analyzers.
 
 ### Composite Complexity Index
 
-Toggle with `#`. Fuses four existing analyzers — **entropy**, **Lyapunov sensitivity**, **prediction surprise**, and **frequency analysis** — into a single per-cell **edge-of-chaos complexity score** (0.0–1.0). This brings the Wolfram class concept down to cell-level spatial resolution, highlighting exactly where Class IV dynamics are happening.
+Toggle: `#`. Fuses entropy, Lyapunov, surprise, and frequency into a per-cell
+edge-of-chaos score (0.0–1.0) with concave edge-boost:
 
-The composite score is computed as a weighted sum with a concave edge-boost:
 ```
 raw = 0.30·entropy + 0.25·lyapunov + 0.25·surprise + 0.20·frequency
-complexity = 0.7·(4·raw·(1-raw)) + 0.3·raw
+score = 0.7·(4·raw·(1-raw)) + 0.3·raw
 ```
 
-The `4·raw·(1-raw)` term peaks at raw=0.5, rewarding balanced moderate signals (the hallmark of edge-of-chaos dynamics) over uniformly high signals (pure chaos) or uniformly low (dead/periodic).
-
-**Color map:** deep blue (simple/dead) → teal-green (periodic) → bright gold (edge-of-chaos sweet spot) → red (fully chaotic). The gold band at 0.4–0.7 marks regions where interesting structures — gliders, long transients, localized computation — tend to live.
-
-The overlay panel displays mean complexity, max complexity, counts of simple/edge/chaotic cells, percentage of alive cells in the edge band, and a color legend gradient.
-
-Recomputes every 4 generations while running.
+Gold band at 0.4–0.7 marks where gliders and complex structures live.
 
 ### Topological Feature Map
 
-Toggle with `$`. Computes **connected component labeling** and **enclosed hole detection** via 4-connected flood fill, providing a purely geometric/topological lens on the pattern — fundamentally different from all information-theoretic overlays.
+Toggle: `$`. Connected component labeling and enclosed hole detection via
+4-connected flood fill.
 
-**β₀ (Betti number 0):** Number of distinct connected live-cell components. Each component is colored with a unique hue (golden-ratio spacing in HSV for maximum visual separation).
+- **β₀** — number of distinct connected components (each uniquely colored)
+- **β₁** — number of enclosed holes (highlighted in magenta)
 
-**β₁ (Betti number 1):** Number of enclosed holes — dead-cell regions completely surrounded by live cells. Highlighted in magenta/violet. These correspond to topological "loops" in the pattern.
-
-The sidebar panel displays:
-- β₀ and β₁ counts
-- Largest component size and mean component size
-- Total hole cells
-- β₀ and β₁ sparkline history (30-frame rolling window)
-
-This overlay reveals **percolation transitions** (when many small components suddenly merge into one large connected cluster), **topological genus** of patterns (how many holes structures like ponds and beehives contain), and the fragmentation/coalescence dynamics invisible to other analyzers.
-
-Recomputes every 4 generations while running.
+Reveals percolation transitions and fragmentation dynamics.
 
 ### Renormalization Group Flow
 
-Toggle with `%`. Implements **real-space renormalization group (RG)** analysis via majority-rule block decimation at three scales (2×2, 4×4, 8×8 blocks). This reveals how spatial structure distributes across length scales — the fundamental question of critical phenomena and phase transitions.
+Toggle: `%`. Real-space RG via majority-rule block decimation at 2×, 4×, 8×
+scales.
 
-**How it works:** At each scale, non-overlapping blocks of s×s cells are coarse-grained to a single "super-cell" (alive if majority of block cells are alive). The density retained at each scale indicates where structure lives:
+| Color | Meaning |
+|-------|---------|
+| Cyan | Fine-dominated (dust, noise) |
+| Yellow | Meso-dominated (clusters) |
+| Magenta | Coarse-dominated (spanning patterns) |
+| White | Scale-invariant (critical behavior) |
 
-- **Cyan** = fine-dominated: structure only at small scales (dust, isolated cells, noise)
-- **Yellow** = meso-dominated: medium-scale organization (clusters, oscillator groups)
-- **Magenta** = coarse-dominated: large-scale coherent structure (spanning patterns)
-- **White** = scale-invariant: similar density at all scales (critical/fractal behavior)
+Criticality score near 1.0 = scale-invariant = edge of chaos.
 
-**Criticality score:** Measures flatness of the density spectrum across scales. Score near 1.0 indicates scale-invariant (critical) behavior — the hallmark of systems at the edge of chaos. Score near 0.0 means structure is concentrated at specific scales.
+### Kolmogorov Complexity
 
-The sidebar panel displays:
-- Criticality score with color coding (red=low, yellow=mid, cyan=high)
-- Density at each RG scale (2x, 4x, 8x)
-- Visual scale spectrum bar
-- Classification fractions (fine/meso/coarse/invariant)
-- Mean invariance and criticality sparkline history
+Toggle: `^`. LZ77-style compression of local neighborhoods. Blue =
+compressible (ordered), gold = structured, red = incompressible (random).
 
-This overlay connects directly to **statistical mechanics** and **critical phenomena**: scale-invariant configurations correspond to critical points where correlation length diverges, while scale-dominated configurations indicate ordered or disordered phases.
+### Cell Probe Inspector
 
-Recomputes every 4 generations while running.
+Toggle: `?`. Click any cell to see all 14+ metrics at once in a unified panel:
+entropy, temperature, Lyapunov, Fourier, fractal, surprisal, mutual info,
+Kolmogorov, complexity, frequency, flow, RG, topology.
 
-## Implementation Details
+## Visualization
 
-- Double-buffered grid updates for correct neighbor counting
-- Single-write rendering via pre-built output buffer (~60fps)
-- SIGWINCH handler for live terminal resize
-- Cell-age heatmap with 24-bit true-color thermal gradient (blue → cyan → green → yellow → red → white)
-- Ghost trails: fading markers where cells die (5-frame decay with gray-blue tint)
-- Legacy color-cycling mode (6-color palette) available via `h` toggle
-- SGR extended mouse protocol (1006) for large terminal support
-- Population sparkline using Unicode block elements (▁▂▃▅▇█) with red→yellow→green color gradient
-- Toroidal wrapping mode — gliders and patterns loop around edges
-- Kaleidoscope drawing — 2/4/8-fold symmetric mouse painting with reflections around grid center
-- Multi-rule zones — paint different rulesets onto regions; cells use per-zone rules with emergent boundary interactions
-- Zoom and pan — 3 zoom levels using Unicode half-block (▀▄) and quarter-block (▘▝▖▗) characters for 2x and 4x density
-- Minimap overlay — quarter-block thumbnail of full grid with yellow viewport rectangle, auto-shows when zoomed
-- Emitters and absorbers — placeable cell sources (dot, cross, random, glider patterns) and circular kill zones for open dissipative dynamics
-- Time-travel replay — 256-frame history ring buffer with rewind/fast-forward, timeline scrubber bar, and branching from any historical point
-- Save/load — binary `.life` files preserving full state (grid, zones, emitters, absorbers, settings) with auto-numbered slots and status flash feedback
-- Frequency analysis — per-cell oscillation period detection via autocorrelation over timeline history, with ice-blue→emerald→gold→red color spectrum and legend overlay
-- Wormhole portals — paired non-local spatial couplings with additive neighbor model, animated ring visualization, positional offset mapping, and bidirectional coupling across up to 8 portal pairs
-- Screenshot capture — single-frame PPM export via `cell_color()` pipeline, plus full timeline sequence dump with grid state save/restore, auto-numbered filenames up to 9999
-- Pattern stamp tool — 20 classic patterns across 5 categories with pre-computed rotations, preview overlay, and full integration with symmetry/species/zones
-- Live pattern census — real-time structure recognition via bitmask matching with dead-border verification for 14 pattern templates (8 still lifes + 6 oscillator phases), color-coded overlay panel, unclaimed cell tracking, and 16-generation refresh cycle
-- Composite complexity index — per-cell edge-of-chaos score fusing entropy, Lyapunov, surprise, and frequency via weighted sum with concave edge-boost transform, 4-generation refresh cycle
-- Mutual information network — inter-region coupling map partitioning grid into 20×10 blocks, computing MI for all ~20K block pairs over 256-frame history, Bresenham line rendering of top-40 couplings, clustering coefficient, and 8-generation refresh cycle
-- Dual-species ecosystem — two coexisting cell populations with independent B/S rules, species-aware neighbor counting, configurable interaction coefficient (-1.0 hostile to +1.0 cooperative), species-specific color gradients, and birth arbitration
-- Full 400×200 simulation grid with viewport navigation (arrow keys + mouse scroll)
-- Proper terminal cleanup on exit (raw mode restore, cursor show)
+### Heatmap & Ghost Trails
+
+Press `h` to toggle. Cells are colored by age using a 24-bit thermal gradient
+(blue → cyan → green → yellow → red → white). Ghost trails mark where cells
+recently died with a 5-frame gray-blue fade.
+
+### Signal Tracer
+
+Press `T` to cycle: off → accumulate → frozen → clear. Alive cells build up
+trail intensity over time using a purple → magenta → pink palette. Glider
+streams become visible rivers, emitter outputs become flow fields.
+
+### Pattern Census
+
+Press `v`. Real-time structure recognition via bitmask matching with
+dead-border verification:
+
+| Category | Patterns |
+|----------|----------|
+| Still lifes (green) | Block, Beehive, Loaf, Boat, Tub, Ship, Barge, Long Boat |
+| Oscillators (amber) | Blinker, Toad, Beacon (both phases each) |
+
+Updates every 16 generations.
+
+### Population Sparkline
+
+Press `g`. Unicode block element graph (▁▂▃▅▇█) with density-based coloring
+(red → yellow → green). Shows population trend over recent history.
+
+### Minimap
+
+Press `n` or zoom in. Quarter-block thumbnail of the full 400×200 grid with
+a yellow viewport rectangle showing your current view.
+
+### Auto-Demo Mode
+
+Press `D`. Guided tour through 10 curated scenes showcasing pattern + overlay
+combinations. Press any key to exit and explore on your own.
+
+## Time-Travel Replay
+
+The simulation records every generation into a 256-frame ring buffer.
+
+| Key | Action |
+|-----|--------|
+| `<` / `,` | Rewind (enters replay mode) |
+| `>` / `.` | Fast-forward |
+| `s` | Step forward one frame |
+| `SPACE` | Resume live from current point (branch) |
+| `t` | Toggle timeline scrubber bar |
+
+The status bar shows `⏪ REPLAY` when browsing history. Press `SPACE` at any
+point to branch — restore that state and resume live simulation from there.
+
+## File I/O
+
+### Save & Load
+
+`Ctrl-S` saves full state to auto-numbered `.life` files (`save_001.life`, etc.).
+`Ctrl-O` loads the most recent save. Everything is preserved: grid, ages,
+zones, emitters, absorbers, portals, ruleset, symmetry, wrapping.
+
+### RLE Import/Export
+
+`Ctrl-E` exports the current grid as RLE (Run Length Encoded), the standard
+Game of Life pattern exchange format. Pass an `.rle` file as a command-line
+argument to import.
+
+### Screenshot Capture
+
+| Key | Output |
+|-----|--------|
+| `P` | Single frame → `frame_0001.ppm` |
+| `Ctrl-P` | Full 256-frame timeline → `frame_0001.ppm` through `frame_0256.ppm` |
+
+Files use binary PPM (P6) format. Convert with:
+
+```bash
+# Animated GIF
+convert -delay 5 frame_*.ppm animation.gif
+
+# Video
+ffmpeg -framerate 30 -i frame_%04d.ppm output.mp4
+```
+
+## Build Options
+
+```bash
+make                # Optimised release build (-O2)
+make debug          # Debug build (-g -O0, no optimisation)
+make sanitize       # AddressSanitizer + UBSan build
+make install        # Install to /usr/local/bin
+make uninstall      # Remove from /usr/local/bin
+make clean          # Remove build artifacts
+make help           # Show all targets and variables
+```
+
+Override compiler or install prefix:
+
+```bash
+make CC=clang
+make install PREFIX=/opt
+```
+
+## Requirements
+
+- C99 compiler (gcc, clang)
+- POSIX terminal with 24-bit color support (most modern terminals)
+- `math.h` / `-lm` (the only library dependency)
+
+No other dependencies. No ncurses. No SDL. No external libraries.
+
+## Architecture
+
+The entire application is a single C file (`life.c`, ~10,800 lines) organized
+into modular subsystems separated by ASCII section headers:
+
+| Subsystem | Responsibility |
+|-----------|---------------|
+| Grid & state | 400×200 double-buffered cell array, ghost trails, signal tracer |
+| Rule engine | B/S notation, 10 presets, live mutation, multi-rule zones |
+| Simulation | Neighbor counting, state update, emitters, absorbers, portals |
+| Analysis | 15 scientific overlay compute functions |
+| Rendering | ANSI escape output buffer, heatmaps, Unicode blocks, UI panels |
+| Input | Raw terminal mode, keyboard dispatch, SGR mouse protocol |
+| File I/O | Binary `.life` format, RLE import/export, PPM screenshots |
+| Timeline | 256-frame ring buffer, replay, branching |
+
+Design choices:
+
+- **Zero allocation** — all state in static arrays, no `malloc`
+- **Double-buffered rendering** — pre-built output buffer, single `write()` per frame
+- **Lazy recomputation** — `stale` flags prevent redundant overlay computation
+- **Single file** — no build complexity, trivial to compile and distribute
+
+## Further Reading
+
+See **[GUIDE.md](GUIDE.md)** for the theoretical background behind each
+analysis mode — what it measures, why it matters, how it works, and academic
+sources with validated DOI links.
+
+## License
+
+[MIT](LICENSE) — Changkun Ou

@@ -1,7 +1,8 @@
-# Conway's Game of Life — Terminal Edition
+# Life-like Cellular Automaton Explorer — Terminal Edition
 
-A fully interactive, zero-dependency Game of Life that runs in any terminal.
-Written in C with ANSI escape codes for rendering.
+A fully interactive, zero-dependency cellular automaton explorer that runs in any terminal.
+Written in C with ANSI escape codes for rendering. Supports Conway's Game of Life
+and 9 other Life-like rulesets, plus live rule mutation.
 
 ![Terminal simulation](https://upload.wikimedia.org/wikipedia/commons/e/e5/Gospers_glider_gun.gif)
 
@@ -25,6 +26,8 @@ Requires only `gcc` and a POSIX terminal.
 | `d` | Toggle draw mode (mouse painting) |
 | `g` | Toggle population sparkline graph |
 | `h` | Toggle heatmap mode (age coloring + ghost trails) |
+| `[` / `]` | Cycle through rule presets (B/S notation) |
+| `m` | Mutate — randomly flip one birth/survival bit |
 | `1`–`5` | Load preset pattern |
 | `+` / `-` | Speed up / slow down (20ms–1000ms) |
 | `q` / `ESC` | Quit |
@@ -43,6 +46,25 @@ Requires only `gcc` and a POSIX terminal.
 3. **Gosper Glider Gun** — infinite growth, streams gliders
 4. **R-pentomino** — chaotic methuselah (stabilizes after 1103 generations)
 5. **Acorn** — another methuselah (stabilizes after 5206 generations)
+
+## Rule Presets
+
+| Ruleset | Rule | Character |
+|---------|------|-----------|
+| Conway | B3/S23 | The classic — gliders, oscillators, still lifes |
+| HighLife | B36/S23 | Famous for its replicator pattern |
+| Day & Night | B3678/S34678 | Symmetric — patterns work inverted too |
+| Seeds | B2/S | Explosive — every cell dies, but births cascade |
+| Diamoeba | B35678/S5678 | Organic amoeba-like blobs |
+| Morley | B368/S245 | Mix of stable structures and chaos |
+| 2x2 | B36/S125 | Block-splitting dynamics |
+| Maze | B3/S12345 | Grows maze-like corridors |
+| Coral | B3/S45678 | Slow coral-reef growth |
+| Anneal | B4678/S35678 | Annealing — noisy regions smooth into blobs |
+
+Press `m` to mutate any ruleset — randomly flips one birth or survival bit,
+creating hybrid rules that may exhibit entirely novel behavior. The status bar
+shows `(mutant)` when the active rule doesn't match any preset.
 
 ## Implementation Details
 

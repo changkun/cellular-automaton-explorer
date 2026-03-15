@@ -1,5 +1,5 @@
 /*
- * Conway's Game of Life — terminal edition (C / ANSI)
+ * Life-like Cellular Automaton Explorer — terminal edition (C / ANSI)
  *
  * Controls:
  *   SPACE / p   Play / Pause
@@ -13,6 +13,8 @@
  *   g           Toggle population sparkline graph
  *   w           Toggle toroidal wrapping
  *   h           Toggle heatmap mode (age coloring + ghost trails)
+ *   [ / ]       Cycle through rule presets (B/S notation)
+ *   m           Mutate — randomly flip one birth/survival bit
  *   q / ESC     Quit
  *
  *   Mouse:      Left-click to place cells, right-click to erase
@@ -71,6 +73,59 @@ static int hist_get(int age) {
     return pop_history[idx];
 }
 
+/* ── Rule system (B/S notation via bitmasks) ───────────────────────────────── */
+
+/*
+ * birth_mask:    bit N set → dead cell with N neighbors is born
+ * survival_mask: bit N set → live cell with N neighbors survives
+ * Conway's Life = B3/S23 → birth=0x008, survival=0x00C
+ */
+static unsigned short birth_mask    = 0x008; /* B3 */
+static unsigned short survival_mask = 0x00C; /* S23 */
+
+typedef struct {
+    const char *name;
+    unsigned short birth;
+    unsigned short survival;
+} Ruleset;
+
+static const Ruleset rulesets[] = {
+    { "Conway",     0x008, 0x00C },  /* B3/S23     — the classic */
+    { "HighLife",   0x048, 0x00C },  /* B36/S23    — replicators */
+    { "Day&Night",  0x1C8, 0x1D8 },  /* B3678/S34678 — symmetric */
+    { "Seeds",      0x004, 0x000 },  /* B2/S       — explosive */
+    { "Diamoeba",   0x1E8, 0x1E0 },  /* B35678/S5678 — amoeba blobs */
+    { "Morley",     0x148, 0x034 },  /* B368/S245  — stable+chaotic */
+    { "2x2",        0x048, 0x026 },  /* B36/S125   — blocks split */
+    { "Maze",       0x008, 0x03E },  /* B3/S12345  — maze-like growth */
+    { "Coral",      0x008, 0x1F0 },  /* B3/S45678  — slow coral growth */
+    { "Anneal",     0x1D0, 0x1E8 },  /* B4678/S35678 — annealing */
+};
+#define N_RULESETS (int)(sizeof(rulesets) / sizeof(rulesets[0]))
+static int current_ruleset = 0;
+
+/* Format current rule as B.../S... string */
+static void rule_to_string(char *buf, int buflen) {
+    char *p = buf;
+    char *end = buf + buflen - 1;
+    *p++ = 'B';
+    for (int i = 0; i <= 8 && p < end; i++)
+        if (birth_mask & (1 << i)) *p++ = '0' + i;
+    *p++ = '/';
+    *p++ = 'S';
+    for (int i = 0; i <= 8 && p < end; i++)
+        if (survival_mask & (1 << i)) *p++ = '0' + i;
+    *p = '\0';
+}
+
+/* Check if current masks match a named preset */
+static int find_matching_ruleset(void) {
+    for (int i = 0; i < N_RULESETS; i++)
+        if (rulesets[i].birth == birth_mask && rulesets[i].survival == survival_mask)
+            return i;
+    return -1; /* custom / mutated */
+}
+
 /* ── Grid operations ───────────────────────────────────────────────────────── */
 
 static void grid_clear(void) {
@@ -118,7 +173,9 @@ static void grid_step(void) {
                             n += (grid[ny][nx] > 0);
                     }
                 }
-            if (n == 3 || (n == 2 && grid[y][x])) {
+            int alive = grid[y][x] > 0;
+            if ((alive && (survival_mask & (1 << n))) ||
+                (!alive && (birth_mask & (1 << n)))) {
                 /* alive: increment age, cap at 255 */
                 int age = grid[y][x];
                 next_grid[y][x] = (age < 255) ? age + 1 : 255;
@@ -499,9 +556,22 @@ static void render(int running, int speed_ms, int draw_mode) {
     const char *heat_str = heatmap_mode
         ? " \033[91m\u2588HEAT\033[0m"
         : "";
-    p += sprintf(p, " %s%s%s%s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+
+    /* Rule string */
+    char rule_str[32];
+    rule_to_string(rule_str, sizeof(rule_str));
+    int rs = find_matching_ruleset();
+    char rule_display[80];
+    if (rs >= 0)
+        snprintf(rule_display, sizeof(rule_display),
+                 "\033[95m%s\033[90m(%s)\033[0m", rule_str, rulesets[rs].name);
+    else
+        snprintf(rule_display, sizeof(rule_display),
+                 "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
+
+    p += sprintf(p, " %s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, wrap_str, draw_str, heat_str, generation, population, speed_ms);
+                 state, wrap_str, draw_str, heat_str, rule_display, generation, population, speed_ms);
 
     /* sparkline right after stats */
     if (show_graph && hist_count > 1) {
@@ -513,7 +583,8 @@ static void render(int running, int speed_ms, int draw_mode) {
 
     /* status bar line 2: compact help */
     p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
-                     "[1-5]pre [d]draw [g]graph [w]wrap [h]heat [+/-]spd [q]quit\033[0m\033[K\n");
+                     "[1-5]pre [d]draw [g]graph [w]wrap [h]heat "
+                     "[\033[0m\033[90m[/]]rule [m]mutate [+/-]spd [q]quit\033[0m\033[K\n");
 
     if (heatmap_mode) {
         /* ── Heatmap rendering with true-color ── */
@@ -668,6 +739,24 @@ int main(void) {
             wrap_mode = !wrap_mode;
         else if (key == 'h' || key == 'H')
             heatmap_mode = !heatmap_mode;
+        else if (key == ']') {
+            current_ruleset = (current_ruleset + 1) % N_RULESETS;
+            birth_mask = rulesets[current_ruleset].birth;
+            survival_mask = rulesets[current_ruleset].survival;
+        }
+        else if (key == '[') {
+            current_ruleset = (current_ruleset - 1 + N_RULESETS) % N_RULESETS;
+            birth_mask = rulesets[current_ruleset].birth;
+            survival_mask = rulesets[current_ruleset].survival;
+        }
+        else if (key == 'm' || key == 'M') {
+            /* Mutate: randomly flip one bit in birth or survival mask (bits 0-8) */
+            int which = rand() % 18; /* 0-8: birth bits, 9-17: survival bits */
+            if (which < 9)
+                birth_mask ^= (1 << which);
+            else
+                survival_mask ^= (1 << (which - 9));
+        }
         else if (key == -2 && draw_mode) {
             /* Mouse event */
             MouseEvent *m = &last_mouse;

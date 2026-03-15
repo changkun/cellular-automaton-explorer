@@ -51,6 +51,7 @@
  *                 [/] adjust brush radius
  *   u           Toggle 2D Fourier spectrum analyzer (spatial frequency analysis)
  *   F           Toggle box-counting fractal dimension analyzer
+ *   C           Toggle Wolfram class detector (auto-classify I/II/III/IV)
  *   Ctrl-E      Export current grid as RLE file (auto-numbered export_NNN.rle)
  *   Arrow keys  Pan viewport across the full 400×200 grid
  *   0           Re-center viewport on grid center
@@ -173,6 +174,30 @@ static int   fractal_n_boxes[FRACTAL_N_SCALES];  /* N(ε) per scale */
 static float fractal_log_eps[FRACTAL_N_SCALES];  /* log(ε) per scale */
 static float fractal_log_n[FRACTAL_N_SCALES];    /* log(N(ε)) per scale */
 static int   fractal_total_alive = 0;     /* total alive cells */
+
+/* ── Wolfram Class Detector ─────────────────────────────────────────────── */
+/* Automatic classification into Wolfram Classes I–IV by fusing signals from
+   entropy, Lyapunov sensitivity, fractal dimension, and population dynamics.
+   Class I:   Fixed (death / homogeneous)
+   Class II:  Periodic (oscillators, still lifes)
+   Class III: Chaotic (pseudo-random, space-filling)
+   Class IV:  Complex (edge of chaos: gliders, long transients, localized structures) */
+#define WOLFRAM_HIST 32   /* population samples for temporal analysis */
+
+static int   wolfram_mode = 0;            /* 0=off, 1=on */
+static int   wolfram_stale = 1;           /* 1=needs recomputation */
+static int   wolfram_class = 0;           /* 0=unknown, 1-4=Wolfram class */
+static float wolfram_confidence = 0.0f;   /* 0.0–1.0 confidence in classification */
+static float wolfram_scores[4];           /* raw score per class (I,II,III,IV) */
+
+/* Feature vector used for classification */
+static float wf_entropy = 0.0f;     /* global mean entropy */
+static float wf_lyapunov = 0.0f;    /* global mean Lyapunov exponent */
+static float wf_fractal = 0.0f;     /* fractal dimension D_box */
+static float wf_pop_var = 0.0f;     /* population variance (normalized) */
+static float wf_pop_trend = 0.0f;   /* population trend (growth/decay rate) */
+static float wf_density = 0.0f;     /* live cell density */
+static float wf_pop_acf = 0.0f;     /* population autocorrelation (periodicity) */
 
 /* ── Pattern Census ───────────────────────────────────────────────────────── */
 static int census_mode = 0;    /* 0=off, 1=on */
@@ -1047,6 +1072,7 @@ static void grid_step(void) {
     lyapunov_stale = 1;
     fourier_stale = 1;
     fractal_stale = 1;
+    wolfram_stale = 1;
 }
 
 /* ── Census scan implementation ───────────────────────────────────────────── */
@@ -2788,6 +2814,275 @@ static void fractal_compute(void) {
     fractal_stale = 0;
 }
 
+/* ── Wolfram Class Detector ────────────────────────────────────────────────── */
+/* Compute feature vector from existing analyzer outputs + population history,
+   then classify into Wolfram Class I–IV using weighted scoring. */
+static void wolfram_classify(void) {
+    /* Step 1: Compute entropy features (inline if entropy_mode is off) */
+    {
+        float sum = 0.0f;
+        int count = 0;
+        for (int y = 0; y < H; y += 2)
+            for (int x = 0; x < W; x += 2) {
+                /* Sample Moore neighborhood entropy */
+                int alive = 0, total = 0;
+                for (int dy = -1; dy <= 1; dy++)
+                    for (int dx = -1; dx <= 1; dx++) {
+                        int ny = y + dy, nx = x + dx;
+                        if (ny >= 0 && ny < H && nx >= 0 && nx < W) {
+                            total++;
+                            if (grid[ny][nx]) alive++;
+                        }
+                    }
+                if (total > 0) {
+                    float p = (float)alive / total;
+                    float h = 0.0f;
+                    if (p > 0.001f && p < 0.999f)
+                        h = -(p * logf(p) + (1.0f - p) * logf(1.0f - p)) / logf(2.0f);
+                    sum += h;
+                    count++;
+                }
+            }
+        wf_entropy = count > 0 ? sum / count : 0.0f;
+    }
+
+    /* Step 2: Lyapunov — lightweight perturbation test (4 random probes) */
+    {
+        float sensitivity = 0.0f;
+        int probes = 4;
+        unsigned char shadow[60][80];  /* small test window */
+        int sw = 80, sh = 60;
+        int ox = (W - sw) / 2, oy = (H - sh) / 2;
+        if (ox < 0) ox = 0;
+        if (oy < 0) oy = 0;
+
+        for (int p = 0; p < probes; p++) {
+            /* Copy small region to shadow */
+            for (int y = 0; y < sh && (oy + y) < H; y++)
+                for (int x = 0; x < sw && (ox + x) < W; x++)
+                    shadow[y][x] = grid[oy + y][ox + x] ? 1 : 0;
+
+            /* Flip one cell */
+            int fy = (rand() % (sh - 2)) + 1;
+            int fx = (rand() % (sw - 2)) + 1;
+            shadow[fy][fx] = shadow[fy][fx] ? 0 : 1;
+
+            /* Evolve both for 8 steps, count differences */
+            unsigned char sh2[60][80];
+            memcpy(sh2, shadow, sizeof(shadow));
+
+            for (int step = 0; step < 8; step++) {
+                unsigned char next_sh[60][80];
+                memset(next_sh, 0, sizeof(next_sh));
+                for (int y = 1; y < sh - 1; y++)
+                    for (int x = 1; x < sw - 1; x++) {
+                        int nn = 0;
+                        for (int dy = -1; dy <= 1; dy++)
+                            for (int dx = -1; dx <= 1; dx++)
+                                if (dy || dx) nn += sh2[y+dy][x+dx] ? 1 : 0;
+                        /* Use current rule */
+                        if (sh2[y][x])
+                            next_sh[y][x] = (survival_mask & (1 << nn)) ? 1 : 0;
+                        else
+                            next_sh[y][x] = (birth_mask & (1 << nn)) ? 1 : 0;
+                    }
+                memcpy(sh2, next_sh, sizeof(sh2));
+            }
+
+            /* Compare shadow to actual grid after 8 steps (approximate) */
+            int diffs = 0;
+            for (int y = 1; y < sh - 1; y++)
+                for (int x = 1; x < sw - 1; x++) {
+                    int actual = (oy + y < H && ox + x < W) ? (grid[oy+y][ox+x] ? 1 : 0) : 0;
+                    if (sh2[y][x] != actual) diffs++;
+                }
+            sensitivity += (float)diffs / ((sh - 2) * (sw - 2));
+        }
+        wf_lyapunov = sensitivity / probes;
+    }
+
+    /* Step 3: Quick fractal dimension (3 scales only: 4, 16, 64) */
+    {
+        static const int scales[] = {4, 16, 64};
+        float log_eps[3], log_n[3];
+        int valid = 0;
+        for (int s = 0; s < 3; s++) {
+            int eps = scales[s];
+            int nboxes = 0;
+            for (int by = 0; by < H; by += eps)
+                for (int bx = 0; bx < W; bx += eps) {
+                    int found = 0;
+                    for (int y = by; y < by + eps && y < H && !found; y++)
+                        for (int x = bx; x < bx + eps && x < W && !found; x++)
+                            if (grid[y][x]) found = 1;
+                    nboxes += found;
+                }
+            if (nboxes > 0) {
+                log_eps[valid] = logf((float)eps);
+                log_n[valid] = logf((float)nboxes);
+                valid++;
+            }
+        }
+        if (valid >= 2) {
+            float sx = 0, sy = 0, sxx = 0, sxy = 0;
+            for (int i = 0; i < valid; i++) {
+                sx += log_eps[i]; sy += log_n[i];
+                sxx += log_eps[i] * log_eps[i];
+                sxy += log_eps[i] * log_n[i];
+            }
+            float denom = valid * sxx - sx * sx;
+            wf_fractal = denom > 0.001f ? -(valid * sxy - sx * sy) / denom : 0.0f;
+        } else {
+            wf_fractal = 0.0f;
+        }
+    }
+
+    /* Step 4: Population dynamics features from history ring buffer */
+    {
+        int n = hist_count;
+        if (n < 2) {
+            wf_pop_var = 0.0f;
+            wf_pop_trend = 0.0f;
+            wf_pop_acf = 0.0f;
+        } else {
+            int window = n < WOLFRAM_HIST ? n : WOLFRAM_HIST;
+            float sum = 0, sum2 = 0;
+            for (int i = 0; i < window; i++) {
+                float v = (float)hist_get(i);
+                sum += v;
+                sum2 += v * v;
+            }
+            float mean = sum / window;
+            float var = sum2 / window - mean * mean;
+            if (var < 0) var = 0;
+
+            /* Normalize variance by mean² to get coefficient of variation² */
+            wf_pop_var = (mean > 1.0f) ? var / (mean * mean) : 0.0f;
+
+            /* Trend: linear regression slope over recent window */
+            float sx = 0, sxy = 0, sxx = 0, sy = 0;
+            for (int i = 0; i < window; i++) {
+                float x = (float)i;
+                float y = (float)hist_get(i);
+                sx += x; sy += y;
+                sxx += x * x;
+                sxy += x * y;
+            }
+            float denom = window * sxx - sx * sx;
+            float slope = (denom > 0.001f) ? (window * sxy - sx * sy) / denom : 0.0f;
+            /* Normalize by mean population */
+            wf_pop_trend = (mean > 1.0f) ? slope / mean : 0.0f;
+
+            /* Autocorrelation at lag 1 for periodicity detection */
+            float acf = 0.0f;
+            if (window >= 3 && var > 0.01f) {
+                float cov = 0;
+                for (int i = 0; i < window - 1; i++)
+                    cov += (hist_get(i) - mean) * (hist_get(i+1) - mean);
+                acf = cov / ((window - 1) * var);
+                if (acf < -1.0f) acf = -1.0f;
+                if (acf > 1.0f) acf = 1.0f;
+            }
+            wf_pop_acf = acf;
+        }
+    }
+
+    /* Step 5: Density */
+    wf_density = (W * H > 0) ? (float)population / (W * H) : 0.0f;
+
+    /* Step 6: Classification via weighted scoring */
+    /* Each class gets a score based on how well the feature vector matches its profile:
+       Class I   (Fixed):    very low entropy, very low Lyapunov, low density, pop→0
+       Class II  (Periodic): low-moderate entropy, low Lyapunov, high ACF, stable pop
+       Class III (Chaotic):  high entropy, high Lyapunov, high D_box, high variance
+       Class IV  (Complex):  moderate entropy, moderate Lyapunov, moderate D_box, moderate var */
+    float s1 = 0, s2 = 0, s3 = 0, s4 = 0;
+
+    /* --- Class I: Death / Fixed point --- */
+    /* Low density is the strongest signal */
+    if (wf_density < 0.001f) {
+        s1 += 5.0f;  /* near-empty grid: almost certainly Class I */
+    } else {
+        s1 += (1.0f - wf_density) * 0.5f;
+    }
+    /* Low entropy strongly favors Class I */
+    s1 += (wf_entropy < 0.1f) ? 2.0f : (wf_entropy < 0.2f) ? 1.0f : 0.0f;
+    /* Low Lyapunov (stable) */
+    s1 += (wf_lyapunov < 0.05f) ? 1.5f : (wf_lyapunov < 0.1f) ? 0.5f : 0.0f;
+    /* Population declining */
+    s1 += (wf_pop_trend < -0.01f) ? 1.0f : 0.0f;
+    /* Very low variance */
+    s1 += (wf_pop_var < 0.001f) ? 1.0f : 0.0f;
+
+    /* --- Class II: Periodic / Static structures --- */
+    /* Moderate density with low variance = settled into still lifes / oscillators */
+    s2 += (wf_density > 0.01f && wf_density < 0.4f) ? 1.0f : 0.0f;
+    /* Low entropy but not zero */
+    s2 += (wf_entropy > 0.05f && wf_entropy < 0.5f) ? 1.5f : 0.0f;
+    /* Low Lyapunov = perturbation-resistant */
+    s2 += (wf_lyapunov < 0.15f) ? 1.5f : (wf_lyapunov < 0.25f) ? 0.5f : 0.0f;
+    /* High autocorrelation = periodic */
+    s2 += (wf_pop_acf > 0.5f) ? 1.5f : (wf_pop_acf > 0.0f) ? 0.5f : 0.0f;
+    /* Low population variance = stable */
+    s2 += (wf_pop_var < 0.01f) ? 1.5f : (wf_pop_var < 0.05f) ? 0.5f : 0.0f;
+    /* Low fractal dimension (simple structures) */
+    s2 += (wf_fractal < 1.3f) ? 0.5f : 0.0f;
+
+    /* --- Class III: Chaotic --- */
+    /* High entropy = disorder */
+    s3 += (wf_entropy > 0.6f) ? 2.0f : (wf_entropy > 0.4f) ? 1.0f : 0.0f;
+    /* High Lyapunov = sensitive to perturbation */
+    s3 += (wf_lyapunov > 0.3f) ? 2.0f : (wf_lyapunov > 0.2f) ? 1.0f : 0.0f;
+    /* High fractal dimension (space-filling) */
+    s3 += (wf_fractal > 1.7f) ? 1.5f : (wf_fractal > 1.5f) ? 0.5f : 0.0f;
+    /* High population variance */
+    s3 += (wf_pop_var > 0.05f) ? 1.0f : 0.0f;
+    /* High density */
+    s3 += (wf_density > 0.3f) ? 1.0f : (wf_density > 0.15f) ? 0.5f : 0.0f;
+    /* Low autocorrelation (non-periodic) */
+    s3 += (wf_pop_acf < 0.2f) ? 0.5f : 0.0f;
+
+    /* --- Class IV: Complex / Edge of chaos --- */
+    /* Moderate entropy (neither ordered nor fully disordered) */
+    if (wf_entropy > 0.2f && wf_entropy < 0.6f) s4 += 2.0f;
+    else if (wf_entropy > 0.15f && wf_entropy < 0.7f) s4 += 0.5f;
+    /* Moderate Lyapunov */
+    if (wf_lyapunov > 0.1f && wf_lyapunov < 0.35f) s4 += 2.0f;
+    else if (wf_lyapunov > 0.05f && wf_lyapunov < 0.4f) s4 += 0.5f;
+    /* Moderate fractal dimension (complex but not space-filling) */
+    if (wf_fractal > 1.2f && wf_fractal < 1.7f) s4 += 1.5f;
+    /* Moderate density */
+    if (wf_density > 0.02f && wf_density < 0.25f) s4 += 1.0f;
+    /* Some variance but not extreme */
+    if (wf_pop_var > 0.005f && wf_pop_var < 0.05f) s4 += 1.0f;
+    /* Near-zero or slightly positive ACF (intermittent dynamics) */
+    if (wf_pop_acf > -0.3f && wf_pop_acf < 0.5f) s4 += 0.5f;
+
+    wolfram_scores[0] = s1;
+    wolfram_scores[1] = s2;
+    wolfram_scores[2] = s3;
+    wolfram_scores[3] = s4;
+
+    /* Find winner */
+    int best = 0;
+    float best_score = s1;
+    if (s2 > best_score) { best = 1; best_score = s2; }
+    if (s3 > best_score) { best = 2; best_score = s3; }
+    if (s4 > best_score) { best = 3; best_score = s4; }
+    wolfram_class = best + 1;
+
+    /* Confidence: margin between best and second-best, normalized */
+    float total = s1 + s2 + s3 + s4;
+    if (total > 0.01f) {
+        wolfram_confidence = best_score / total;
+    } else {
+        wolfram_confidence = 0.0f;
+        wolfram_class = 0;
+    }
+
+    wolfram_stale = 0;
+}
+
 /* ── Save / Load (.life files) ─────────────────────────────────────────────── */
 
 /*
@@ -4280,6 +4575,17 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(fractal_str, sizeof(fractal_str),
                  " \033[38;2;230;200;40mD\xe2\x82\x93=%.3f\033[0m", fractal_dbox);
 
+    /* Wolfram class indicator */
+    char wolfram_str[96] = "";
+    if (wolfram_mode) {
+        static const char *class_names[] = {"?", "I", "II", "III", "IV"};
+        static const char *class_colors[] = {"90", "38;2;80;80;120", "38;2;80;200;120", "38;2;255;80;60", "38;2;255;200;60"};
+        int wc = (wolfram_class >= 1 && wolfram_class <= 4) ? wolfram_class : 0;
+        snprintf(wolfram_str, sizeof(wolfram_str),
+                 " \033[%sm\xe2\x97\x86" "W:%s(%.0f%%)\033[0m",
+                 class_colors[wc], class_names[wc], wolfram_confidence * 100.0f);
+    }
+
     /* Census indicator */
     char census_str[64] = "";
     if (census_mode)
@@ -4406,9 +4712,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, census_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
+                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, census_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -4433,7 +4739,7 @@ static void render(int running, int speed_ms, int draw_mode) {
     /* status bar line 2: compact help */
     p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
                      "[1-5]pre [d]draw [k]sym [g]graph [y]dash [w]topo [h]heat [T]trace [f]freq [i]ent [L]lyap [u]fft "
-                     "[X]temp [/]rule [m]mut [b]edit [G]evolve [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
+                     "[X]temp [C]class [/]rule [m]mut [b]edit [G]evolve [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
                      "[S]stamp [v]census [z/x]zoom [n]map [<>]time [t]tbar [P]snap C-p:seq "
                      "C-s:save C-o:load C-e:rle [q]quit\033[0m\033[K\n");
 
@@ -5542,6 +5848,168 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", fdrst);
     }
 
+    /* ── Wolfram Class Detector overlay panel ──────────────────────────────── */
+    if (wolfram_mode) {
+        int wf_w = 44;
+        int wf_col = term_cols - wf_w - 2;
+        /* Stack below other active panels */
+        int wf_row = 3;
+        if (entropy_mode) wf_row += 8;
+        if (temp_mode)    wf_row += 9;
+        if (lyapunov_mode) wf_row += 8;
+        if (fourier_mode) wf_row += 18;
+        if (fractal_mode) wf_row += 11;
+        if (wf_col < 1) wf_col = 1;
+
+        /* Color scheme based on detected class */
+        static const char *wf_bdrs[] = {
+            "\033[38;2;100;100;100;48;2;10;10;10m",   /* unknown: gray */
+            "\033[38;2;80;80;160;48;2;6;6;16m",        /* I: slate blue */
+            "\033[38;2;60;200;100;48;2;4;16;8m",       /* II: green */
+            "\033[38;2;255;80;60;48;2;16;6;4m",        /* III: red */
+            "\033[38;2;255;200;60;48;2;16;14;4m",      /* IV: gold */
+        };
+        static const char *wf_bgs[] = {
+            "\033[48;2;10;10;10m",
+            "\033[48;2;6;6;16m",
+            "\033[48;2;4;16;8m",
+            "\033[48;2;16;6;4m",
+            "\033[48;2;16;14;4m",
+        };
+        static const char *class_names[] = {"???", "I: Fixed", "II: Periodic", "III: Chaotic", "IV: Complex"};
+        static const char *class_desc[] = {
+            "Insufficient data",
+            "Converges to uniform/empty state",
+            "Stable oscillators & still lifes",
+            "Pseudo-random, sensitive to IC",
+            "Edge of chaos: emergent structures"
+        };
+
+        int wc = (wolfram_class >= 1 && wolfram_class <= 4) ? wolfram_class : 0;
+        const char *wbdr = wf_bdrs[wc];
+        const char *wbg  = wf_bgs[wc];
+        const char *wrst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 Wolfram Class ",
+                     wf_row, wf_col, wbdr);
+        for (int i = 16; i < wf_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", wrst);
+
+        /* Row 1: Classification result */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     wf_row + 1, wf_col, wbdr, wbg);
+        p += sprintf(p, " \033[1;38;2;255;255;255m%-22s \033[0;38;2;180;180;140m%.0f%% conf",
+                     class_names[wc], wolfram_confidence * 100.0f);
+        p += sprintf(p, "%s", wbg);
+        for (int i = 0; i < 4; i++) *p++ = ' ';
+        p += sprintf(p, "%s\xe2\x94\x82%s", wbdr, wrst);
+
+        /* Row 2: Description */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     wf_row + 2, wf_col, wbdr, wbg);
+        p += sprintf(p, " \033[38;2;140;140;120m%-41s", class_desc[wc]);
+        p += sprintf(p, "%s\xe2\x94\x82%s", wbdr, wrst);
+
+        /* Row 3: Separator */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82", wf_row + 3, wf_col, wbdr);
+        p += sprintf(p, "%s", wbg);
+        for (int i = 0; i < wf_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", wbdr, wrst);
+
+        /* Row 4: Feature vector header */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     wf_row + 4, wf_col, wbdr, wbg);
+        p += sprintf(p, " \033[38;2;120;120;100mFeatures:                              ");
+        p += sprintf(p, "%s\xe2\x94\x82%s", wbdr, wrst);
+
+        /* Row 5: Entropy + Lyapunov */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     wf_row + 5, wf_col, wbdr, wbg);
+        p += sprintf(p, " \033[38;2;180;255;180mH\xcc\x84=\033[38;2;255;255;255m%.4f"
+                     "  \033[38;2;220;200;60m\xce\xbb=\033[38;2;255;255;255m%.4f"
+                     "  \033[38;2;230;200;40mD\xe2\x82\x93=\033[38;2;255;255;255m%.3f",
+                     wf_entropy, wf_lyapunov, wf_fractal);
+        p += sprintf(p, "%s", wbg);
+        for (int i = 0; i < 2; i++) *p++ = ' ';
+        p += sprintf(p, "%s\xe2\x94\x82%s", wbdr, wrst);
+
+        /* Row 6: Population dynamics */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     wf_row + 6, wf_col, wbdr, wbg);
+        p += sprintf(p, " \033[38;2;120;180;255m\xcf\x83\xc2\xb2=\033[38;2;255;255;255m%.5f"
+                     "  \033[38;2;120;180;255mACF=\033[38;2;255;255;255m%.3f"
+                     "  \033[38;2;120;180;255m\xcf\x81=\033[38;2;255;255;255m%.4f",
+                     wf_pop_var, wf_pop_acf, wf_density);
+        p += sprintf(p, "%s", wbg);
+        for (int i = 0; i < 2; i++) *p++ = ' ';
+        p += sprintf(p, "%s\xe2\x94\x82%s", wbdr, wrst);
+
+        /* Row 7: Separator */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82", wf_row + 7, wf_col, wbdr);
+        p += sprintf(p, "%s", wbg);
+        for (int i = 0; i < wf_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", wbdr, wrst);
+
+        /* Row 8: Score bars header */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     wf_row + 8, wf_col, wbdr, wbg);
+        p += sprintf(p, " \033[38;2;120;120;100mClass Scores:                          ");
+        p += sprintf(p, "%s\xe2\x94\x82%s", wbdr, wrst);
+
+        /* Rows 9-12: Score bars for each class */
+        {
+            static const char *bar_labels[] = {"  I Fixed  ", " II Peri.  ", "III Chaos  ", " IV Cmplx  "};
+            static const int bar_colors[][3] = {
+                {80, 80, 160},   /* slate blue */
+                {60, 200, 100},  /* green */
+                {255, 80, 60},   /* red */
+                {255, 200, 60},  /* gold */
+            };
+            float max_score = 0.01f;
+            for (int i = 0; i < 4; i++)
+                if (wolfram_scores[i] > max_score) max_score = wolfram_scores[i];
+
+            for (int c = 0; c < 4; c++) {
+                p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                             wf_row + 9 + c, wf_col, wbdr, wbg);
+                /* Label */
+                int is_winner = (c + 1 == wolfram_class);
+                if (is_winner)
+                    p += sprintf(p, "\033[1;38;2;255;255;255m");
+                else
+                    p += sprintf(p, "\033[38;2;120;120;100m");
+                p += sprintf(p, "%s", bar_labels[c]);
+
+                /* Bar: 28 chars wide */
+                int bar_len = (int)(wolfram_scores[c] / max_score * 28.0f);
+                if (bar_len > 28) bar_len = 28;
+                for (int i = 0; i < 28; i++) {
+                    if (i < bar_len) {
+                        int r = bar_colors[c][0], g = bar_colors[c][1], b = bar_colors[c][2];
+                        if (is_winner) {
+                            p += sprintf(p, "\033[38;2;%d;%d;%dm\xe2\x96\x88", r, g, b);
+                        } else {
+                            p += sprintf(p, "\033[38;2;%d;%d;%dm\xe2\x96\x93", r/2, g/2, b/2);
+                        }
+                    } else {
+                        p += sprintf(p, "\033[38;2;30;30;25m\xc2\xb7");
+                    }
+                }
+                /* Score value */
+                p += sprintf(p, "\033[38;2;140;140;120m%3.1f", wolfram_scores[c]);
+                p += sprintf(p, "%s\xe2\x94\x82%s", wbdr, wrst);
+            }
+        }
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", wf_row + 13, wf_col, wbdr);
+        for (int i = 0; i < wf_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", wrst);
+    }
+
     /* ── Population Dynamics Dashboard overlay ─────────────────────────────── */
     if (dashboard_mode && hist_count > 1) {
         int db_w = 62;      /* panel width */
@@ -6009,6 +6477,12 @@ int main(int argc, char **argv) {
                 fractal_compute(); /* compute on toggle-on */
             }
         }
+        else if (key == 'C') {
+            wolfram_mode = !wolfram_mode;
+            if (wolfram_mode) {
+                wolfram_classify(); /* compute on toggle-on */
+            }
+        }
         else if (key == ']') {
             if (temp_mode) {
                 temp_brush_radius = temp_brush_radius < 20 ? temp_brush_radius + 1 : 20;
@@ -6414,6 +6888,11 @@ int main(int argc, char **argv) {
         /* Auto-refresh fractal dimension every 8 generations (box-counting over 7 scales) */
         if (fractal_mode && fractal_stale && (generation % 8 == 0 || !running)) {
             fractal_compute();
+        }
+
+        /* Auto-refresh Wolfram classifier every 16 generations (fuses entropy+Lyapunov+fractal+pop) */
+        if (wolfram_mode && wolfram_stale && (generation % 16 == 0 || !running)) {
+            wolfram_classify();
         }
 
         render(running, speed_ms, draw_mode);

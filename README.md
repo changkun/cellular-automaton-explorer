@@ -51,6 +51,7 @@ Requires only `gcc` and a POSIX terminal.
 | `S` | Toggle pattern stamp mode (place classic structures) |
 | `[` / `]` | Cycle stamp pattern (in stamp mode) |
 | Scroll wheel | Rotate stamp 0°/90°/180°/270° (in stamp mode) |
+| `C` | Toggle Wolfram class detector (auto-classify I/II/III/IV) |
 | `G` | Genetic rule explorer — evolve interesting rulesets |
 | `G` (in overlay) | Breed next generation of candidate rules |
 | `1`–`5` (in overlay) | Load a discovered rule into the simulation |

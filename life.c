@@ -16,10 +16,14 @@
  *   [ / ]       Cycle through rule presets (B/S notation)
  *   m           Mutate — randomly flip one birth/survival bit
  *   k           Cycle symmetry: none → 2-fold → 4-fold → 8-fold (kaleidoscope)
+ *   z / x       Zoom in / out (3 levels: 1x, 2x half-block, 4x quarter)
+ *   Arrow keys  Pan viewport across the full 400×200 grid
+ *   0           Re-center viewport on grid center
  *   q / ESC     Quit
  *
  *   Mouse:      Left-click to place cells, right-click to erase
  *               Click+drag to paint/erase continuously
+ *               Scroll wheel to zoom in/out
  *
  * Build:  gcc -O2 -o life life.c
  * Run:    ./life
@@ -48,12 +52,64 @@ static unsigned char next_grid[MAX_H][MAX_W];
 #define GHOST_FRAMES 5
 static unsigned char ghost[MAX_H][MAX_W];
 
-static int W, H;
+static int W = MAX_W, H = MAX_H; /* simulation always uses full grid */
 static int generation;
 static int population;
 static int wrap_mode = 0; /* toroidal wrapping */
 static int heatmap_mode = 1; /* age heatmap + ghost trails (on by default) */
 static int symmetry = 0; /* 0=none, 1=2-fold, 2=4-fold, 3=8-fold */
+
+/* ── Viewport (zoom + pan) ─────────────────────────────────────────────────── */
+
+static int view_x = 0, view_y = 0;     /* top-left corner in grid coords */
+static int view_w, view_h;             /* viewport size in grid cells */
+static int term_cols, term_rows;        /* terminal dimensions */
+static int zoom = 1; /* 1=normal(2ch/cell), 2=half-block(1ch/cell,2rows/char), 4=quarter */
+
+static void viewport_update(void) {
+    /* Compute how many grid cells fit in the terminal at current zoom */
+    int usable_rows = term_rows - 3; /* 2 status lines + margin */
+    if (usable_rows < 5) usable_rows = 5;
+
+    if (zoom == 1) {
+        view_w = term_cols / 2;
+        view_h = usable_rows;
+    } else if (zoom == 2) {
+        /* half-block: 1 char per cell wide, 2 cells per row tall */
+        view_w = term_cols;
+        view_h = usable_rows * 2;
+    } else { /* zoom == 4 */
+        /* quarter: 2 cells per char wide, 2 cells per row tall */
+        view_w = term_cols * 2;
+        view_h = usable_rows * 2;
+    }
+
+    if (view_w > MAX_W) view_w = MAX_W;
+    if (view_h > MAX_H) view_h = MAX_H;
+
+    /* Clamp viewport position */
+    if (view_x + view_w > W) view_x = W - view_w;
+    if (view_y + view_h > H) view_y = H - view_h;
+    if (view_x < 0) view_x = 0;
+    if (view_y < 0) view_y = 0;
+}
+
+static void viewport_center(void) {
+    view_x = (W - view_w) / 2;
+    view_y = (H - view_h) / 2;
+    if (view_x < 0) view_x = 0;
+    if (view_y < 0) view_y = 0;
+}
+
+static void viewport_pan(int dx, int dy) {
+    int step = (zoom == 1) ? 4 : (zoom == 2) ? 8 : 16;
+    view_x += dx * step;
+    view_y += dy * step;
+    if (view_x + view_w > W) view_x = W - view_w;
+    if (view_y + view_h > H) view_y = H - view_h;
+    if (view_x < 0) view_x = 0;
+    if (view_y < 0) view_y = 0;
+}
 
 /* ── Population history (for sparkline) ────────────────────────────────────── */
 
@@ -422,6 +478,14 @@ static MouseEvent parse_sgr_mouse(void) {
 /* High-level key/mouse reader. Returns key char, or 0 if nothing, or -2 for mouse. */
 static MouseEvent last_mouse;
 
+/* Special return codes for read_input */
+#define KEY_MOUSE  (-2)
+#define KEY_UP     (-3)
+#define KEY_DOWN   (-4)
+#define KEY_RIGHT  (-5)
+#define KEY_LEFT   (-6)
+#define KEY_IGNORE (-1)
+
 static int read_input(void) {
     int c = read_byte();
     if (c < 0) return 0;
@@ -433,28 +497,21 @@ static int read_input(void) {
             if (c3 == '<') {
                 /* SGR mouse */
                 last_mouse = parse_sgr_mouse();
-                return -2;
+                return KEY_MOUSE;
             }
-            /* Other CSI sequences — ignore */
-            while (c3 >= 0 && c3 < 0x40) c3 = read_byte(); /* consume params */
-            return -1;
+            /* Arrow keys: CSI A/B/C/D */
+            if (c3 == 'A') return KEY_UP;
+            if (c3 == 'B') return KEY_DOWN;
+            if (c3 == 'C') return KEY_RIGHT;
+            if (c3 == 'D') return KEY_LEFT;
+            /* Other CSI sequences — consume and ignore */
+            while (c3 >= 0 && c3 < 0x40) c3 = read_byte();
+            return KEY_IGNORE;
         }
         return 27;
     }
     return c;
 }
-
-/* ── Color palette (legacy flat color, cycles each generation) ─────────────── */
-
-static const char *alive_colors[] = {
-    "\033[42m",   /* green */
-    "\033[102m",  /* bright green */
-    "\033[46m",   /* cyan */
-    "\033[106m",  /* bright cyan */
-    "\033[43m",   /* yellow */
-    "\033[103m",  /* bright yellow */
-};
-#define N_COLORS 6
 
 /* ── Thermal heatmap: age → RGB ────────────────────────────────────────────── */
 
@@ -565,6 +622,25 @@ static void render_sparkline(char **pp, int width) {
 /* Larger buffer for true-color escape sequences */
 static char render_buf[MAX_H * MAX_W * 40 + 16384];
 
+/* Get cell color for rendering (returns 1 if alive, fills rgb; 2 if ghost) */
+static int cell_color(int x, int y, RGB *out) {
+    if (x < 0 || x >= W || y < 0 || y >= H) return 0;
+    if (grid[y][x]) {
+        if (heatmap_mode)
+            *out = age_to_rgb(grid[y][x]);
+        else {
+            /* flat green for non-heatmap */
+            *out = (RGB){0, 200, 0};
+        }
+        return 1;
+    }
+    if (heatmap_mode && ghost[y][x]) {
+        *out = ghost_to_rgb(ghost[y][x]);
+        return 2; /* ghost */
+    }
+    return 0;
+}
+
 static void render(int running, int speed_ms, int draw_mode) {
     char *p = render_buf;
 
@@ -576,7 +652,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         ? "\033[92m\u25B6 RUN\033[0m"
         : "\033[93m\u23F8 PAUSE\033[0m";
     const char *wrap_str = wrap_mode
-        ? " \033[95m\u221E\033[0m"  /* infinity symbol for toroidal */
+        ? " \033[95m\u221E\033[0m"
         : "";
     const char *draw_str = draw_mode
         ? " \033[96m\u270E DRAW\033[0m"
@@ -591,6 +667,12 @@ static void render(int running, int speed_ms, int draw_mode) {
                  " \033[93m\u2735SYM:%d\033[0m", folds[symmetry]);
     }
 
+    /* Zoom indicator */
+    char zoom_str[32] = "";
+    if (zoom > 1)
+        snprintf(zoom_str, sizeof(zoom_str),
+                 " \033[94m\u2302%dx\033[0m", zoom);
+
     /* Rule string */
     char rule_str[32];
     rule_to_string(rule_str, sizeof(rule_str));
@@ -603,9 +685,10 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, wrap_str, draw_str, heat_str, sym_str, rule_display, generation, population, speed_ms);
+                 state, wrap_str, draw_str, heat_str, sym_str, zoom_str,
+                 rule_display, generation, population, speed_ms);
 
     /* sparkline right after stats */
     if (show_graph && hist_count > 1) {
@@ -618,18 +701,22 @@ static void render(int running, int speed_ms, int draw_mode) {
     /* status bar line 2: compact help */
     p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
                      "[1-5]pre [d]draw [k]sym [g]graph [w]wrap [h]heat "
-                     "[\033[0m\033[90m[/]]rule [m]mutate [+/-]spd [q]quit\033[0m\033[K\n");
+                     "[/]rule [m]mut [z/x]zoom [\u2190\u2191\u2192\u2193]pan [0]center [q]quit\033[0m\033[K\n");
 
-    if (heatmap_mode) {
-        /* ── Heatmap rendering with true-color ── */
-        for (int y = 0; y < H; y++) {
-            for (int x = 0; x < W; x++) {
-                if (grid[y][x]) {
-                    RGB c = age_to_rgb(grid[y][x]);
+    int usable_rows = term_rows - 3;
+    if (usable_rows < 5) usable_rows = 5;
+
+    if (zoom == 1) {
+        /* ── Normal zoom: 2 chars per cell ── */
+        for (int row = 0; row < usable_rows && row < view_h; row++) {
+            int gy = view_y + row;
+            for (int col = 0; col < view_w; col++) {
+                int gx = view_x + col;
+                RGB c;
+                int t = cell_color(gx, gy, &c);
+                if (t == 1) {
                     p += sprintf(p, "\033[48;2;%d;%d;%dm  \033[0m", c.r, c.g, c.b);
-                } else if (ghost[y][x]) {
-                    RGB c = ghost_to_rgb(ghost[y][x]);
-                    /* Ghost: foreground dot on black background */
+                } else if (t == 2) {
                     p += sprintf(p, "\033[38;2;%d;%d;%dm\xC2\xB7 \033[0m", c.r, c.g, c.b);
                 } else {
                     *p++ = ' '; *p++ = ' ';
@@ -637,18 +724,103 @@ static void render(int running, int speed_ms, int draw_mode) {
             }
             *p++ = '\033'; *p++ = '['; *p++ = 'K'; *p++ = '\n';
         }
-    } else {
-        /* ── Legacy flat-color rendering ── */
-        const char *color = alive_colors[generation % N_COLORS];
-        for (int y = 0; y < H; y++) {
-            for (int x = 0; x < W; x++) {
-                if (grid[y][x]) {
-                    const char *c = color;
-                    while (*c) *p++ = *c++;
-                    *p++ = ' '; *p++ = ' ';
-                    *p++ = '\033'; *p++ = '['; *p++ = '0'; *p++ = 'm';
+    } else if (zoom == 2) {
+        /* ── Half-block zoom: 1 char per cell, 2 rows per terminal row ── */
+        /* Use ▀ (upper half block) with fg=top cell, bg=bottom cell */
+        int vis_w = view_w < term_cols ? view_w : term_cols;
+        for (int row = 0; row < usable_rows; row++) {
+            int gy_top = view_y + row * 2;
+            int gy_bot = gy_top + 1;
+            for (int col = 0; col < vis_w; col++) {
+                int gx = view_x + col;
+                RGB ct, cb;
+                int tt = cell_color(gx, gy_top, &ct);
+                int tb = cell_color(gx, gy_bot, &cb);
+
+                if (tt == 1 && tb == 1) {
+                    /* both alive: fg=top, bg=bottom, print ▀ */
+                    p += sprintf(p, "\033[38;2;%d;%d;%d;48;2;%d;%d;%dm\xe2\x96\x80\033[0m",
+                                 ct.r, ct.g, ct.b, cb.r, cb.g, cb.b);
+                } else if (tt == 1) {
+                    /* top alive only */
+                    p += sprintf(p, "\033[38;2;%d;%d;%dm\xe2\x96\x80\033[0m",
+                                 ct.r, ct.g, ct.b);
+                } else if (tb == 1) {
+                    /* bottom alive only: use ▄ (lower half) */
+                    p += sprintf(p, "\033[38;2;%d;%d;%dm\xe2\x96\x84\033[0m",
+                                 cb.r, cb.g, cb.b);
+                } else if (tt == 2 || tb == 2) {
+                    /* ghost in either half — dim dot */
+                    RGB gc = tt == 2 ? ct : cb;
+                    p += sprintf(p, "\033[38;2;%d;%d;%dm\xC2\xB7\033[0m",
+                                 gc.r, gc.g, gc.b);
                 } else {
-                    *p++ = ' '; *p++ = ' ';
+                    *p++ = ' ';
+                }
+            }
+            *p++ = '\033'; *p++ = '['; *p++ = 'K'; *p++ = '\n';
+        }
+    } else { /* zoom == 4 */
+        /* ── Quarter zoom: 2 cells per char wide, 2 cells per row tall ── */
+        /* Use quadrant block chars: ▘▝▀▖▌▞▛▗▚▐▜▄▙▟█ */
+        /* Encoding: bit0=TL, bit1=TR, bit2=BL, bit3=BR */
+        static const char *quad_chars[16] = {
+            " ",                    /* 0000 */
+            "\xe2\x96\x98",        /* 0001 ▘ TL */
+            "\xe2\x96\x9d",        /* 0010 ▝ TR */
+            "\xe2\x96\x80",        /* 0011 ▀ top */
+            "\xe2\x96\x96",        /* 0100 ▖ BL */
+            "\xe2\x96\x8c",        /* 0101 ▌ left */
+            "\xe2\x96\x9e",        /* 0110 ▞ diag */
+            "\xe2\x96\x9b",        /* 0111 ▛ TL+TR+BL */
+            "\xe2\x96\x97",        /* 1000 ▗ BR */
+            "\xe2\x96\x9a",        /* 1001 ▚ anti-diag */
+            "\xe2\x96\x90",        /* 1010 ▐ right */
+            "\xe2\x96\x9c",        /* 1011 ▜ TL+TR+BR */
+            "\xe2\x96\x84",        /* 1100 ▄ bottom */
+            "\xe2\x96\x99",        /* 1101 ▙ TL+BL+BR */
+            "\xe2\x96\x9f",        /* 1110 ▟ TR+BL+BR */
+            "\xe2\x96\x88",        /* 1111 █ full */
+        };
+        int vis_w = (view_w + 1) / 2;
+        if (vis_w > term_cols) vis_w = term_cols;
+        for (int row = 0; row < usable_rows; row++) {
+            int gy0 = view_y + row * 2;
+            int gy1 = gy0 + 1;
+            for (int col = 0; col < vis_w; col++) {
+                int gx0 = view_x + col * 2;
+                int gx1 = gx0 + 1;
+
+                /* Check which quadrants are alive */
+                RGB dummy;
+                int tl = (cell_color(gx0, gy0, &dummy) == 1);
+                int tr = (cell_color(gx1, gy0, &dummy) == 1);
+                int bl = (cell_color(gx0, gy1, &dummy) == 1);
+                int br = (cell_color(gx1, gy1, &dummy) == 1);
+                int bits = tl | (tr << 1) | (bl << 2) | (br << 3);
+
+                if (bits && heatmap_mode) {
+                    /* Average color of alive cells */
+                    int rr = 0, gg = 0, bb = 0, cnt = 0;
+                    RGB c;
+                    if (tl && cell_color(gx0, gy0, &c)) { rr += c.r; gg += c.g; bb += c.b; cnt++; }
+                    if (tr && cell_color(gx1, gy0, &c)) { rr += c.r; gg += c.g; bb += c.b; cnt++; }
+                    if (bl && cell_color(gx0, gy1, &c)) { rr += c.r; gg += c.g; bb += c.b; cnt++; }
+                    if (br && cell_color(gx1, gy1, &c)) { rr += c.r; gg += c.g; bb += c.b; cnt++; }
+                    if (cnt) {
+                        p += sprintf(p, "\033[38;2;%d;%d;%dm", rr/cnt, gg/cnt, bb/cnt);
+                    } else {
+                        p += sprintf(p, "\033[37m");
+                    }
+                } else if (bits) {
+                    p += sprintf(p, "\033[92m"); /* green */
+                }
+
+                const char *ch = quad_chars[bits];
+                while (*ch) *p++ = *ch++;
+
+                if (bits) {
+                    p += sprintf(p, "\033[0m");
                 }
             }
             *p++ = '\033'; *p++ = '['; *p++ = 'K'; *p++ = '\n';
@@ -670,32 +842,8 @@ static void handle_winch(int sig) {
 }
 
 static void apply_resize(void) {
-    int cols, rows;
-    get_term_size(&cols, &rows);
-    int nw = cols / 2;
-    int nh = rows - 3; /* 2 status lines + margin */
-    if (nw > MAX_W) nw = MAX_W;
-    if (nh > MAX_H) nh = MAX_H;
-    if (nw < 10) nw = 10;
-    if (nh < 5) nh = 5;
-
-    unsigned char tmp[MAX_H][MAX_W];
-    unsigned char tmp_ghost[MAX_H][MAX_W];
-    memcpy(tmp, grid, sizeof(grid));
-    memcpy(tmp_ghost, ghost, sizeof(ghost));
-    memset(grid, 0, sizeof(grid));
-    memset(ghost, 0, sizeof(ghost));
-    population = 0;
-    int mw = nw < W ? nw : W;
-    int mh = nh < H ? nh : H;
-    for (int y = 0; y < mh; y++)
-        for (int x = 0; x < mw; x++) {
-            if (tmp[y][x]) { grid[y][x] = tmp[y][x]; population++; }
-            ghost[y][x] = tmp_ghost[y][x];
-        }
-
-    W = nw;
-    H = nh;
+    get_term_size(&term_cols, &term_rows);
+    viewport_update();
     printf("\033[2J");
     fflush(stdout);
 }
@@ -712,12 +860,11 @@ int main(void) {
     srand(time(NULL));
     build_pulsar();
 
-    int cols, rows;
-    get_term_size(&cols, &rows);
-    W = cols / 2;
-    H = rows - 3;
-    if (W > MAX_W) W = MAX_W;
-    if (H > MAX_H) H = MAX_H;
+    W = MAX_W;
+    H = MAX_H;
+    get_term_size(&term_cols, &term_rows);
+    viewport_update();
+    viewport_center();
 
     grid_randomize(0.25);
     hist_push(population);
@@ -793,22 +940,91 @@ int main(void) {
             else
                 survival_mask ^= (1 << (which - 9));
         }
-        else if (key == -2 && draw_mode) {
-            /* Mouse event */
+        else if (key == 'z' || key == 'Z') {
+            /* Zoom in */
+            if (zoom > 1) {
+                /* Center the new view on the midpoint of old view */
+                int cx = view_x + view_w / 2;
+                int cy = view_y + view_h / 2;
+                zoom /= 2;
+                viewport_update();
+                view_x = cx - view_w / 2;
+                view_y = cy - view_h / 2;
+                viewport_update(); /* re-clamp */
+                printf("\033[2J"); fflush(stdout);
+            }
+        }
+        else if (key == 'x' || key == 'X') {
+            /* Zoom out */
+            if (zoom < 4) {
+                int cx = view_x + view_w / 2;
+                int cy = view_y + view_h / 2;
+                zoom *= 2;
+                viewport_update();
+                view_x = cx - view_w / 2;
+                view_y = cy - view_h / 2;
+                viewport_update();
+                printf("\033[2J"); fflush(stdout);
+            }
+        }
+        else if (key == '0') {
+            viewport_center();
+        }
+        else if (key == KEY_UP) viewport_pan(0, -1);
+        else if (key == KEY_DOWN) viewport_pan(0, 1);
+        else if (key == KEY_LEFT) viewport_pan(-1, 0);
+        else if (key == KEY_RIGHT) viewport_pan(1, 0);
+        else if (key == KEY_MOUSE) {
             MouseEvent *m = &last_mouse;
-            /* Convert terminal coords to grid coords (1-based, 2 chars per cell) */
-            int gx = (m->x - 1) / 2;
-            int gy = m->y - 3; /* 2 status lines + 1-based */
+            int btn = m->button & 0x43;
 
-            if (m->type == 1) { /* press */
-                int btn = m->button & 0x03;
-                if (btn == 0) { mouse_held = 1; sym_apply(gx, gy, grid_set); }
-                else if (btn == 2) { mouse_held = 2; sym_apply(gx, gy, grid_unset); }
-            } else if (m->type == 3) { /* drag */
-                if (mouse_held == 1) sym_apply(gx, gy, grid_set);
-                else if (mouse_held == 2) sym_apply(gx, gy, grid_unset);
-            } else if (m->type == 2) { /* release */
-                mouse_held = 0;
+            /* Scroll wheel zoom: button 64=scroll-up(zoom in), 65=scroll-down(zoom out) */
+            if (m->type == 1 && btn == 64) {
+                if (zoom > 1) {
+                    int cx = view_x + view_w / 2;
+                    int cy = view_y + view_h / 2;
+                    zoom /= 2;
+                    viewport_update();
+                    view_x = cx - view_w / 2;
+                    view_y = cy - view_h / 2;
+                    viewport_update();
+                    printf("\033[2J"); fflush(stdout);
+                }
+            } else if (m->type == 1 && btn == 65) {
+                if (zoom < 4) {
+                    int cx = view_x + view_w / 2;
+                    int cy = view_y + view_h / 2;
+                    zoom *= 2;
+                    viewport_update();
+                    view_x = cx - view_w / 2;
+                    view_y = cy - view_h / 2;
+                    viewport_update();
+                    printf("\033[2J"); fflush(stdout);
+                }
+            } else if (draw_mode) {
+                /* Convert terminal coords to grid coords through viewport */
+                int gx, gy;
+                if (zoom == 1) {
+                    gx = view_x + (m->x - 1) / 2;
+                    gy = view_y + (m->y - 3);
+                } else if (zoom == 2) {
+                    gx = view_x + (m->x - 1);
+                    gy = view_y + (m->y - 3) * 2;
+                } else { /* zoom == 4 */
+                    gx = view_x + (m->x - 1) * 2;
+                    gy = view_y + (m->y - 3) * 2;
+                }
+
+                if (m->type == 1) { /* press */
+                    int mbtn = btn & 0x03;
+                    if (mbtn == 0) { mouse_held = 1; sym_apply(gx, gy, grid_set); }
+                    else if (mbtn == 2) { mouse_held = 2; sym_apply(gx, gy, grid_unset); }
+                } else if (m->type == 3) { /* drag */
+                    if (mouse_held == 1) sym_apply(gx, gy, grid_set);
+                    else if (mouse_held == 2) sym_apply(gx, gy, grid_unset);
+                } else if (m->type == 2) { /* release */
+                    mouse_held = 0;
+                }
             }
         }
 

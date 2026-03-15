@@ -68,6 +68,8 @@
  *   ^           Toggle Kolmogorov complexity estimator (algorithmic complexity)
  *                 LZ77-style compression of local neighborhoods
  *                 Blue=compressible, gold=structured, red=incompressible
+ *   D           Auto-demo mode — curated tour of pattern + overlay combos
+ *                 Cycles through 10 scenes; press any key to exit and explore
  *   ?           Toggle cell probe inspector (click any cell for all metrics)
  *                 Shows entropy, temperature, Lyapunov, Fourier, fractal, surprisal,
  *                 mutual info, Kolmogorov, complexity, frequency, flow, RG, topology
@@ -475,6 +477,38 @@ static int   kc_hist_count = 0;
 static int   probe_mode = 0;          /* 0=off, 1=on (awaiting click), 2=showing */
 static int   probe_x = -1;            /* selected cell x */
 static int   probe_y = -1;            /* selected cell y */
+
+/* ── Auto-Demo Mode ──────────────────────────────────────────────────────── */
+
+#define DEMO_N_SCENES 10
+#define DEMO_SCENE_GENS 150
+#define DEMO_FADE_FRAMES 12
+
+typedef struct {
+    int pattern;          /* 0=random, 1-5=preset pattern */
+    int ruleset;          /* index into rulesets[] */
+    const char *overlays; /* string of overlay toggle chars to enable */
+    const char *caption;  /* description shown during scene */
+} DemoScene;
+
+static const DemoScene demo_scenes[DEMO_N_SCENES] = {
+    { 3, 0, "O",  "Gosper Gun + Information Flow: causal influence radiates with gliders" },
+    { 4, 0, "L",  "R-pentomino + Lyapunov Sensitivity: chaos mapped at the expanding frontier" },
+    { 0, 4, "F",  "Diamoeba + Fractal Dimension: organic boundaries with measurable roughness" },
+    { 5, 0, "i",  "Acorn + Entropy: Shannon entropy localizes active computation" },
+    { 3, 0, "f",  "Gosper Gun + Frequency Analysis: periodic structures revealed" },
+    { 0, 2, "#",  "Day & Night + Complexity Index: edge-of-chaos dynamics visualized" },
+    { 4, 0, "!",  "R-pentomino + Prediction Surprise: emergent novelty highlighted" },
+    { 0, 1, "$",  "HighLife + Topological Features: connected components and holes tracked" },
+    { 0, 7, "^",  "Maze + Kolmogorov Complexity: algorithmic depth of corridor growth" },
+    { 5, 0, "%h", "Acorn + Renormalization Group: multi-scale structure emerges over time" },
+};
+
+static int demo_mode = 0;        /* 0=off, 1=running */
+static int demo_scene = 0;       /* current scene index */
+static int demo_scene_gen = 0;   /* generations into current scene */
+static int demo_fade = 0;        /* countdown frames for fade transition */
+static char demo_caption[256] = "";
 
 /* ── Pattern Census ───────────────────────────────────────────────────────── */
 static int census_mode = 0;    /* 0=off, 1=on */
@@ -2002,6 +2036,106 @@ static void load_pattern(int id) {
         case 4: place_pattern(pat_rpent, 5); break;
         case 5: place_pattern(pat_acorn, 7); break;
     }
+}
+
+/* ── Auto-Demo helpers ─────────────────────────────────────────────────────── */
+
+/* Forward declarations for overlay compute functions (defined later) */
+static void freq_analyze(void);
+static void entropy_compute(void);
+static void lyapunov_compute(void);
+static void fourier_compute(void);
+static void fractal_compute(void);
+static void wolfram_classify(void);
+static void flow_compute(void);
+static void attractor_compute(void);
+static void surp_compute(void);
+static void mi_compute(void);
+static void cplx_compute(void);
+static void topo_compute(void);
+static void rg_compute(void);
+static void kc_compute(void);
+
+static void demo_reset_overlays(void) {
+    freq_mode = 0;
+    entropy_mode = 0;
+    lyapunov_mode = 0;
+    flow_mode = 0;
+    attractor_mode = 0;
+    surp_mode = 0;
+    mi_mode = 0;
+    cplx_mode = 0;
+    topo_mode = 0;
+    rg_mode = 0;
+    kc_mode = 0;
+    fourier_mode = 0;
+    fractal_mode = 0;
+    wolfram_mode = 0;
+    census_mode = 0;
+    heatmap_mode = 0;
+    show_graph = 0;
+    dashboard_mode = 0;
+    probe_mode = 0;
+    probe_x = probe_y = -1;
+    cone_mode = 0;
+    tracer_mode = 0;
+    rule_editor = 0;
+    gene_mode = 0;
+    /* stamp_mode is reset separately in demo_setup_scene */
+    emit_mode = 0;
+    zone_mode = 0;
+    portal_mode = 0;
+    temp_mode = 0;
+    ecosystem_mode = 0;
+}
+
+static void demo_setup_scene(int idx) {
+    const DemoScene *sc = &demo_scenes[idx];
+
+    /* Reset all overlays */
+    demo_reset_overlays();
+
+    /* Set ruleset */
+    current_ruleset = sc->ruleset;
+    birth_mask = rulesets[current_ruleset].birth;
+    survival_mask = rulesets[current_ruleset].survival;
+
+    /* Load pattern or randomize */
+    if (sc->pattern == 0) {
+        grid_randomize(0.25);
+    } else {
+        load_pattern(sc->pattern);
+    }
+
+    /* Enable requested overlays */
+    for (const char *o = sc->overlays; *o; o++) {
+        switch (*o) {
+            case 'f': freq_mode = 1; freq_analyze(); break;
+            case 'i': entropy_mode = 1; entropy_compute(); break;
+            case 'L': lyapunov_mode = 1; lyapunov_compute(); break;
+            case 'u': fourier_mode = 1; fourier_compute(); break;
+            case 'F': fractal_mode = 1; fractal_compute(); break;
+            case 'C': wolfram_mode = 1; wolfram_classify(); break;
+            case 'O': flow_mode = 1; flow_compute(); break;
+            case 'A': attractor_mode = 1; attractor_compute(); break;
+            case '!': surp_mode = 1; surp_compute(); break;
+            case '@': mi_mode = 1; mi_compute(); break;
+            case '#': cplx_mode = 1; cplx_compute(); break;
+            case '$': topo_mode = 1; topo_compute(); break;
+            case '%': rg_mode = 1; rg_compute(); break;
+            case '^': kc_mode = 1; kc_compute(); break;
+            case 'h': heatmap_mode = 1; break;
+            case 'g': show_graph = 1; break;
+        }
+    }
+
+    /* Set caption */
+    snprintf(demo_caption, sizeof(demo_caption), "%s", sc->caption);
+    demo_scene_gen = 0;
+    demo_fade = 0;
+
+    /* Center viewport */
+    viewport_center();
 }
 
 /* ── Stamp Tool (pattern library with rotation) ────────────────────────────── */
@@ -6593,6 +6727,17 @@ static int cell_color(int x, int y, RGB *out) {
     return 0;
 }
 
+/* Apply demo fade-out dimming to an RGB color */
+static void demo_fade_apply(RGB *c) {
+    if (demo_mode && demo_scene_gen >= DEMO_SCENE_GENS && demo_fade > 0) {
+        int scale = 255 - (demo_fade * 240 / DEMO_FADE_FRAMES);
+        if (scale < 15) scale = 15;
+        c->r = (unsigned char)(c->r * scale / 255);
+        c->g = (unsigned char)(c->g * scale / 255);
+        c->b = (unsigned char)(c->b * scale / 255);
+    }
+}
+
 static void render(int running, int speed_ms, int draw_mode) {
     char *p = render_buf;
 
@@ -6600,7 +6745,9 @@ static void render(int running, int speed_ms, int draw_mode) {
     p += sprintf(p, "\033[H");
 
     /* status bar line 1 */
-    const char *state = replay_mode
+    const char *state = demo_mode
+        ? "\033[95m\u25B6 DEMO\033[0m"
+        : replay_mode
         ? "\033[93m\u23EA REPLAY\033[0m"
         : running
         ? "\033[92m\u25B6 RUN\033[0m"
@@ -6886,12 +7033,26 @@ static void render(int running, int speed_ms, int draw_mode) {
 
     p += sprintf(p, "\033[K\n");
 
-    /* status bar line 2: compact help */
-    p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
-                     "[1-5]pre [d]draw [k]sym [g]graph [y]dash [w]topo [h]heat [T]trace [f]freq [i]ent [L]lyap [u]fft "
-                     "[X]temp [C]class [O]flow [9]cone [!]surp [@]mi [#]cplx [$]topo [/]rule [m]mut [b]edit [G]evolve [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
-                     "[S]stamp [v]census [?]probe [z/x]zoom [n]map [<>]time [t]tbar [P]snap C-p:seq "
-                     "C-s:save C-o:load C-e:rle [q]quit\033[0m\033[K\n");
+    /* status bar line 2: compact help or demo caption */
+    if (demo_mode && demo_caption[0]) {
+        /* Demo caption bar with scene counter and progress */
+        int pct = (demo_scene_gen < DEMO_SCENE_GENS)
+                ? demo_scene_gen * 100 / DEMO_SCENE_GENS : 100;
+        int fade_bright = 255;
+        if (demo_scene_gen >= DEMO_SCENE_GENS && demo_fade > 0) {
+            fade_bright = 255 - (demo_fade * 200 / DEMO_FADE_FRAMES);
+            if (fade_bright < 55) fade_bright = 55;
+        }
+        p += sprintf(p, " \033[38;2;%d;%d;%dm\xe2\x96\xb6 DEMO [%d/%d] %s  \033[90m(%d%%) press any key to exit\033[0m\033[K\n",
+                     fade_bright, fade_bright, (int)(fade_bright * 0.7),
+                     demo_scene + 1, DEMO_N_SCENES, demo_caption, pct);
+    } else {
+        p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
+                         "[1-5]pre [d]draw [D]demo [k]sym [g]graph [y]dash [w]topo [h]heat [T]trace [f]freq [i]ent [L]lyap [u]fft "
+                         "[X]temp [C]class [O]flow [9]cone [!]surp [@]mi [#]cplx [$]topo [/]rule [m]mut [b]edit [G]evolve [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
+                         "[S]stamp [v]census [?]probe [z/x]zoom [n]map [<>]time [t]tbar [P]snap C-p:seq "
+                         "C-s:save C-o:load C-e:rle [q]quit\033[0m\033[K\n");
+    }
 
     int usable_rows = term_rows - 3;
     if (usable_rows < 5) usable_rows = 5;
@@ -6904,6 +7065,7 @@ static void render(int running, int speed_ms, int draw_mode) {
                 int gx = view_x + col;
                 RGB c;
                 int t = cell_color(gx, gy, &c);
+                demo_fade_apply(&c);
                 if (t == 1) {
                     /* Show arrow glyphs at block centers in flow mode */
                     if (flow_mode && (gx % FLOW_BLOCK == FLOW_BLOCK/2) && (gy % FLOW_BLOCK == FLOW_BLOCK/2)) {
@@ -6971,6 +7133,8 @@ static void render(int running, int speed_ms, int draw_mode) {
                 RGB ct, cb;
                 int tt = cell_color(gx, gy_top, &ct);
                 int tb = cell_color(gx, gy_bot, &cb);
+                demo_fade_apply(&ct);
+                demo_fade_apply(&cb);
 
                 /* Treat emitter(4), absorber(5), tracer(6), freq(7), portal(8,9,10) as solid colored cells */
                 int tt_solid = (tt == 1 || tt >= 4);
@@ -9904,6 +10068,14 @@ int main(int argc, char **argv) {
         }
 
         int key = read_input();
+
+        /* Auto-demo: any key exits demo and keeps current scene */
+        if (demo_mode && key != KEY_IGNORE && key != KEY_MOUSE && key != 0) {
+            demo_mode = 0;
+            flash_set("Demo ended \xe2\x80\x94 explore freely");
+            key = KEY_IGNORE; /* consume the key */
+        }
+
         if (gene_mode == 2 && (key == 'q' || key == 'Q' || key == 27)) {
             /* Close genetic explorer overlay without quitting */
             gene_mode = 0;
@@ -10058,7 +10230,21 @@ int main(int argc, char **argv) {
                 speed_ms = speed_ms < 1000 ? speed_ms + 20 : 1000;
             }
         }
-        else if (key == 'd' || key == 'D')
+        else if (key == 'D') {
+            /* Toggle auto-demo mode */
+            if (demo_mode) {
+                demo_mode = 0;
+                flash_set("Demo ended — explore freely");
+            } else {
+                demo_mode = 1;
+                demo_scene = 0;
+                demo_setup_scene(0);
+                running = 1;
+                speed_ms = 60;
+                printf("\033[2J"); fflush(stdout);
+            }
+        }
+        else if (key == 'd')
             draw_mode = !draw_mode;
         else if (key == 'g' || key == 'G')
             show_graph = !show_graph;
@@ -10585,6 +10771,20 @@ int main(int argc, char **argv) {
         if (running && !replay_mode && now - last_step >= speed_ms) {
             grid_step();
             last_step = now;
+
+            /* Auto-demo scene advancement */
+            if (demo_mode) {
+                demo_scene_gen++;
+                if (demo_scene_gen >= DEMO_SCENE_GENS) {
+                    demo_fade++;
+                    if (demo_fade >= DEMO_FADE_FRAMES) {
+                        /* Advance to next scene (wrap around) */
+                        demo_scene = (demo_scene + 1) % DEMO_N_SCENES;
+                        demo_setup_scene(demo_scene);
+                        printf("\033[2J"); fflush(stdout);
+                    }
+                }
+            }
         }
 
         /* Auto-refresh frequency analysis every 8 generations when active */

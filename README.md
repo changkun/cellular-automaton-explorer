@@ -44,6 +44,8 @@ Requires only `gcc` and a POSIX terminal.
 | `a` | Toggle dual-species ecosystem mode |
 | `6` | Toggle brush species (A ↔ B) in ecosystem mode |
 | `{` / `}` | Adjust cross-species interaction coefficient (-1.0 to +1.0) |
+| `P` | Screenshot — save viewport as PPM image (`frame_NNNN.ppm`) |
+| `Ctrl-P` | Dump full timeline buffer as numbered PPM image sequence |
 | `S` | Toggle pattern stamp mode (place classic structures) |
 | `[` / `]` | Cycle stamp pattern (in stamp mode) |
 | Scroll wheel | Rotate stamp 0°/90°/180°/270° (in stamp mode) |
@@ -288,6 +290,31 @@ name, and current rotation. Stamps integrate with kaleidoscope symmetry (place m
 arrangements), ecosystem mode (stamp as active species), and wormhole portals (aim gliders
 at portal entrances).
 
+## Screenshot & Animation Capture
+
+Press `P` to save the current viewport as a **PPM image** file, or `Ctrl-P` to export the
+entire 256-frame timeline buffer as a numbered image sequence.
+
+- **`P`** — single screenshot → `frame_0001.ppm`, `frame_0002.ppm`, etc.
+- **`Ctrl-P`** — full timeline dump → `frame_0001.ppm` through `frame_0256.ppm`
+
+Files use binary PPM (`P6`) format — zero dependencies, readable by ImageMagick, GIMP, ffmpeg,
+and most image viewers. Captures exactly what the viewport shows, including all active rendering
+modes (heatmap, species colors, zone tinting, frequency overlay, signal tracer, portals, ghost trails).
+
+### Converting output
+
+```bash
+# Animated GIF from timeline sequence
+convert -delay 5 frame_*.ppm animation.gif
+
+# Video from timeline sequence
+ffmpeg -framerate 30 -i frame_%04d.ppm output.mp4
+```
+
+Auto-numbered files skip existing slots (up to 9999), so multiple captures accumulate safely.
+Status bar flashes confirmation with filename and dimensions.
+
 ## Save & Load
 
 Press `Ctrl-S` to save the full simulation state to a numbered `.life` file (`save_001.life`,
@@ -319,6 +346,7 @@ grid state, cell ages, ghost trails, zones, emitters, absorbers, ruleset, symmet
 - Save/load — binary `.life` files preserving full state (grid, zones, emitters, absorbers, settings) with auto-numbered slots and status flash feedback
 - Frequency analysis — per-cell oscillation period detection via autocorrelation over timeline history, with ice-blue→emerald→gold→red color spectrum and legend overlay
 - Wormhole portals — paired non-local spatial couplings with additive neighbor model, animated ring visualization, positional offset mapping, and bidirectional coupling across up to 8 portal pairs
+- Screenshot capture — single-frame PPM export via `cell_color()` pipeline, plus full timeline sequence dump with grid state save/restore, auto-numbered filenames up to 9999
 - Pattern stamp tool — 20 classic patterns across 5 categories with pre-computed rotations, preview overlay, and full integration with symmetry/species/zones
 - Dual-species ecosystem — two coexisting cell populations with independent B/S rules, species-aware neighbor counting, configurable interaction coefficient (-1.0 hostile to +1.0 cooperative), species-specific color gradients, and birth arbitration
 - Full 400×200 simulation grid with viewport navigation (arrow keys + mouse scroll)

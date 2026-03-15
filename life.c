@@ -3,6 +3,7 @@
  *
  * Controls:
  *   SPACE / p   Play / Pause (in replay mode: resume live from current point)
+ *   P           Screenshot — save viewport as PPM image (frame_NNNN.ppm)
  *   s           Step one generation (while paused)
  *   r           Randomize the grid
  *   c           Clear the grid
@@ -35,6 +36,8 @@
  *   a           Toggle dual-species ecosystem mode (Red vs Blue)
  *   6           Toggle active brush species (A/B) in ecosystem mode
  *   { / }       Adjust cross-species interaction coefficient (-1.0 to +1.0)
+ *   P           Capture screenshot as PPM image (auto-numbered frame_NNN.ppm)
+ *   Ctrl-P      Dump full timeline buffer as numbered image sequence
  *   Ctrl-S      Save state to numbered .life file
  *   Ctrl-O      Load most recent .life save (or Ctrl-O N for slot N)
  *   Arrow keys  Pan viewport across the full 400×200 grid
@@ -1375,6 +1378,122 @@ static int flash_active(void) {
     return now < flash_until;
 }
 
+/* Forward declaration for cell_color (defined later after rendering helpers) */
+static int cell_color(int x, int y, RGB *out);
+
+/* ── Frame capture (PPM screenshot) ────────────────────────────────────────── */
+
+static int frame_counter = 0;
+
+static int next_frame_number(void) {
+    char path[64];
+    for (int n = 1; n <= 9999; n++) {
+        snprintf(path, sizeof(path), "frame_%04d.ppm", n);
+        if (access(path, F_OK) != 0) return n;
+    }
+    return 9999;
+}
+
+/* Render the current viewport to a PPM file.  Returns the filename via flash. */
+static void capture_frame(void) {
+    int num = next_frame_number();
+    char path[64];
+    snprintf(path, sizeof(path), "frame_%04d.ppm", num);
+
+    FILE *f = fopen(path, "wb");
+    if (!f) { flash_set("Capture failed!"); return; }
+
+    /* Image dimensions = viewport in pixels (1 cell = 1 pixel) */
+    int img_w = view_w;
+    int img_h = view_h;
+    if (img_w < 1) img_w = 1;
+    if (img_h < 1) img_h = 1;
+
+    fprintf(f, "P6\n%d %d\n255\n", img_w, img_h);
+
+    for (int row = 0; row < img_h; row++) {
+        for (int col = 0; col < img_w; col++) {
+            int gx = view_x + col;
+            int gy = view_y + row;
+            RGB c = {0, 0, 0};
+            cell_color(gx, gy, &c);
+            fputc(c.r, f);
+            fputc(c.g, f);
+            fputc(c.b, f);
+        }
+    }
+
+    fclose(f);
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Saved %s (%dx%d)", path, img_w, img_h);
+    flash_set(msg);
+}
+
+/* Dump the entire timeline buffer as a numbered image sequence */
+static void capture_timeline(void) {
+    if (!timeline || tl_len == 0) {
+        flash_set("No timeline frames to capture");
+        return;
+    }
+
+    /* Save current grid state so we can restore it after */
+    unsigned char save_grid[MAX_H][MAX_W];
+    unsigned char save_ghost[MAX_H][MAX_W];
+    unsigned char save_species[MAX_H][MAX_W];
+    int save_gen = generation;
+    int save_pop = population;
+    memcpy(save_grid, grid, sizeof(grid));
+    memcpy(save_ghost, ghost, sizeof(ghost));
+    memcpy(save_species, species, sizeof(species));
+
+    int base = next_frame_number();
+    int img_w = view_w;
+    int img_h = view_h;
+    if (img_w < 1) img_w = 1;
+    if (img_h < 1) img_h = 1;
+
+    int saved = 0;
+    /* Iterate from oldest to newest */
+    for (int age = tl_len - 1; age >= 0; age--) {
+        timeline_restore(age);
+
+        char path[64];
+        snprintf(path, sizeof(path), "frame_%04d.ppm", base + saved);
+
+        FILE *f = fopen(path, "wb");
+        if (!f) continue;
+
+        fprintf(f, "P6\n%d %d\n255\n", img_w, img_h);
+
+        for (int row = 0; row < img_h; row++) {
+            for (int col = 0; col < img_w; col++) {
+                int gx = view_x + col;
+                int gy = view_y + row;
+                RGB c = {0, 0, 0};
+                cell_color(gx, gy, &c);
+                fputc(c.r, f);
+                fputc(c.g, f);
+                fputc(c.b, f);
+            }
+        }
+
+        fclose(f);
+        saved++;
+    }
+
+    /* Restore original grid state */
+    memcpy(grid, save_grid, sizeof(grid));
+    memcpy(ghost, save_ghost, sizeof(ghost));
+    memcpy(species, save_species, sizeof(species));
+    generation = save_gen;
+    population = save_pop;
+
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Saved %d frames (%dx%d) frame_%04d..%04d.ppm",
+             saved, img_w, img_h, base, base + saved - 1);
+    flash_set(msg);
+}
+
 static int next_save_slot(void) {
     char path[64];
     for (int slot = 1; slot <= 999; slot++) {
@@ -2412,7 +2531,7 @@ static void render(int running, int speed_ms, int draw_mode) {
     p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
                      "[1-5]pre [d]draw [k]sym [g]graph [w]wrap [h]heat [T]trace [f]freq "
                      "[/]rule [m]mut [b]edit [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
-                     "[S]stamp [z/x]zoom [n]map [<>]time [t]tbar "
+                     "[S]stamp [z/x]zoom [n]map [<>]time [t]tbar [P]snap C-p:seq "
                      "C-s:save C-o:load [q]quit\033[0m\033[K\n");
 
     int usable_rows = term_rows - 3;
@@ -2782,7 +2901,7 @@ int main(void) {
         int key = read_input();
         if (key == 'q' || key == 'Q' || key == 27 || key == 3)
             break;
-        else if (key == ' ' || key == 'p' || key == 'P') {
+        else if (key == ' ' || key == 'p') {
             if (replay_mode) {
                 /* Resume live from this historical point */
                 timeline_restore(replay_pos);
@@ -2793,6 +2912,12 @@ int main(void) {
             } else {
                 running = !running;
             }
+        }
+        else if (key == 'P') {
+            capture_frame();
+        }
+        else if (key == 16) { /* Ctrl-P */
+            capture_timeline();
         }
         else if (key == 's') {
             if (replay_mode) {

@@ -26,6 +26,7 @@
  *   > / .       Fast-forward through history
  *   t           Toggle timeline bar display
  *   T           Cycle signal tracer: off → accumulate → frozen → clear+off
+ *   f           Toggle frequency analysis overlay (period detection heatmap)
  *   Ctrl-S      Save state to numbered .life file
  *   Ctrl-O      Load most recent .life save (or Ctrl-O N for slot N)
  *   Arrow keys  Pan viewport across the full 400×200 grid
@@ -70,6 +71,11 @@ static unsigned char ghost[MAX_H][MAX_W];
 /* signal tracer: accumulates cell presence over time (0-255) */
 static unsigned char tracer[MAX_H][MAX_W];
 static int tracer_mode = 0; /* 0=off, 1=accumulating, 2=frozen (visible but not growing) */
+
+/* frequency analysis: detected oscillation period per cell */
+static unsigned char freq_grid[MAX_H][MAX_W]; /* 0=dead, 1=still life, 2-32=period, 255=chaotic */
+static int freq_mode = 0; /* 0=off, 1=on (analysis overlay active) */
+static int freq_stale = 1; /* 1=needs recomputation */
 
 static int W = MAX_W, H = MAX_H; /* simulation always uses full grid */
 static int generation;
@@ -539,6 +545,7 @@ static void grid_step(void) {
 
     hist_push(population);
     timeline_push();
+    freq_stale = 1;
 }
 
 static void grid_set(int x, int y) {
@@ -860,6 +867,120 @@ static RGB tracer_to_rgb(int t) {
         if (f > 1.0f) f = 1.0f;
         return (RGB){ (unsigned char)(220 + f*35), (unsigned char)(50 + f*50), (unsigned char)(200 + f*55) };
     }
+}
+
+/* ── Frequency analysis: period detection via autocorrelation ───────────────── */
+
+/* Color palette for oscillation periods:
+ *   dead (0):      off/black
+ *   still life (1): cool ice blue
+ *   period 2:       emerald green
+ *   period 3:       golden yellow
+ *   period 4-5:     warm orange
+ *   period 6-12:    coral/salmon
+ *   period 13-32:   deep magenta
+ *   chaotic (255):  hot red
+ */
+static RGB freq_to_rgb(int period) {
+    if (period == 0) return (RGB){0, 0, 0};
+    if (period == 1) return (RGB){80, 180, 240};    /* ice blue — still life */
+    if (period == 2) return (RGB){40, 220, 80};      /* emerald — blinkers */
+    if (period == 3) return (RGB){240, 220, 40};     /* gold — pulsars */
+    if (period <= 5) {
+        float t = (float)(period - 4) / 1.0f;
+        return (RGB){(unsigned char)(240 + t*15), (unsigned char)(160 - t*40), (unsigned char)(30 + t*10)};
+    }
+    if (period <= 12) {
+        float t = (float)(period - 6) / 6.0f;
+        return (RGB){(unsigned char)(240 - t*40), (unsigned char)(100 - t*40), (unsigned char)(80 + t*40)};
+    }
+    if (period <= 32) {
+        float t = (float)(period - 13) / 19.0f;
+        return (RGB){(unsigned char)(180 + t*40), (unsigned char)(40 + t*20), (unsigned char)(160 + t*40)};
+    }
+    /* chaotic (255) */
+    return (RGB){255, 30, 20};
+}
+
+/* Analyze timeline history to detect oscillation period for each cell.
+ * Uses autocorrelation on the last N frames of on/off state. */
+static void freq_analyze(void) {
+    int n = tl_len;
+    if (n < 4) {
+        memset(freq_grid, 0, sizeof(freq_grid));
+        return;
+    }
+    /* Use up to 64 most recent frames */
+    int depth = n < 64 ? n : 64;
+
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            /* Extract on/off history: bit vector (1=alive, 0=dead) */
+            /* age 0 = newest frame */
+            unsigned char state[64];
+            int alive_count = 0;
+            for (int i = 0; i < depth; i++) {
+                TimelineFrame *f = timeline_get(i);
+                if (f) {
+                    state[i] = (f->grid[y][x] > 0) ? 1 : 0;
+                    alive_count += state[i];
+                } else {
+                    state[i] = 0;
+                }
+            }
+
+            /* If never alive, mark as dead */
+            if (alive_count == 0) {
+                freq_grid[y][x] = 0;
+                continue;
+            }
+            /* If always alive (same state throughout), still life */
+            if (alive_count == depth) {
+                freq_grid[y][x] = 1;
+                continue;
+            }
+
+            /* Autocorrelation: test periods 1..32 */
+            int best_period = 0;
+            int best_match = 0;
+            int max_period = depth / 2;
+            if (max_period > 32) max_period = 32;
+
+            for (int p = 1; p <= max_period; p++) {
+                int matches = 0;
+                int total = depth - p;
+                for (int i = 0; i < total; i++) {
+                    if (state[i] == state[i + p])
+                        matches++;
+                }
+                /* Need >85% match to count as periodic */
+                if (matches * 100 > total * 85 && matches > best_match) {
+                    best_match = matches;
+                    best_period = p;
+                }
+            }
+
+            if (best_period > 0) {
+                /* Verify: period 1 means constant state — check if truly constant */
+                if (best_period == 1) {
+                    /* Check if cell is actually constant (still life or permanent dead) */
+                    int changes = 0;
+                    for (int i = 1; i < depth; i++)
+                        if (state[i] != state[i-1]) changes++;
+                    if (changes == 0)
+                        freq_grid[y][x] = alive_count > 0 ? 1 : 0;
+                    else
+                        freq_grid[y][x] = 255; /* looks period-1 but has changes = noise */
+                } else {
+                    freq_grid[y][x] = (unsigned char)best_period;
+                }
+            } else {
+                /* No clear period found — chaotic */
+                freq_grid[y][x] = alive_count > 0 ? 255 : 0;
+            }
+        }
+    }
+    freq_stale = 0;
 }
 
 /* ── Save / Load (.life files) ─────────────────────────────────────────────── */
@@ -1564,6 +1685,27 @@ static int cell_color(int x, int y, RGB *out) {
     int ss = source_sink_marker(x, y, out);
     if (ss) return ss;
 
+    /* Frequency analysis overlay: color by oscillation period */
+    if (freq_mode) {
+        int period = freq_grid[y][x];
+        if (period > 0) {
+            *out = freq_to_rgb(period);
+            /* Brighten currently-alive cells */
+            if (grid[y][x]) {
+                out->r = (unsigned char)(out->r < 225 ? out->r + 30 : 255);
+                out->g = (unsigned char)(out->g < 225 ? out->g + 30 : 255);
+                out->b = (unsigned char)(out->b < 225 ? out->b + 30 : 255);
+            } else {
+                /* Dim dead cells in oscillation — show the pattern shape */
+                out->r = out->r * 2 / 5;
+                out->g = out->g * 2 / 5;
+                out->b = out->b * 2 / 5;
+            }
+            return grid[y][x] ? 1 : 7; /* 7 = freq ghost (dead but periodic) */
+        }
+        return 0; /* truly dead — no period */
+    }
+
     if (grid[y][x]) {
         if (heatmap_mode)
             *out = age_to_rgb(grid[y][x]);
@@ -1639,6 +1781,12 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(tracer_str, sizeof(tracer_str),
                  " \033[38;2;120;30;160m\u2593TRACE:FRZ\033[0m");
 
+    /* Frequency analysis indicator */
+    char freq_str[64] = "";
+    if (freq_mode)
+        snprintf(freq_str, sizeof(freq_str),
+                 " \033[38;2;80;180;240m\u2261FREQ\033[0m");
+
     /* Zoom indicator */
     char zoom_str[32] = "";
     if (zoom > 1)
@@ -1690,9 +1838,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, wrap_str, draw_str, heat_str, tracer_str, sym_str, zoom_str, map_str, zone_str,
+                 state, wrap_str, draw_str, heat_str, tracer_str, freq_str, sym_str, zoom_str, map_str, zone_str,
                  emit_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -1716,7 +1864,7 @@ static void render(int running, int speed_ms, int draw_mode) {
 
     /* status bar line 2: compact help */
     p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
-                     "[1-5]pre [d]draw [k]sym [g]graph [w]wrap [h]heat [T]trace "
+                     "[1-5]pre [d]draw [k]sym [g]graph [w]wrap [h]heat [T]trace [f]freq "
                      "[/]rule [m]mut [b]edit [j]zone [e]emit [z/x]zoom [n]map [<>]time [t]tbar "
                      "C-s:save C-o:load [q]quit\033[0m\033[K\n");
 
@@ -1746,6 +1894,9 @@ static void render(int running, int speed_ms, int draw_mode) {
                 } else if (t == 6) {
                     /* Tracer trail: colored background */
                     p += sprintf(p, "\033[48;2;%d;%d;%dm  \033[0m", c.r, c.g, c.b);
+                } else if (t == 7) {
+                    /* Freq analysis ghost: dim colored background */
+                    p += sprintf(p, "\033[48;2;%d;%d;%dm  \033[0m", c.r, c.g, c.b);
                 } else {
                     *p++ = ' '; *p++ = ' ';
                 }
@@ -1765,9 +1916,9 @@ static void render(int running, int speed_ms, int draw_mode) {
                 int tt = cell_color(gx, gy_top, &ct);
                 int tb = cell_color(gx, gy_bot, &cb);
 
-                /* Treat emitter(4), absorber(5), tracer(6) as solid colored cells */
-                int tt_solid = (tt == 1 || tt == 4 || tt == 5 || tt == 6);
-                int tb_solid = (tb == 1 || tb == 4 || tb == 5 || tb == 6);
+                /* Treat emitter(4), absorber(5), tracer(6), freq(7) as solid colored cells */
+                int tt_solid = (tt == 1 || tt == 4 || tt == 5 || tt == 6 || tt == 7);
+                int tb_solid = (tb == 1 || tb == 4 || tb == 5 || tb == 6 || tb == 7);
                 if (tt_solid && tb_solid) {
                     p += sprintf(p, "\033[38;2;%d;%d;%d;48;2;%d;%d;%dm\xe2\x96\x80\033[0m",
                                  ct.r, ct.g, ct.b, cb.r, cb.g, cb.b);
@@ -1841,10 +1992,10 @@ static void render(int running, int speed_ms, int draw_mode) {
                 int tr_t = cell_color(gx1, gy0, &dummy);
                 int bl_t = cell_color(gx0, gy1, &dummy);
                 int br_t = cell_color(gx1, gy1, &dummy);
-                int tl = (tl_t == 1 || tl_t == 4 || tl_t == 5 || tl_t == 6);
-                int tr = (tr_t == 1 || tr_t == 4 || tr_t == 5 || tr_t == 6);
-                int bl = (bl_t == 1 || bl_t == 4 || bl_t == 5 || bl_t == 6);
-                int br = (br_t == 1 || br_t == 4 || br_t == 5 || br_t == 6);
+                int tl = (tl_t == 1 || tl_t == 4 || tl_t == 5 || tl_t == 6 || tl_t == 7);
+                int tr = (tr_t == 1 || tr_t == 4 || tr_t == 5 || tr_t == 6 || tr_t == 7);
+                int bl = (bl_t == 1 || bl_t == 4 || bl_t == 5 || bl_t == 6 || bl_t == 7);
+                int br = (br_t == 1 || br_t == 4 || br_t == 5 || br_t == 6 || br_t == 7);
                 int bits = tl | (tr << 1) | (bl << 2) | (br << 3);
 
                 /* In zone mode, also show zone bg for empty cells */
@@ -1899,6 +2050,42 @@ static void render(int running, int speed_ms, int draw_mode) {
 
     /* Minimap overlay (only when zoomed) */
     render_minimap(&p);
+
+    /* Frequency analysis legend overlay */
+    if (freq_mode) {
+        int usable = term_rows - 3;
+        int leg_h = 9;
+        int leg_w = 22;
+        int leg_col = 2;
+        int leg_row = 3 + usable - leg_h;
+        if (leg_row >= 3 && leg_col + leg_w < term_cols) {
+            const char *bdr = "\033[38;2;80;100;140;48;2;10;10;20m";
+            const char *bg = "\033[48;2;10;10;20m";
+            const char *rst = "\033[0m";
+            /* Top border */
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 Frequency ", leg_row, leg_col, bdr);
+            for (int i = 0; i < leg_w - 13; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+            *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+            p += sprintf(p, "%s", rst);
+            /* Legend entries */
+            struct { const char *label; int period; } entries[] = {
+                {"Still life", 1}, {"Period 2", 2}, {"Period 3", 3},
+                {"Period 4-5", 4}, {"Period 6-12", 8}, {"Period 13+", 20}, {"Chaotic", 255}
+            };
+            for (int i = 0; i < 7; i++) {
+                RGB ec = freq_to_rgb(entries[i].period);
+                p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s", leg_row + 1 + i, leg_col, bdr, bg);
+                p += sprintf(p, " \033[48;2;%d;%d;%dm  %s \033[38;2;%d;%d;%d;48;2;10;10;20m%-11s",
+                             ec.r, ec.g, ec.b, bg, ec.r, ec.g, ec.b, entries[i].label);
+                p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s", leg_row + 1 + i, leg_col + leg_w + 1, bdr, rst);
+            }
+            /* Bottom border */
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", leg_row + 8, leg_col, bdr);
+            for (int i = 0; i < leg_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+            *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+            p += sprintf(p, "%s", rst);
+        }
+    }
 
     /* Rule editor overlay */
     render_rule_editor(&p);
@@ -2079,6 +2266,12 @@ int main(void) {
             wrap_mode = !wrap_mode;
         else if (key == 'h' || key == 'H')
             heatmap_mode = !heatmap_mode;
+        else if (key == 'f' || key == 'F') {
+            freq_mode = !freq_mode;
+            if (freq_mode) {
+                freq_analyze(); /* compute on toggle-on */
+            }
+        }
         else if (key == ']') {
             if (emit_mode) {
                 emit_pattern = (emit_pattern + 1) % N_EMIT_PATTERNS;
@@ -2276,6 +2469,11 @@ int main(void) {
         if (running && !replay_mode && now - last_step >= speed_ms) {
             grid_step();
             last_step = now;
+        }
+
+        /* Auto-refresh frequency analysis every 8 generations when active */
+        if (freq_mode && freq_stale && (generation % 8 == 0 || !running)) {
+            freq_analyze();
         }
 
         render(running, speed_ms, draw_mode);

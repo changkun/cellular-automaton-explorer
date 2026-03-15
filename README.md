@@ -39,6 +39,7 @@ Requires only `gcc` and a POSIX terminal.
 | `>` / `.` | Fast-forward through history |
 | `t` | Toggle timeline scrubber bar |
 | `T` | Cycle signal tracer: off → accumulate → frozen → clear+off |
+| `f` | Toggle frequency analysis overlay (period detection heatmap) |
 | `Ctrl-S` | Save state to numbered `.life` file |
 | `Ctrl-O` | Load most recent `.life` save |
 | `Arrow keys` | Pan viewport across the full 400×200 grid |
@@ -159,6 +160,33 @@ The tracer uses a distinct purple→magenta→pink palette so it doesn't conflic
 thermal heatmap (blue→red→white). Combine with 8-fold symmetry and emitters for stunning
 mandala-like trail art.
 
+## Frequency Analysis Overlay
+
+Press `f` to toggle the **frequency analysis overlay** — a visualization that reveals the
+hidden temporal structure of the automaton by color-coding every cell based on its oscillation
+period, detected via autocorrelation over the last 64 frames of timeline history.
+
+| Color | Meaning |
+|-------|---------|
+| Ice blue | Still life — permanently alive, never changes |
+| Emerald green | Period 2 — blinkers, toads, beacons |
+| Gold | Period 3 — pulsars |
+| Orange | Period 4–5 |
+| Coral | Period 6–12 |
+| Magenta | Period 13–32 |
+| Hot red | Chaotic — toggles without clear periodicity |
+
+Currently-alive cells are rendered brighter; cells in their "off" phase of an oscillation are
+rendered dimmer, so you can see the full spatial extent of each oscillating structure. A legend
+panel appears in the bottom-left corner.
+
+This mode is especially revealing for patterns like:
+- **Gosper Glider Gun** — the gun itself shows as period-30 (magenta), the stream as chaotic (red)
+- **Pulsars** — beautiful gold p3 structures
+- **R-pentomino aftermath** — still-life debris (blue) surrounded by oscillators (green/gold)
+
+The analysis auto-refreshes every 8 generations while the simulation runs.
+
 ## Save & Load
 
 Press `Ctrl-S` to save the full simulation state to a numbered `.life` file (`save_001.life`,
@@ -188,5 +216,6 @@ grid state, cell ages, ghost trails, zones, emitters, absorbers, ruleset, symmet
 - Emitters and absorbers — placeable cell sources (dot, cross, random, glider patterns) and circular kill zones for open dissipative dynamics
 - Time-travel replay — 256-frame history ring buffer with rewind/fast-forward, timeline scrubber bar, and branching from any historical point
 - Save/load — binary `.life` files preserving full state (grid, zones, emitters, absorbers, settings) with auto-numbered slots and status flash feedback
+- Frequency analysis — per-cell oscillation period detection via autocorrelation over timeline history, with ice-blue→emerald→gold→red color spectrum and legend overlay
 - Full 400×200 simulation grid with viewport navigation (arrow keys + mouse scroll)
 - Proper terminal cleanup on exit (raw mode restore, cursor show)

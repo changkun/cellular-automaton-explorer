@@ -49,6 +49,7 @@
  *                 Left-click=paint hot, right-click=paint cold, scroll=brush size
  *                 +/- adjust brush temperature, {/} adjust global temperature
  *                 [/] adjust brush radius
+ *   u           Toggle 2D Fourier spectrum analyzer (spatial frequency analysis)
  *   Ctrl-E      Export current grid as RLE file (auto-numbered export_NNN.rle)
  *   Arrow keys  Pan viewport across the full 400×200 grid
  *   0           Re-center viewport on grid center
@@ -132,6 +133,28 @@ static float lyapunov_max_local = 0.0f;    /* max local sensitivity found */
 #define LYAP_HORIZON  16   /* shadow generations per measurement cycle */
 #define LYAP_PERTURB  80   /* 1-in-N cells get bit-flipped in shadow */
 #define LYAP_DECAY    0.82f /* sliding window EMA decay factor */
+
+/* ── 2D Fourier Spectrum Analyzer ──────────────────────────────────────── */
+/* Spatial frequency analysis via 2D discrete FFT (Cooley-Tukey radix-2).
+   Reveals dominant wavelengths, periodicity, and structural regularity.
+   Power spectrum mapped to grid, plus radial profile and spectral entropy. */
+#define FFT_W 512      /* padded width  (next power of 2 above MAX_W=400) */
+#define FFT_H 256      /* padded height (next power of 2 above MAX_H=200) */
+#define FFT_RADIAL_BINS 128  /* bins for radial power profile */
+
+static float fourier_grid[MAX_H][MAX_W];  /* per-cell log-power (fftshifted, normalized 0–1) */
+static int   fourier_mode = 0;            /* 0=off, 1=on */
+static int   fourier_stale = 1;           /* 1=needs recomputation */
+static float fourier_spectral_entropy = 0.0f;   /* how spread energy is across frequencies */
+static float fourier_dominant_wl = 0.0f;         /* dominant wavelength in cells */
+static float fourier_peak_power = 0.0f;          /* peak radial power (for display) */
+static float fourier_mean_power = 0.0f;          /* mean spectral power */
+static float fourier_radial[FFT_RADIAL_BINS];    /* azimuthally-averaged power vs frequency */
+static float fourier_radial_max = 0.0f;          /* max radial bin value */
+
+/* FFT workspace — static to avoid stack overflow */
+static float fft_re[FFT_H][FFT_W];
+static float fft_im[FFT_H][FFT_W];
 
 /* ── Pattern Census ───────────────────────────────────────────────────────── */
 static int census_mode = 0;    /* 0=off, 1=on */
@@ -1004,6 +1027,7 @@ static void grid_step(void) {
     census_stale = 1;
     entropy_stale = 1;
     lyapunov_stale = 1;
+    fourier_stale = 1;
 }
 
 /* ── Census scan implementation ───────────────────────────────────────────── */
@@ -2363,6 +2387,220 @@ static RGB lyapunov_to_rgb(float s) {
     }
 }
 
+/* ── 2D Fourier Spectrum Analyzer ─────────────────────────────────────────── */
+
+/* In-place Cooley-Tukey radix-2 FFT on interleaved float arrays.
+   n must be a power of 2. */
+static void fft1d(float *re, float *im, int n) {
+    /* Bit-reversal permutation */
+    int j = 0;
+    for (int i = 0; i < n - 1; i++) {
+        if (i < j) {
+            float tr = re[i]; re[i] = re[j]; re[j] = tr;
+            float ti = im[i]; im[i] = im[j]; im[j] = ti;
+        }
+        int m = n >> 1;
+        while (m >= 1 && j >= m) { j -= m; m >>= 1; }
+        j += m;
+    }
+    /* Butterfly stages */
+    for (int step = 2; step <= n; step <<= 1) {
+        int half = step >> 1;
+        float angle = -6.283185307179586f / (float)step;
+        float wr = cosf(angle), wi = sinf(angle);
+        for (int k = 0; k < n; k += step) {
+            float cr = 1.0f, ci = 0.0f;
+            for (int m = 0; m < half; m++) {
+                float tr = cr * re[k+m+half] - ci * im[k+m+half];
+                float ti = cr * im[k+m+half] + ci * re[k+m+half];
+                re[k+m+half] = re[k+m] - tr;
+                im[k+m+half] = im[k+m] - ti;
+                re[k+m] += tr;
+                im[k+m] += ti;
+                float nr = cr * wr - ci * wi;
+                ci = cr * wi + ci * wr;
+                cr = nr;
+            }
+        }
+    }
+}
+
+/* Map Fourier power (0.0–1.0) to RGB:
+   dark indigo (low) → blue → cyan → green → yellow → white (high) */
+static RGB fourier_to_rgb(float p) {
+    if (p <= 0.0f) return (RGB){4, 2, 20};          /* near-black indigo */
+    if (p >= 1.0f) return (RGB){255, 255, 240};      /* hot white-yellow */
+    if (p < 0.2f) {
+        /* Dark indigo → blue */
+        float t = p * 5.0f;
+        return (RGB){
+            (unsigned char)(4 + t * 16),
+            (unsigned char)(2 + t * 40),
+            (unsigned char)(20 + t * 180)
+        };
+    } else if (p < 0.4f) {
+        /* Blue → cyan */
+        float t = (p - 0.2f) * 5.0f;
+        return (RGB){
+            (unsigned char)(20 - t * 10),
+            (unsigned char)(42 + t * 198),
+            (unsigned char)(200 + t * 55)
+        };
+    } else if (p < 0.6f) {
+        /* Cyan → green */
+        float t = (p - 0.4f) * 5.0f;
+        return (RGB){
+            (unsigned char)(10 + t * 80),
+            (unsigned char)(240 - t * 20),
+            (unsigned char)(255 - t * 200)
+        };
+    } else if (p < 0.8f) {
+        /* Green → yellow */
+        float t = (p - 0.6f) * 5.0f;
+        return (RGB){
+            (unsigned char)(90 + t * 165),
+            (unsigned char)(220 + t * 35),
+            (unsigned char)(55 - t * 30)
+        };
+    } else {
+        /* Yellow → white */
+        float t = (p - 0.8f) * 5.0f;
+        return (RGB){
+            255,
+            255,
+            (unsigned char)(25 + t * 215)
+        };
+    }
+}
+
+static void fourier_compute(void) {
+    /* Copy grid into FFT workspace (zero-padded) */
+    memset(fft_re, 0, sizeof(fft_re));
+    memset(fft_im, 0, sizeof(fft_im));
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++)
+            fft_re[y][x] = grid[y][x] ? 1.0f : 0.0f;
+
+    /* 2D FFT: rows then columns */
+    for (int y = 0; y < FFT_H; y++)
+        fft1d(fft_re[y], fft_im[y], FFT_W);
+
+    static float col_re[FFT_H], col_im[FFT_H];
+    for (int x = 0; x < FFT_W; x++) {
+        for (int y = 0; y < FFT_H; y++) {
+            col_re[y] = fft_re[y][x];
+            col_im[y] = fft_im[y][x];
+        }
+        fft1d(col_re, col_im, FFT_H);
+        for (int y = 0; y < FFT_H; y++) {
+            fft_re[y][x] = col_re[y];
+            fft_im[y][x] = col_im[y];
+        }
+    }
+
+    /* Compute log-power spectrum with fftshift, map to grid */
+    /* First pass: find max log-power for normalization */
+    float max_log_power = -1e30f;
+    int hw = FFT_W / 2, hh = FFT_H / 2;
+    for (int y = 0; y < FFT_H; y++)
+        for (int x = 0; x < FFT_W; x++) {
+            float re = fft_re[y][x], im = fft_im[y][x];
+            float power = re * re + im * im;
+            float lp = logf(1.0f + power);
+            /* Store temporarily in fft_im (we no longer need it) */
+            fft_im[y][x] = lp;
+            if (lp > max_log_power) max_log_power = lp;
+        }
+
+    /* Radial power profile: bin by distance from DC */
+    memset(fourier_radial, 0, sizeof(fourier_radial));
+    int radial_counts[FFT_RADIAL_BINS];
+    memset(radial_counts, 0, sizeof(radial_counts));
+    float total_power = 0.0f;
+
+    /* Second pass: normalize and map fftshifted spectrum to grid + radial bins */
+    float inv_max = (max_log_power > 0.001f) ? 1.0f / max_log_power : 1.0f;
+    for (int y = 0; y < FFT_H; y++) {
+        /* fftshift: remap so DC is at center */
+        int sy = (y + hh) % FFT_H;
+        for (int x = 0; x < FFT_W; x++) {
+            int sx = (x + hw) % FFT_W;
+            float norm = fft_im[sy][sx] * inv_max;
+
+            /* Map to grid coordinates (center spectrum on grid) */
+            int gx = x - (FFT_W - W) / 2;
+            int gy = y - (FFT_H - H) / 2;
+            if (gx >= 0 && gx < W && gy >= 0 && gy < H) {
+                fourier_grid[gy][gx] = norm;
+            }
+
+            /* Radial binning (distance from center in frequency space) */
+            float fx = (float)(x - hw);
+            float fy = (float)(y - hh);
+            float dist = sqrtf(fx * fx + fy * fy);
+            float max_dist = sqrtf((float)(hw * hw + hh * hh));
+            int bin = (int)(dist / max_dist * (FFT_RADIAL_BINS - 1));
+            if (bin >= 0 && bin < FFT_RADIAL_BINS) {
+                fourier_radial[bin] += fft_im[sy][sx];
+                radial_counts[bin]++;
+                total_power += fft_im[sy][sx];
+            }
+        }
+    }
+
+    /* Average radial bins */
+    fourier_radial_max = 0.0f;
+    int peak_bin = 0;
+    for (int i = 0; i < FFT_RADIAL_BINS; i++) {
+        if (radial_counts[i] > 0)
+            fourier_radial[i] /= radial_counts[i];
+        if (i > 0 && fourier_radial[i] > fourier_radial_max) {
+            fourier_radial_max = fourier_radial[i];
+            peak_bin = i;
+        }
+    }
+
+    /* Dominant wavelength: wavelength = N / k, where k is peak frequency bin.
+       Map bin back to spatial frequency, then to wavelength in cells. */
+    if (peak_bin > 0) {
+        float max_dist = sqrtf((float)(hw * hw + hh * hh));
+        float peak_freq = (float)peak_bin / (FFT_RADIAL_BINS - 1) * max_dist;
+        /* Average grid dimension for wavelength conversion */
+        float avg_N = (float)(W + H) / 2.0f;
+        fourier_dominant_wl = avg_N / (peak_freq > 0.5f ? peak_freq : 0.5f);
+        if (fourier_dominant_wl > avg_N) fourier_dominant_wl = avg_N;
+    } else {
+        fourier_dominant_wl = 0.0f;
+    }
+
+    fourier_peak_power = fourier_radial_max;
+
+    /* Spectral entropy: H = -sum(p_i * log2(p_i)) over normalized radial profile.
+       Measures how evenly energy is distributed across frequencies.
+       Low = peaked/crystalline, High = broadband/noisy. */
+    float spec_ent = 0.0f;
+    float radial_sum = 0.0f;
+    for (int i = 1; i < FFT_RADIAL_BINS; i++)  /* skip DC bin */
+        radial_sum += fourier_radial[i];
+    if (radial_sum > 0.001f) {
+        float inv_sum = 1.0f / radial_sum;
+        for (int i = 1; i < FFT_RADIAL_BINS; i++) {
+            float p = fourier_radial[i] * inv_sum;
+            if (p > 1e-10f)
+                spec_ent -= p * log2f(p);
+        }
+    }
+    /* Normalize to 0–1 range: max possible = log2(FFT_RADIAL_BINS-1) */
+    float max_ent = log2f((float)(FFT_RADIAL_BINS - 1));
+    fourier_spectral_entropy = (max_ent > 0.0f) ? spec_ent / max_ent : 0.0f;
+
+    /* Mean power (excluding DC) */
+    int total_cells = FFT_W * FFT_H;
+    fourier_mean_power = (total_cells > 0) ? total_power / total_cells : 0.0f;
+
+    fourier_stale = 0;
+}
+
 /* ── Save / Load (.life files) ─────────────────────────────────────────────── */
 
 /*
@@ -3669,6 +3907,21 @@ static int cell_color(int x, int y, RGB *out) {
         return 0;
     }
 
+    /* Fourier spectrum overlay: 2D power spectrum mapped to grid space */
+    if (fourier_mode) {
+        float fp = fourier_grid[y][x];
+        if (fp > 0.005f || grid[y][x]) {
+            *out = fourier_to_rgb(fp);
+            if (grid[y][x]) {
+                out->r = (unsigned char)(out->r < 220 ? out->r + 35 : 255);
+                out->g = (unsigned char)(out->g < 220 ? out->g + 35 : 255);
+                out->b = (unsigned char)(out->b < 220 ? out->b + 35 : 255);
+            }
+            return grid[y][x] ? 1 : 12; /* 12 = fourier ghost */
+        }
+        return 0;
+    }
+
     /* Temperature field overlay: show thermal landscape as blue→red wash */
     if (temp_mode) {
         float t = temp_global + temp_grid[y][x];
@@ -3812,6 +4065,13 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(lyapunov_str, sizeof(lyapunov_str),
                  " \033[38;2;220;200;60m\xce\xbbLYAP:%.4f\033[0m", lyapunov_global);
 
+    /* Fourier spectrum indicator */
+    char fourier_str[96] = "";
+    if (fourier_mode)
+        snprintf(fourier_str, sizeof(fourier_str),
+                 " \033[38;2;80;200;255m\xe2\x89\x88" "FFT:\xce\xbb%.1f\033[0m",
+                 fourier_dominant_wl);
+
     /* Census indicator */
     char census_str[64] = "";
     if (census_mode)
@@ -3938,9 +4198,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, census_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
+                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, census_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -3964,7 +4224,7 @@ static void render(int running, int speed_ms, int draw_mode) {
 
     /* status bar line 2: compact help */
     p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
-                     "[1-5]pre [d]draw [k]sym [g]graph [y]dash [w]topo [h]heat [T]trace [f]freq [i]ent [L]lyap "
+                     "[1-5]pre [d]draw [k]sym [g]graph [y]dash [w]topo [h]heat [T]trace [f]freq [i]ent [L]lyap [u]fft "
                      "[X]temp [/]rule [m]mut [b]edit [G]evolve [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
                      "[S]stamp [v]census [z/x]zoom [n]map [<>]time [t]tbar [P]snap C-p:seq "
                      "C-s:save C-o:load C-e:rle [q]quit\033[0m\033[K\n");
@@ -4755,6 +5015,143 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", lrst);
     }
 
+    /* ── Fourier Spectrum Analyzer overlay panel ─────────────────────────── */
+    if (fourier_mode) {
+        int fp_w = 44;
+        int fp_col = term_cols - fp_w - 2;
+        /* Stack below other active panels */
+        int fp_row = 3;
+        if (entropy_mode) fp_row += 8;
+        if (temp_mode)    fp_row += 9;
+        if (lyapunov_mode) fp_row += 8;
+        if (fp_col < 1) fp_col = 1;
+
+        const char *fbdr = "\033[38;2;80;200;255;48;2;4;8;24m";
+        const char *fbg  = "\033[48;2;4;8;24m";
+        const char *frst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 Fourier \xe2\x89\x88 ",
+                     fp_row, fp_col, fbdr);
+        for (int i = 13; i < fp_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", frst);
+
+        /* Row 1: Spectral entropy + dominant wavelength */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     fp_row + 1, fp_col, fbdr, fbg);
+        p += sprintf(p, " \033[38;2;80;200;255mH\xe2\x82\x9b=\033[38;2;255;255;255m%.3f"
+                     "  \033[38;2;80;200;255m\xce\xbb=\033[38;2;255;255;255m%.1f cells",
+                     fourier_spectral_entropy, fourier_dominant_wl);
+        /* Pad to width */
+        int used1 = 7 + 5 + 2 + 4 + 6; /* approximate visible chars */
+        for (int i = used1; i < fp_w - 1; i++) *p++ = ' ';
+        p += sprintf(p, "%s\xe2\x94\x82%s", fbdr, frst);
+
+        /* Row 2: Labels for radial profile */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     fp_row + 2, fp_col, fbdr, fbg);
+        p += sprintf(p, " \033[38;2;40;80;140mDC");
+        for (int i = 0; i < 20; i++) *p++ = ' ';
+        p += sprintf(p, "\033[38;2;60;140;180mRadial Power");
+        for (int i = 0; i < 4; i++) *p++ = ' ';
+        p += sprintf(p, "\033[38;2;40;80;140mNyq ");
+        p += sprintf(p, "%s\xe2\x94\x82%s", fbdr, frst);
+
+        /* Rows 3-6: Radial power profile as 4-row histogram (40 bins displayed) */
+        int rbins[40];
+        memset(rbins, 0, sizeof(rbins));
+        float rmax = 0.001f;
+        for (int i = 1; i < FFT_RADIAL_BINS; i++) {
+            int b = (i - 1) * 40 / (FFT_RADIAL_BINS - 1);
+            if (b >= 40) b = 39;
+            rbins[b] += (int)(fourier_radial[i] * 1000.0f);
+        }
+        for (int i = 0; i < 40; i++)
+            if (rbins[i] > rmax) rmax = (float)rbins[i];
+
+        for (int row = 0; row < 4; row++) {
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s ",
+                         fp_row + 3 + row, fp_col, fbdr, fbg);
+            int level = 3 - row;
+            for (int b = 0; b < 40; b++) {
+                int bar_h = (int)((float)rbins[b] * 4.0f / rmax);
+                /* Color based on frequency (low=blue, high=cyan/green) */
+                float freq_t = (float)b / 39.0f;
+                RGB bc = fourier_to_rgb(0.3f + freq_t * 0.5f);
+                if (bar_h > level) {
+                    p += sprintf(p, "\033[38;2;%d;%d;%dm\xe2\x96\x88",
+                                 bc.r, bc.g, bc.b);
+                } else if (bar_h == level) {
+                    p += sprintf(p, "\033[38;2;%d;%d;%dm\xe2\x96\x84",
+                                 bc.r/2, bc.g/2, bc.b/2);
+                } else {
+                    p += sprintf(p, "\033[38;2;12;16;40m\xc2\xb7");
+                }
+            }
+            *p++ = ' ';
+            p += sprintf(p, "%s\xe2\x94\x82%s", fbdr, frst);
+        }
+
+        /* Row 7: Power spectrum mini-view label */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     fp_row + 7, fp_col, fbdr, fbg);
+        p += sprintf(p, " \033[38;2;60;140;180m2D Spectrum (log)");
+        for (int i = 18; i < fp_w - 1; i++) *p++ = ' ';
+        p += sprintf(p, "%s\xe2\x94\x82%s", fbdr, frst);
+
+        /* Rows 8-15: 8-row × 40-col mini 2D power spectrum using block chars */
+        /* Map the center region of the spectrum to a small display */
+        for (int row = 0; row < 8; row++) {
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s ",
+                         fp_row + 8 + row, fp_col, fbdr, fbg);
+            for (int col = 0; col < 40; col++) {
+                /* Map mini display (col,row) to grid coordinates */
+                /* Show center portion of spectrum */
+                int gy_top = H/2 - 8 + row * 2;
+                int gy_bot = gy_top + 1;
+                int gx = W/2 - 20 + col;
+                float v_top = 0.0f, v_bot = 0.0f;
+                if (gy_top >= 0 && gy_top < H && gx >= 0 && gx < W)
+                    v_top = fourier_grid[gy_top][gx];
+                if (gy_bot >= 0 && gy_bot < H && gx >= 0 && gx < W)
+                    v_bot = fourier_grid[gy_bot][gx];
+                /* Use half-block: top pixel = fg, bottom pixel = bg */
+                RGB ct = fourier_to_rgb(v_top);
+                RGB cb = fourier_to_rgb(v_bot);
+                p += sprintf(p, "\033[38;2;%d;%d;%d;48;2;%d;%d;%dm\xe2\x96\x80",
+                             ct.r, ct.g, ct.b, cb.r, cb.g, cb.b);
+            }
+            p += sprintf(p, "%s ", fbg);
+            p += sprintf(p, "%s\xe2\x94\x82%s", fbdr, frst);
+        }
+
+        /* Row 16: Spectral entropy bar */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     fp_row + 16, fp_col, fbdr, fbg);
+        p += sprintf(p, " \033[38;2;80;200;255mEntropy: ");
+        /* Render entropy bar (30 chars wide) */
+        int ent_fill = (int)(fourier_spectral_entropy * 30.0f);
+        if (ent_fill > 30) ent_fill = 30;
+        for (int i = 0; i < 30; i++) {
+            if (i < ent_fill) {
+                float t = (float)i / 29.0f;
+                RGB ec = fourier_to_rgb(0.2f + t * 0.6f);
+                p += sprintf(p, "\033[38;2;%d;%d;%dm\xe2\x96\x88", ec.r, ec.g, ec.b);
+            } else {
+                p += sprintf(p, "\033[38;2;12;16;40m\xe2\x96\x91");
+            }
+        }
+        p += sprintf(p, "  ");
+        p += sprintf(p, "%s\xe2\x94\x82%s", fbdr, frst);
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", fp_row + 17, fp_col, fbdr);
+        for (int i = 0; i < fp_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", frst);
+    }
+
     /* ── Population Dynamics Dashboard overlay ─────────────────────────────── */
     if (dashboard_mode && hist_count > 1) {
         int db_w = 62;      /* panel width */
@@ -5210,6 +5607,12 @@ int main(int argc, char **argv) {
                 lyapunov_compute(); /* compute on toggle-on */
             }
         }
+        else if (key == 'u' || key == 'U') {
+            fourier_mode = !fourier_mode;
+            if (fourier_mode) {
+                fourier_compute(); /* compute on toggle-on */
+            }
+        }
         else if (key == ']') {
             if (temp_mode) {
                 temp_brush_radius = temp_brush_radius < 20 ? temp_brush_radius + 1 : 20;
@@ -5605,6 +6008,11 @@ int main(int argc, char **argv) {
         /* Auto-refresh Lyapunov sensitivity every 16 generations (heavy: 2× shadow simulation) */
         if (lyapunov_mode && lyapunov_stale && (generation % 16 == 0 || !running)) {
             lyapunov_compute();
+        }
+
+        /* Auto-refresh Fourier spectrum every 8 generations (2D FFT on padded grid) */
+        if (fourier_mode && fourier_stale && (generation % 8 == 0 || !running)) {
+            fourier_compute();
         }
 
         render(running, speed_ms, draw_mode);

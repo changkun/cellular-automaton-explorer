@@ -54,6 +54,8 @@ Requires only `gcc` and a POSIX terminal.
 | `C` | Toggle Wolfram class detector (auto-classify I/II/III/IV) |
 | `O` | Toggle information flow field (transfer entropy causal vectors) |
 | `A` | Toggle phase-space attractor (Takens delay embedding portrait) |
+| `9` | Toggle causal light cone — click cell to trace backward/forward cones |
+| `+`/`-` (in cone) | Adjust forward cone depth |
 | `G` | Genetic rule explorer — evolve interesting rulesets |
 | `G` (in overlay) | Breed next generation of candidate rules |
 | `1`–`5` (in overlay) | Load a discovered rule into the simulation |

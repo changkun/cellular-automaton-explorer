@@ -54,6 +54,8 @@
  *   C           Toggle Wolfram class detector (auto-classify I/II/III/IV)
  *   O           Toggle information flow field (transfer entropy causal vectors)
  *   A           Toggle phase-space attractor (Takens delay embedding portrait)
+ *   9           Toggle causal light cone (click cell to trace backward/forward cones)
+ *                 +/- adjust forward cone depth, click to retarget
  *   Ctrl-E      Export current grid as RLE file (auto-numbered export_NNN.rle)
  *   Arrow keys  Pan viewport across the full 400×200 grid
  *   0           Re-center viewport on grid center
@@ -244,6 +246,33 @@ static float attr_corr_dim = 0.0f;      /* correlation dimension D₂ */
 static float attr_pop_min = 0.0f;       /* population range for axis labels */
 static float attr_pop_max = 1.0f;
 static int   attr_embed_dim = 2;        /* embedding dimension (always 2 for display) */
+
+/* ── Causal Light Cone ───────────────────────────────────────────────────── */
+/* Relativistic-style causal structure visualization.  Select a cell and trace
+   its backward light cone (which cells causally influenced it) through the
+   timeline buffer, and its forward light cone (which cells it can influence)
+   based on the ruleset's Moore neighborhood propagation speed (1 cell/step).
+   Backward cone: actual causal ancestors highlighted inside the theoretical
+   diamond.  Forward cone: theoretical maximum influence boundary. */
+#define CONE_MAX_DEPTH 128  /* max frames to trace backward (half of TL_MAX) */
+
+static int   cone_mode = 0;          /* 0=off, 1=on (awaiting click), 2=on (computed) */
+static int   cone_sel_x = -1;        /* selected cell x */
+static int   cone_sel_y = -1;        /* selected cell y */
+static int   cone_depth = 0;         /* actual backward depth traced */
+static int   cone_fwd_depth = 32;    /* forward cone depth to show */
+
+/* Backward cone: per-cell minimum causal distance (0 = selected cell, 1..N = ancestor depth)
+   0 means not in cone.  We use a separate grid to store depth+1 (0=not in cone). */
+static unsigned char cone_back[MAX_H][MAX_W];  /* backward cone depth+1 (0=not in cone) */
+static unsigned char cone_fwd[MAX_H][MAX_W];   /* forward cone depth+1 (0=not in cone) */
+
+/* Stats */
+static int   cone_back_cells = 0;    /* cells in backward cone */
+static int   cone_fwd_cells = 0;     /* cells in forward cone */
+static int   cone_theoretical = 0;   /* theoretical max cells in cone */
+static float cone_fill_ratio = 0.0f; /* actual/theoretical ratio */
+static int   cone_back_alive = 0;    /* backward cone cells currently alive */
 
 /* ── Pattern Census ───────────────────────────────────────────────────────── */
 static int census_mode = 0;    /* 0=off, 1=on */
@@ -3498,6 +3527,113 @@ static void attractor_compute(void) {
     attractor_stale = 0;
 }
 
+/* ── Causal Light Cone computation ──────────────────────────────────────── */
+/* Trace backward through timeline to find actual causal ancestors of the
+   selected cell.  A cell at time t-1 is a causal ancestor if:
+   (a) it is within the Moore neighborhood of a cell already in the cone at time t, AND
+   (b) it was alive at time t-1 (contributed to the neighbor count).
+   Forward cone: theoretical maximum influence boundary (diamond shape). */
+static void cone_compute(void) {
+    memset(cone_back, 0, sizeof(cone_back));
+    memset(cone_fwd, 0, sizeof(cone_fwd));
+    cone_back_cells = 0;
+    cone_fwd_cells = 0;
+    cone_theoretical = 0;
+    cone_fill_ratio = 0.0f;
+    cone_back_alive = 0;
+
+    if (cone_sel_x < 0 || cone_sel_x >= W || cone_sel_y < 0 || cone_sel_y >= H)
+        return;
+    if (!timeline || tl_len < 2) return;
+
+    /* ── Backward cone: trace actual causal ancestors ── */
+    /* Use two layers: current frontier and next frontier */
+    static unsigned char frontier[MAX_H][MAX_W];
+    static unsigned char next_frontier[MAX_H][MAX_W];
+    memset(frontier, 0, sizeof(frontier));
+
+    /* Seed: the selected cell in the current frame */
+    frontier[cone_sel_y][cone_sel_x] = 1;
+    cone_back[cone_sel_y][cone_sel_x] = 1; /* depth 0 + 1 */
+
+    int depth = 0;
+    int max_depth = tl_len - 1;
+    if (max_depth > CONE_MAX_DEPTH) max_depth = CONE_MAX_DEPTH;
+
+    for (int d = 1; d <= max_depth; d++) {
+        TimelineFrame *prev_frame = timeline_get(d);
+        if (!prev_frame) break;
+
+        memset(next_frontier, 0, sizeof(next_frontier));
+        int found_any = 0;
+
+        /* For each cell in the current frontier, mark its Moore neighborhood
+           in the previous frame as causal ancestors IF they were alive */
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                if (!frontier[y][x]) continue;
+                for (int dy = -1; dy <= 1; dy++) {
+                    for (int dx = -1; dx <= 1; dx++) {
+                        int nx = x + dx, ny = y + dy;
+                        if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
+                        /* Was this cell alive in the previous frame? */
+                        if (prev_frame->grid[ny][nx] > 0 && cone_back[ny][nx] == 0) {
+                            cone_back[ny][nx] = (unsigned char)(d + 1 > 255 ? 255 : d + 1);
+                            next_frontier[ny][nx] = 1;
+                            found_any = 1;
+                            cone_back_cells++;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!found_any) break;
+        memcpy(frontier, next_frontier, sizeof(frontier));
+        depth = d;
+    }
+    cone_depth = depth;
+
+    /* Count backward cone cells that are currently alive */
+    cone_back_alive = 0;
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++)
+            if (cone_back[y][x] > 0 && grid[y][x] > 0)
+                cone_back_alive++;
+
+    /* ── Forward cone: theoretical maximum influence (diamond) ── */
+    int fwd = cone_fwd_depth;
+    cone_fwd_cells = 0;
+    cone_theoretical = 0;
+
+    for (int dy = -fwd; dy <= fwd; dy++) {
+        for (int dx = -fwd; dx <= fwd; dx++) {
+            int dist = (dy < 0 ? -dy : dy) + (dx < 0 ? -dx : dx);
+            /* Chebyshev distance for Moore neighborhood: max(|dx|,|dy|) */
+            int cheb = (dy < 0 ? -dy : dy);
+            if ((dx < 0 ? -dx : dx) > cheb) cheb = (dx < 0 ? -dx : dx);
+            if (cheb > fwd) continue;
+            if (cheb == 0) continue; /* skip the selected cell itself */
+
+            int fx = cone_sel_x + dx;
+            int fy = cone_sel_y + dy;
+            if (fx < 0 || fx >= W || fy < 0 || fy >= H) continue;
+
+            cone_fwd[fy][fx] = (unsigned char)(cheb > 255 ? 255 : cheb);
+            cone_fwd_cells++;
+        }
+    }
+
+    /* Theoretical max: (2*depth+1)^2 - 1 for Moore neighborhood Chebyshev diamond */
+    if (depth > 0) {
+        int side = 2 * depth + 1;
+        cone_theoretical = side * side - 1;
+        cone_fill_ratio = cone_theoretical > 0 ? (float)cone_back_cells / cone_theoretical : 0.0f;
+    }
+
+    cone_mode = 2; /* mark as computed */
+}
+
 /* Map flow magnitude + direction to RGB color and Unicode arrow glyph */
 static RGB flow_to_rgb(float mag, float vx, float vy) {
     /* Normalize magnitude for color */
@@ -4966,6 +5102,71 @@ static int cell_color(int x, int y, RGB *out) {
         return 0;
     }
 
+    /* Causal light cone overlay: backward (blue/violet) + forward (orange/red) */
+    if (cone_mode == 2) {
+        int bd = cone_back[y][x]; /* backward depth+1 (0=not in cone) */
+        int fd = cone_fwd[y][x];  /* forward Chebyshev distance (0=not in cone) */
+
+        /* Selected cell: bright white marker */
+        if (x == cone_sel_x && y == cone_sel_y) {
+            out->r = 255; out->g = 255; out->b = 255;
+            return 1;
+        }
+
+        if (bd > 0) {
+            /* Backward cone: cool gradient violet → blue → cyan by depth */
+            float t = (float)(bd - 1) / (cone_depth > 1 ? (float)cone_depth : 1.0f);
+            if (t > 1.0f) t = 1.0f;
+            /* Near (t~0): bright cyan/white, Far (t~1): deep violet */
+            if (t < 0.5f) {
+                float s = t / 0.5f;
+                out->r = (unsigned char)(180 - 120 * s);
+                out->g = (unsigned char)(240 - 140 * s);
+                out->b = (unsigned char)(255);
+            } else {
+                float s = (t - 0.5f) / 0.5f;
+                out->r = (unsigned char)(60 + 80 * s);
+                out->g = (unsigned char)(100 - 60 * s);
+                out->b = (unsigned char)(255 - 80 * s);
+            }
+            /* Brighten alive cells */
+            if (grid[y][x]) {
+                out->r = (unsigned char)(out->r < 220 ? out->r + 35 : 255);
+                out->g = (unsigned char)(out->g < 220 ? out->g + 35 : 255);
+                out->b = (unsigned char)(out->b < 220 ? out->b + 35 : 255);
+            }
+            return grid[y][x] ? 1 : 16; /* 16 = cone ghost */
+        }
+
+        if (fd > 0) {
+            /* Forward cone: warm gradient orange → red by distance */
+            float t = (float)fd / (cone_fwd_depth > 1 ? (float)cone_fwd_depth : 1.0f);
+            if (t > 1.0f) t = 1.0f;
+            /* Near (t~0): bright orange, Far (t~1): dim red */
+            out->r = (unsigned char)(255 - 80 * t);
+            out->g = (unsigned char)(160 - 130 * t);
+            out->b = (unsigned char)(40 - 30 * t);
+            /* Dim the forward cone more — it's theoretical, not actual */
+            out->r = out->r * 2 / 5;
+            out->g = out->g * 2 / 5;
+            out->b = out->b * 2 / 5;
+            /* Brighten alive cells */
+            if (grid[y][x]) {
+                out->r = (unsigned char)(out->r < 200 ? out->r + 55 : 255);
+                out->g = (unsigned char)(out->g < 200 ? out->g + 55 : 255);
+                out->b = (unsigned char)(out->b < 200 ? out->b + 55 : 255);
+            }
+            return grid[y][x] ? 1 : 16;
+        }
+
+        /* Outside both cones — show normal cells very dimmed */
+        if (grid[y][x]) {
+            out->r = 25; out->g = 30; out->b = 35;
+            return 1;
+        }
+        return 0;
+    }
+
     /* Temperature field overlay: show thermal landscape as blue→red wash */
     if (temp_mode) {
         float t = temp_global + temp_grid[y][x];
@@ -5145,6 +5346,16 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(census_str, sizeof(census_str),
                  " \033[38;2;100;220;160m\u2630CENSUS\033[0m");
 
+    /* Light cone indicator */
+    char cone_str[96] = "";
+    if (cone_mode == 1)
+        snprintf(cone_str, sizeof(cone_str),
+                 " \033[38;2;200;140;60m\xe2\x97\x87" "CONE:?\033[0m");
+    else if (cone_mode == 2)
+        snprintf(cone_str, sizeof(cone_str),
+                 " \033[38;2;200;140;60m\xe2\x97\x87" "CONE:(%d,%d)\033[0m",
+                 cone_sel_x, cone_sel_y);
+
     /* Genetic explorer indicator */
     char gene_str[64] = "";
     if (gene_mode == 1)
@@ -5265,9 +5476,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
+                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -5292,7 +5503,7 @@ static void render(int running, int speed_ms, int draw_mode) {
     /* status bar line 2: compact help */
     p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
                      "[1-5]pre [d]draw [k]sym [g]graph [y]dash [w]topo [h]heat [T]trace [f]freq [i]ent [L]lyap [u]fft "
-                     "[X]temp [C]class [O]flow [/]rule [m]mut [b]edit [G]evolve [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
+                     "[X]temp [C]class [O]flow [9]cone [/]rule [m]mut [b]edit [G]evolve [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
                      "[S]stamp [v]census [z/x]zoom [n]map [<>]time [t]tbar [P]snap C-p:seq "
                      "C-s:save C-o:load C-e:rle [q]quit\033[0m\033[K\n");
 
@@ -6828,6 +7039,112 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", arst);
     }
 
+    /* ── Causal Light Cone overlay panel ──────────────────────────────────── */
+    if (cone_mode >= 1) {
+        int cn_w = 44;
+        int cn_col = term_cols - cn_w - 2;
+        /* Stack below other active panels */
+        int cn_row = 3;
+        if (entropy_mode)   cn_row += 8;
+        if (temp_mode)      cn_row += 9;
+        if (lyapunov_mode)  cn_row += 8;
+        if (fourier_mode)   cn_row += 18;
+        if (fractal_mode)   cn_row += 11;
+        if (wolfram_mode)   cn_row += 14;
+        if (flow_mode)      cn_row += 9;
+        if (attractor_mode) cn_row += 8;
+        if (cn_col < 1) cn_col = 1;
+
+        const char *cbdr = "\033[38;2;200;140;60;48;2;10;8;4m";
+        const char *cbg  = "\033[48;2;10;8;4m";
+        const char *crst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 Light Cone \xe2\x97\x87 ",
+                     cn_row, cn_col, cbdr);
+        for (int i = 17; i < cn_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", crst);
+
+        if (cone_mode == 1) {
+            /* Waiting for click */
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                         cn_row + 1, cn_col, cbdr, cbg);
+            p += sprintf(p, " \033[38;2;200;180;120mClick a cell to trace...");
+            { int used = 27; for (int i = used; i < cn_w - 1; i++) *p++ = ' '; }
+            p += sprintf(p, "%s\xe2\x94\x82%s", cbdr, crst);
+
+            /* Bottom border */
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", cn_row + 2, cn_col, cbdr);
+            for (int i = 0; i < cn_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+            *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+            p += sprintf(p, "%s", crst);
+        } else {
+            /* Row 1: Selected cell */
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                         cn_row + 1, cn_col, cbdr, cbg);
+            p += sprintf(p, " \033[38;2;200;180;120mCell: \033[1;38;2;255;255;255m(%d,%d)",
+                         cone_sel_x, cone_sel_y);
+            { int used = 18 + (cone_sel_x >= 100 ? 1 : 0) + (cone_sel_x >= 10 ? 1 : 0)
+                           + (cone_sel_y >= 100 ? 1 : 0) + (cone_sel_y >= 10 ? 1 : 0);
+              for (int i = used; i < cn_w - 1; i++) *p++ = ' '; }
+            p += sprintf(p, "%s\xe2\x94\x82%s", cbdr, crst);
+
+            /* Row 2: Backward cone stats */
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                         cn_row + 2, cn_col, cbdr, cbg);
+            p += sprintf(p, " \033[38;2;120;180;255m\xe2\x97\x80 Back: "
+                         "\033[38;2;180;220;255m%d cells  \033[38;2;120;180;255mdepth=%d",
+                         cone_back_cells, cone_depth);
+            { int used = 32 + (cone_back_cells >= 100 ? 1 : 0) + (cone_back_cells >= 1000 ? 1 : 0)
+                           + (cone_back_cells >= 10000 ? 1 : 0)
+                           + (cone_depth >= 10 ? 1 : 0) + (cone_depth >= 100 ? 1 : 0);
+              for (int i = used; i < cn_w - 1; i++) *p++ = ' '; }
+            p += sprintf(p, "%s\xe2\x94\x82%s", cbdr, crst);
+
+            /* Row 3: Forward cone stats */
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                         cn_row + 3, cn_col, cbdr, cbg);
+            p += sprintf(p, " \033[38;2;255;140;40m\xe2\x97\xb6 Fwd:  "
+                         "\033[38;2;255;180;100m%d cells  \033[38;2;255;140;40mdepth=%d",
+                         cone_fwd_cells, cone_fwd_depth);
+            { int used = 32 + (cone_fwd_cells >= 100 ? 1 : 0) + (cone_fwd_cells >= 1000 ? 1 : 0)
+                           + (cone_fwd_cells >= 10000 ? 1 : 0)
+                           + (cone_fwd_depth >= 10 ? 1 : 0) + (cone_fwd_depth >= 100 ? 1 : 0);
+              for (int i = used; i < cn_w - 1; i++) *p++ = ' '; }
+            p += sprintf(p, "%s\xe2\x94\x82%s", cbdr, crst);
+
+            /* Row 4: Fill ratio */
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                         cn_row + 4, cn_col, cbdr, cbg);
+            {
+                const char *fill_clr;
+                if (cone_fill_ratio < 0.1f) fill_clr = "38;2;80;200;80";       /* sparse */
+                else if (cone_fill_ratio < 0.4f) fill_clr = "38;2;200;200;80"; /* moderate */
+                else fill_clr = "38;2;255;80;60";                               /* dense */
+                p += sprintf(p, " \033[38;2;200;180;120mFill: "
+                             "\033[%sm%.1f%%  \033[38;2;150;150;130malive=%d",
+                             fill_clr, cone_fill_ratio * 100.0f, cone_back_alive);
+            }
+            { int used = 30 + (cone_back_alive >= 100 ? 1 : 0) + (cone_back_alive >= 1000 ? 1 : 0);
+              for (int i = used; i < cn_w - 1; i++) *p++ = ' '; }
+            p += sprintf(p, "%s\xe2\x94\x82%s", cbdr, crst);
+
+            /* Row 5: Hint */
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                         cn_row + 5, cn_col, cbdr, cbg);
+            p += sprintf(p, " \033[38;2;120;110;90mClick to retarget  [+/-]depth");
+            { int used = 32; for (int i = used; i < cn_w - 1; i++) *p++ = ' '; }
+            p += sprintf(p, "%s\xe2\x94\x82%s", cbdr, crst);
+
+            /* Bottom border */
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", cn_row + 6, cn_col, cbdr);
+            for (int i = 0; i < cn_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+            *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+            p += sprintf(p, "%s", crst);
+        }
+    }
+
     /* ── Population Dynamics Dashboard overlay ─────────────────────────────── */
     if (dashboard_mode && hist_count > 1) {
         int db_w = 62;      /* panel width */
@@ -7225,7 +7542,10 @@ int main(int argc, char **argv) {
             }
         }
         else if (key == '+' || key == '=') {
-            if (temp_mode) {
+            if (cone_mode >= 1) {
+                cone_fwd_depth = cone_fwd_depth < 128 ? cone_fwd_depth + 4 : 128;
+                if (cone_mode == 2) cone_compute();
+            } else if (temp_mode) {
                 temp_brush += 0.05f;
                 if (temp_brush > 1.0f) temp_brush = 1.0f;
             } else if (emit_mode) {
@@ -7235,7 +7555,10 @@ int main(int argc, char **argv) {
             }
         }
         else if (key == '-' || key == '_') {
-            if (temp_mode) {
+            if (cone_mode >= 1) {
+                cone_fwd_depth = cone_fwd_depth > 4 ? cone_fwd_depth - 4 : 4;
+                if (cone_mode == 2) cone_compute();
+            } else if (temp_mode) {
                 temp_brush -= 0.05f;
                 if (temp_brush < 0.0f) temp_brush = 0.0f;
             } else if (emit_mode) {
@@ -7311,6 +7634,17 @@ int main(int argc, char **argv) {
             attractor_mode = !attractor_mode;
             if (attractor_mode) {
                 attractor_compute(); /* compute on toggle-on */
+            }
+        }
+        else if (key == '9') {
+            if (cone_mode > 0) {
+                cone_mode = 0; /* toggle off */
+                memset(cone_back, 0, sizeof(cone_back));
+                memset(cone_fwd, 0, sizeof(cone_fwd));
+            } else {
+                cone_mode = 1; /* waiting for click */
+                cone_sel_x = -1;
+                cone_sel_y = -1;
             }
         }
         else if (key == ']') {
@@ -7553,7 +7887,18 @@ int main(int argc, char **argv) {
                     gy = view_y + (m->y - 3) * 4;
                 }
 
-                if (stamp_mode) {
+                if (cone_mode >= 1 && m->type == 1 && (btn & 0x03) == 0) {
+                    /* Light cone: left-click selects target cell */
+                    if (gx >= 0 && gx < W && gy >= 0 && gy < H) {
+                        cone_sel_x = gx;
+                        cone_sel_y = gy;
+                        cone_compute();
+                        char msg[64];
+                        snprintf(msg, sizeof(msg), "Light cone: (%d,%d) depth=%d",
+                                 gx, gy, cone_depth);
+                        flash_set(msg);
+                    }
+                } else if (stamp_mode) {
                     /* Stamp placement: left-click places, right-click exits stamp mode */
                     if (m->type == 1) {
                         int mbtn = btn & 0x03;
@@ -7733,6 +8078,11 @@ int main(int argc, char **argv) {
         /* Auto-refresh phase-space attractor every 8 generations (uses population history) */
         if (attractor_mode && attractor_stale && (generation % 8 == 0 || !running)) {
             attractor_compute();
+        }
+
+        /* Auto-refresh causal light cone every 8 generations while running */
+        if (cone_mode == 2 && cone_sel_x >= 0 && (generation % 8 == 0)) {
+            cone_compute();
         }
 
         render(running, speed_ms, draw_mode);

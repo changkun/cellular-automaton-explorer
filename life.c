@@ -1956,6 +1956,51 @@ static void ir_reset(void) {
         ir_scales[i] = 2 << i;  /* 2,4,8,16,32,64,128 */
 }
 
+/* ── Poincaré Recurrence Time Map ─────────────────────────────────────────── */
+/* Per-cell recurrence: tracks 3×3 (9-bit) neighborhood microstates and measures
+   frames until exact recurrence.  Short = periodic/crystallized; long = chaotic;
+   never = truly novel.  Heatmap from cool blue → green → yellow → red → white. */
+#define PR_SLOTS 8
+#define PR_HIST_LEN 64
+#define PR_EMA 0.85f
+
+static int   pr_mode = 0;
+static int   pr_stale = 1;
+static unsigned short pr_slot_state[MAX_H][MAX_W][PR_SLOTS]; /* 9-bit microstate per slot */
+static unsigned int   pr_slot_frame[MAX_H][MAX_W][PR_SLOTS]; /* frame when stored          */
+static float pr_cell[MAX_H][MAX_W];      /* normalized recurrence for rendering [0,1]      */
+static float pr_raw[MAX_H][MAX_W];       /* EMA-smoothed raw recurrence time               */
+static unsigned char pr_recurred[MAX_H][MAX_W]; /* 1 = has ever recurred                   */
+static unsigned int  pr_frame_count;     /* running frame counter                           */
+static float pr_mean_recur;              /* global mean recurrence time                     */
+static float pr_frac_recurred;           /* fraction of grid that has recurred              */
+static float pr_max_recur;               /* longest observed recurrence                     */
+static float pr_hist_mean[PR_HIST_LEN];  /* sparkline: mean τ history                      */
+static float pr_hist_frac[PR_HIST_LEN];  /* sparkline: fraction recurred history            */
+static int   pr_hist_idx;
+static int   pr_hist_count;
+static const char *pr_class_str;         /* classification label                            */
+static const char *pr_class_clr;         /* ANSI color for classification                   */
+
+static void pr_reset(void) {
+    pr_stale = 1;
+    pr_frame_count = 0;
+    pr_mean_recur = 0.0f;
+    pr_frac_recurred = 0.0f;
+    pr_max_recur = 0.0f;
+    pr_hist_idx = 0;
+    pr_hist_count = 0;
+    pr_class_str = "WAITING";
+    pr_class_clr = "\033[38;2;128;128;128m";
+    memset(pr_slot_state, 0xFF, sizeof(pr_slot_state)); /* 0xFFFF = empty sentinel */
+    memset(pr_slot_frame, 0, sizeof(pr_slot_frame));
+    memset(pr_cell, 0, sizeof(pr_cell));
+    memset(pr_raw, 0, sizeof(pr_raw));
+    memset(pr_recurred, 0, sizeof(pr_recurred));
+    memset(pr_hist_mean, 0, sizeof(pr_hist_mean));
+    memset(pr_hist_frac, 0, sizeof(pr_hist_frac));
+}
+
 /* ── Cross-Correlation Matrix ──────────────────────────────────────────────── */
 /* Computes pairwise time-lagged cross-correlation across all 16 metric streams
    at lags -8 to +8.  For each pair, identifies the optimal lag (peak |r|),
@@ -2178,6 +2223,7 @@ static int split_detect_current(void) {
     if (sg2_mode) return 39;
     if (su_mode) return 40;
     if (ir_mode) return 41;
+    if (pr_mode) return 42;
     return 0;
 }
 
@@ -3542,6 +3588,7 @@ static void grid_step(void) {
     sg2_stale = 1;
     su_stale = 1;
     ir_stale = 1;
+    pr_stale = 1;
 
     /* Always record frames for surprise field (cheap memcpy) */
     surp_record_frame();
@@ -9766,6 +9813,117 @@ ir_history:
     }
 }
 
+/* ── Poincaré Recurrence Time Map computation ─────────────────────────────── */
+static void pr_compute(void) {
+    pr_stale = 0;
+    pr_frame_count++;
+
+    int n_recurred = 0;
+    float sum_recur = 0.0f;
+    int n_with_recur = 0;
+    float max_r = 0.0f;
+
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            /* Compute 9-bit microstate: 3×3 Moore neighborhood including center */
+            unsigned short ms = 0;
+            int bit = 0;
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    int ny = y + dy, nx = x + dx;
+                    if (ny >= 0 && ny < H && nx >= 0 && nx < W && grid[ny][nx])
+                        ms |= (unsigned short)(1 << bit);
+                    bit++;
+                }
+            }
+
+            /* Skip completely dead neighborhoods — nothing to track */
+            if (ms == 0 && pr_raw[y][x] <= 0.0f) {
+                pr_cell[y][x] = 0.0f;
+                continue;
+            }
+
+            /* Direct-mapped hash lookup: slot = low 3 bits of microstate */
+            int slot = ms & (PR_SLOTS - 1);
+            float recur_time = -1.0f;
+
+            if (pr_slot_state[y][x][slot] == ms && pr_frame_count > 1) {
+                unsigned int dt = pr_frame_count - pr_slot_frame[y][x][slot];
+                if (dt > 0) {
+                    recur_time = (float)dt;
+                    pr_recurred[y][x] = 1;
+                }
+            }
+
+            /* Store current microstate in slot */
+            pr_slot_state[y][x][slot] = ms;
+            pr_slot_frame[y][x][slot] = pr_frame_count;
+
+            /* EMA-smooth the recurrence time */
+            if (recur_time > 0.0f) {
+                if (pr_raw[y][x] > 0.0f)
+                    pr_raw[y][x] = PR_EMA * pr_raw[y][x] + (1.0f - PR_EMA) * recur_time;
+                else
+                    pr_raw[y][x] = recur_time;
+            }
+
+            /* Accumulate stats */
+            if (pr_recurred[y][x]) n_recurred++;
+            if (pr_raw[y][x] > 0.0f) {
+                sum_recur += pr_raw[y][x];
+                n_with_recur++;
+                if (pr_raw[y][x] > max_r) max_r = pr_raw[y][x];
+            }
+        }
+    }
+
+    /* Global statistics */
+    int total = H * W;
+    pr_frac_recurred = (total > 0) ? (float)n_recurred / (float)total : 0.0f;
+    pr_mean_recur = (n_with_recur > 0) ? sum_recur / (float)n_with_recur : 0.0f;
+    pr_max_recur = max_r;
+
+    /* Classification by mean recurrence time */
+    if (pr_frame_count < 5) {
+        pr_class_str = "WARMING";
+        pr_class_clr = "\033[38;2;128;128;128m";
+    } else if (pr_mean_recur < 3.0f) {
+        pr_class_str = "CRYSTALLINE";
+        pr_class_clr = "\033[38;2;80;180;255m";
+    } else if (pr_mean_recur < 10.0f) {
+        pr_class_str = "PERIODIC";
+        pr_class_clr = "\033[38;2;80;220;140m";
+    } else if (pr_mean_recur < 50.0f) {
+        pr_class_str = "MIXING";
+        pr_class_clr = "\033[38;2;240;200;60m";
+    } else {
+        pr_class_str = "CHAOTIC";
+        pr_class_clr = "\033[38;2;255;80;40m";
+    }
+
+    /* Normalize per-cell values for rendering using log scale */
+    float log_max = (max_r > 1.0f) ? logf(max_r) : 1.0f;
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            if (pr_raw[y][x] > 0.0f) {
+                float v = logf(pr_raw[y][x]) / log_max;
+                if (v < 0.0f) v = 0.0f;
+                if (v > 1.0f) v = 1.0f;
+                pr_cell[y][x] = v;
+            } else if (!pr_recurred[y][x] && grid[y][x]) {
+                /* Alive but never recurred: show as hot */
+                pr_cell[y][x] = 1.0f;
+            }
+        }
+    }
+
+    /* Sparkline history */
+    pr_hist_mean[pr_hist_idx] = pr_mean_recur;
+    pr_hist_frac[pr_hist_idx] = pr_frac_recurred;
+    pr_hist_idx = (pr_hist_idx + 1) % PR_HIST_LEN;
+    if (pr_hist_count < PR_HIST_LEN) pr_hist_count++;
+}
+
 /* ── Causal Emergence computation ──────────────────────────────────────────── */
 /* Color mapping: scale 0 (micro best) = cool blue,
    scale 1 (2x2) = green, scale 2 (4x4) = warm orange,
@@ -11064,6 +11222,7 @@ static void split_ensure_computed(int idx) {
         case 39: if (sg2_stale) sg2_compute(); break;
         case 40: if (su_stale) su_compute(); break;
         case 41: if (ir_stale) ir_compute(); break;
+        case 42: if (pr_stale) pr_compute(); break;
         default: break;
     }
 }
@@ -13171,6 +13330,61 @@ static int cell_color(int x, int y, RGB *out) {
             }
             out->r = r; out->g = g; out->b = b;
             return grid[y][x] ? 1 : 42; /* 42 = roughness ghost */
+        }
+        return 0;
+    }
+
+    /* Poincaré Recurrence Time Map overlay: recurrence heatmap */
+    if (pr_mode) {
+        float v = pr_cell[y][x];
+        if (grid[y][x] || v > 0.02f) {
+            /* Cool blue (fast recurrence) → green → yellow → red → white (never recurred) */
+            unsigned char r, g, b;
+            if (v < 0.15f) {
+                /* Very fast recurrence: deep blue → cyan */
+                float t = v / 0.15f;
+                r = (unsigned char)(10 + 20 * t);
+                g = (unsigned char)(30 + 100 * t);
+                b = (unsigned char)(120 + 135 * t);
+            } else if (v < 0.35f) {
+                /* Fast: cyan → teal-green */
+                float t = (v - 0.15f) / 0.20f;
+                r = (unsigned char)(30 + 20 * t);
+                g = (unsigned char)(130 + 90 * t);
+                b = (unsigned char)(255 - 120 * t);
+            } else if (v < 0.55f) {
+                /* Moderate: green → yellow */
+                float t = (v - 0.35f) / 0.20f;
+                r = (unsigned char)(50 + 180 * t);
+                g = (unsigned char)(220 - 10 * t);
+                b = (unsigned char)(135 - 105 * t);
+            } else if (v < 0.75f) {
+                /* Long: yellow → orange-red */
+                float t = (v - 0.55f) / 0.20f;
+                r = (unsigned char)(230 + 25 * t);
+                g = (unsigned char)(210 - 140 * t);
+                b = (unsigned char)(30 - 10 * t);
+            } else if (v < 0.90f) {
+                /* Very long: red → hot pink */
+                float t = (v - 0.75f) / 0.15f;
+                r = 255;
+                g = (unsigned char)(70 + 40 * t);
+                b = (unsigned char)(20 + 80 * t);
+            } else {
+                /* Never recurred / extreme: white-hot */
+                float t = (v - 0.90f) / 0.10f;
+                if (t > 1.0f) t = 1.0f;
+                r = 255;
+                g = (unsigned char)(110 + 145 * t);
+                b = (unsigned char)(100 + 155 * t);
+            }
+            if (grid[y][x]) {
+                r = (unsigned char)(r < 200 ? r + 55 : 255);
+                g = (unsigned char)(g < 200 ? g + 55 : 255);
+                b = (unsigned char)(b < 200 ? b + 55 : 255);
+            }
+            out->r = r; out->g = g; out->b = b;
+            return grid[y][x] ? 1 : 43; /* 43 = recurrence ghost */
         }
         return 0;
     }
@@ -20114,6 +20328,170 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", irrst);
     }
 
+    /* ── Poincaré Recurrence Time Map overlay panel ─────────────────────── */
+    if (pr_mode) {
+        int pr_pw = 50;
+        int pr_col = term_cols - pr_pw - 2;
+        int pr_row = 3;
+        /* Stack below other panels */
+        if (entropy_mode)   pr_row += 8;
+        if (temp_mode)      pr_row += 9;
+        if (lyapunov_mode)  pr_row += 8;
+        if (fourier_mode)   pr_row += 18;
+        if (fractal_mode)   pr_row += 11;
+        if (wolfram_mode)   pr_row += 14;
+        if (flow_mode)      pr_row += 9;
+        if (attractor_mode) pr_row += 8;
+        if (cone_mode >= 1) pr_row += 8;
+        if (surp_mode)      pr_row += 8;
+        if (mi_mode)        pr_row += 12;
+        if (cplx_mode)      pr_row += 11;
+        if (topo_mode)      pr_row += 11;
+        if (rg_mode)        pr_row += 11;
+        if (kc_mode)        pr_row += 9;
+        if (corr_mode)      pr_row += 9;
+        if (eprod_mode)     pr_row += 9;
+        if (vort_mode)      pr_row += 9;
+        if (wave_mode)      pr_row += 9;
+        if (ergo_mode)      pr_row += 10;
+        if (coh_mode)       pr_row += 8;
+        if (ce_mode)        pr_row += 9;
+        if (ew_mode)        pr_row += 10;
+        if (hr_mode)        pr_row += 10;
+        if (rd_mode)        pr_row += 13;
+        if (xc_mode && xc_count >= 20) pr_row += 28;
+        if (fi_mode && fi_count >= 16)  pr_row += 12;
+        if (sg_mode)        pr_row += 12;
+        if (td_mode)        pr_row += 10;
+        if (mf_mode)        pr_row += 10;
+        if (ri_mode)        pr_row += 10;
+        if (sg2_mode)       pr_row += 9;
+        if (su_mode)        pr_row += 9;
+        if (ir_mode)        pr_row += 10;
+        if (pr_col < 1) pr_col = 1;
+
+        const char *prbdr = "\033[38;2;180;120;220;48;2;12;8;16m";  /* purple border */
+        const char *prbg  = "\033[48;2;12;8;16m";
+        const char *prrst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 \xe2\x8f\xb1 Poincar\xc3\xa9 Recurrence ",
+                     pr_row, pr_col, prbdr);
+        for (int i = 28; i < pr_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", prrst);
+
+        /* Row 1: Mean recurrence time + classification */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     pr_row + 1, pr_col, prbdr, prbg);
+        {
+            int n = sprintf(p, " \033[38;2;160;140;220m\xcf\x84\xcc\x84: %s%.1f %s",
+                            pr_class_clr, pr_mean_recur, pr_class_str);
+            p += n;
+            int used = 28;
+            for (int i = used; i < pr_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", prbdr, prrst);
+
+        /* Row 2: Max recurrence + fraction recurred */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     pr_row + 2, pr_col, prbdr, prbg);
+        {
+            int n = sprintf(p, " \033[38;2;130;110;180m\xcf\x84max=%.0f"
+                               " \033[38;2;110;90;160mrecur=%.1f%%",
+                            pr_max_recur, pr_frac_recurred * 100.0f);
+            p += n;
+            int used = 30;
+            for (int i = used; i < pr_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", prbdr, prrst);
+
+        /* Row 3: Frame counter */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     pr_row + 3, pr_col, prbdr, prbg);
+        {
+            int n = sprintf(p, " \033[38;2;100;80;140mframes=%u"
+                               " \033[38;2;80;65;120mnovel=%.1f%%",
+                            pr_frame_count, (1.0f - pr_frac_recurred) * 100.0f);
+            p += n;
+            int used = 30;
+            for (int i = used; i < pr_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", prbdr, prrst);
+
+        /* Row 4: Separator */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     pr_row + 4, pr_col, prbdr, prbg);
+        p += sprintf(p, " \033[38;2;30;20;40m");
+        for (int i = 1; i < pr_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", prbdr, prrst);
+
+        /* Row 5: Color scale legend */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     pr_row + 5, pr_col, prbdr, prbg);
+        {
+            int n = sprintf(p, " \033[38;2;10;30;120m\xe2\x96\x88"
+                               "\033[38;2;30;130;255m\xe2\x96\x88"
+                               "\033[38;2;50;220;135m\xe2\x96\x88"
+                               "\033[38;2;230;210;30m\xe2\x96\x88"
+                               "\033[38;2;255;70;20m\xe2\x96\x88"
+                               "\033[38;2;255;255;255m\xe2\x96\x88"
+                               "\033[38;2;140;120;180m fast\xe2\x86\x90 \xe2\x86\x92" "slow [^Y]");
+            p += n;
+            int used = 34;
+            for (int i = used; i < pr_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", prbdr, prrst);
+
+        /* Rows 6-7: Sparklines — mean τ and fraction recurred */
+        for (int sp = 0; sp < 2; sp++) {
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                         pr_row + 6 + sp, pr_col, prbdr, prbg);
+            const char *spark_blocks[] = {"\xe2\x96\x81","\xe2\x96\x82","\xe2\x96\x83",
+                                          "\xe2\x96\x84","\xe2\x96\x85","\xe2\x96\x86",
+                                          "\xe2\x96\x87","\xe2\x96\x88"};
+            float *hist = (sp == 0) ? pr_hist_mean : pr_hist_frac;
+            const char *label = (sp == 0) ? " \xcf\x84\xcc\x84 " : " %R ";
+            const char *clr = (sp == 0) ? "\033[38;2;180;140;240m" : "\033[38;2;120;200;160m";
+            int n = sprintf(p, " \033[38;2;60;40;80m%-3s%s", label, clr);
+            p += n;
+            int spark_w = pr_pw - 7;
+
+            /* Find max for normalization */
+            float sp_max = 0.01f;
+            for (int i = 0; i < pr_hist_count; i++) {
+                int idx2 = (pr_hist_idx - pr_hist_count + i + PR_HIST_LEN) % PR_HIST_LEN;
+                float hv = hist[idx2];
+                if (hv > sp_max) sp_max = hv;
+            }
+
+            for (int i = 0; i < spark_w && i < PR_HIST_LEN; i++) {
+                int idx2 = (pr_hist_idx - pr_hist_count + i + PR_HIST_LEN) % PR_HIST_LEN;
+                if (i >= pr_hist_count) {
+                    *p++ = ' ';
+                } else {
+                    float v = hist[idx2] / sp_max;
+                    if (v < 0.0f) v = 0.0f;
+                    if (v > 1.0f) v = 1.0f;
+                    int bi = (int)(v * 7.0f);
+                    if (bi > 7) bi = 7;
+                    const char *blk = spark_blocks[bi];
+                    while (*blk) *p++ = *blk++;
+                }
+            }
+            int used = spark_w + 5;
+            for (int i = used; i < pr_pw - 1; i++) *p++ = ' ';
+            p += sprintf(p, "%s\xe2\x94\x82%s", prbdr, prrst);
+        }
+
+        /* Bottom border */
+        int pr_bottom = pr_row + 8;
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", pr_bottom, pr_col, prbdr);
+        for (int i = 0; i < pr_pw; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", prrst);
+    }
+
     /* ── Percolation Analysis overlay panel ─────────────────────────────── */
     if (perc_mode) {
         int pc_w = 46;
@@ -20149,6 +20527,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (sg2_mode)       pc_row += 9;
         if (su_mode)        pc_row += 9;
         if (ir_mode)        pc_row += 10;
+        if (pr_mode)        pc_row += 9;
         if (pc_col < 1) pc_col = 1;
 
         const char *pcbdr = "\033[38;2;255;200;40;48;2;14;12;6m";
@@ -23510,6 +23889,19 @@ int main(int argc, char **argv) {
                     printf("\033[2J"); fflush(stdout);
                 } else {
                     flash_set("Roughness off");
+                    printf("\033[2J"); fflush(stdout);
+                }
+            }
+        }
+        else if (key == 25) { /* Ctrl-Y: Poincaré Recurrence Time Map */
+            if (!ecosystem_mode) {
+                pr_mode = !pr_mode;
+                if (pr_mode) {
+                    pr_reset();
+                    flash_set("Poincar\xc3\xa9 Recurrence: microstate return time map [^Y]exit");
+                    printf("\033[2J"); fflush(stdout);
+                } else {
+                    flash_set("Recurrence off");
                     printf("\033[2J"); fflush(stdout);
                 }
             }

@@ -81,6 +81,8 @@
  *   ~           Toggle wave mechanics overlay (interference from births/deaths)
  *                 Births emit positive impulses, deaths negative — 2D wave equation
  *                 Cyan=positive amplitude, dark=zero, orange=negative
+ *   (           Toggle ergodicity metric (time-avg vs space-avg convergence)
+ *                 Green=ergodic (averages match), magenta=non-ergodic (frozen)
  *   D           Auto-demo mode — curated tour of pattern + overlay combos
  *                 Cycles through 10 scenes; press any key to exit and explore
  *   ?           Toggle cell probe inspector (click any cell for all metrics)
@@ -602,6 +604,30 @@ static float vort_hist_max[VORT_HIST_LEN];
 static float vort_hist_net[VORT_HIST_LEN];
 static int   vort_hist_idx = 0;
 static int   vort_hist_count = 0;
+
+/* ── Ergodicity Metric ───────────────────────────────────────────────────── */
+/* Compares time-averaged density per cell against the spatial average.
+   Ergodic systems: time avg ≈ space avg everywhere.  Broken ergodicity:
+   persistent local bias (frozen clusters, stable structures).
+   Green = ergodic, magenta = non-ergodic. */
+
+#define ERGO_HIST_LEN 64
+#define ERGO_EMA_ALPHA 0.02f   /* slow EMA for time averaging */
+
+static float ergo_time_avg[MAX_H][MAX_W];  /* per-cell EMA of density */
+static float ergo_dev[MAX_H][MAX_W];       /* |time_avg - space_avg| */
+static int   ergo_mode = 0;
+static int   ergo_stale = 1;
+static int   ergo_warmup = 0;              /* frames accumulated */
+static float ergo_space_avg = 0.0f;        /* global spatial density */
+static float ergo_index = 0.0f;            /* 1=ergodic, 0=broken */
+static float ergo_frac_ergodic = 0.0f;     /* fraction of ergodic cells */
+static int   ergo_equil_gen = -1;          /* generation where index > 0.9 */
+
+/* Sparkline history */
+static float ergo_hist[ERGO_HIST_LEN];
+static int   ergo_hist_idx = 0;
+static int   ergo_hist_count = 0;
 
 /* ── Cell Probe Inspector ─────────────────────────────────────────────────── */
 /* Click-to-inspect tool: shows all analysis metrics for a single cell.
@@ -1306,6 +1332,12 @@ static void grid_clear(void) {
     hist_count = 0;
     hist_pos = 0;
     timeline_clear();
+    /* Reset ergodicity EMA so stale time averages don't persist */
+    memset(ergo_time_avg, 0, sizeof(ergo_time_avg));
+    ergo_warmup = 0;
+    ergo_equil_gen = -1;
+    ergo_hist_count = 0;
+    ergo_hist_idx = 0;
 }
 
 static void zones_clear(void) {
@@ -1531,6 +1563,7 @@ static void grid_step(void) {
     eprod_stale = 1;
     wave_stale = 1;
     vort_stale = 1;
+    ergo_stale = 1;
 
     /* Always record frames for surprise field (cheap memcpy) */
     surp_record_frame();
@@ -2195,6 +2228,7 @@ static void corr_compute(void);
 static void eprod_compute(void);
 static void wave_compute(void);
 static void vort_compute(void);
+static void ergo_compute(void);
 
 static void demo_reset_overlays(void) {
     freq_mode = 0;
@@ -2212,6 +2246,7 @@ static void demo_reset_overlays(void) {
     eprod_mode = 0;
     wave_mode = 0;
     vort_mode = 0;
+    ergo_mode = 0;
     fourier_mode = 0;
     fractal_mode = 0;
     wolfram_mode = 0;
@@ -2272,6 +2307,7 @@ static void demo_setup_scene(int idx) {
             case '=': eprod_mode = 1; eprod_compute(); break;
             case '~': wave_mode = 1; wave_compute(); break;
             case '*': vort_mode = 1; vort_compute(); break;
+            case '(': ergo_mode = 1; ergo_compute(); break;
             case 'h': heatmap_mode = 1; break;
             case 'g': show_graph = 1; break;
         }
@@ -5427,6 +5463,101 @@ static RGB vort_to_rgb(float omega, float max_omega) {
     }
 }
 
+/* ── Ergodicity Metric computation ────────────────────────────────────────── */
+/* Compares per-cell time-averaged density (EMA) against global spatial avg.
+   Ergodic hypothesis: for a stationary process, time avg = ensemble avg.
+   Deviation reveals frozen structures, absorbing states, broken symmetry. */
+static void ergo_compute(void) {
+    /* Step 1: Compute spatial average density */
+    int alive = 0;
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++)
+            if (grid[y][x] > 0) alive++;
+    ergo_space_avg = (float)alive / (float)(W * H);
+
+    /* Step 2: Update per-cell time-averaged density via EMA */
+    float alpha = ERGO_EMA_ALPHA;
+    /* Use faster alpha during warmup for quicker convergence */
+    if (ergo_warmup < 50) alpha = 0.1f;
+    else if (ergo_warmup < 200) alpha = 0.05f;
+
+    double sum_dev = 0.0;
+    int n_ergodic = 0;
+    float thresh = 0.08f; /* deviation threshold for "ergodic" classification */
+
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            float cell_val = grid[y][x] > 0 ? 1.0f : 0.0f;
+            ergo_time_avg[y][x] = (1.0f - alpha) * ergo_time_avg[y][x]
+                                  + alpha * cell_val;
+            float dev = fabsf(ergo_time_avg[y][x] - ergo_space_avg);
+            ergo_dev[y][x] = dev;
+            sum_dev += dev;
+            if (dev < thresh) n_ergodic++;
+        }
+    }
+
+    ergo_warmup++;
+    int total = W * H;
+    float mean_dev = (float)(sum_dev / total);
+
+    /* Ergodicity index: 1 - mean_deviation (clamped to [0,1]) */
+    ergo_index = 1.0f - mean_dev * 4.0f; /* scale: dev=0.25 → index=0 */
+    if (ergo_index < 0.0f) ergo_index = 0.0f;
+    if (ergo_index > 1.0f) ergo_index = 1.0f;
+    ergo_frac_ergodic = (float)n_ergodic / (float)total;
+
+    /* Track equilibration: first generation where index > 0.9 */
+    if (ergo_equil_gen < 0 && ergo_index > 0.9f && ergo_warmup > 50)
+        ergo_equil_gen = generation;
+    /* Reset if it drops back below 0.85 */
+    if (ergo_equil_gen >= 0 && ergo_index < 0.85f)
+        ergo_equil_gen = -1;
+
+    /* Record sparkline history */
+    ergo_hist[ergo_hist_idx] = ergo_index;
+    ergo_hist_idx = (ergo_hist_idx + 1) % ERGO_HIST_LEN;
+    if (ergo_hist_count < ERGO_HIST_LEN) ergo_hist_count++;
+
+    ergo_stale = 0;
+}
+
+/* Ergodicity deviation to RGB:
+   Low deviation (ergodic) → green
+   High deviation (non-ergodic/frozen) → magenta/purple
+   Smooth gradient with adaptive scaling. */
+static RGB ergo_to_rgb(float dev) {
+    /* Normalize deviation: 0=ergodic, 1=maximally non-ergodic */
+    float t = dev * 4.0f; /* scale so dev=0.25 → t=1.0 */
+    if (t > 1.0f) t = 1.0f;
+
+    if (t < 0.15f) {
+        /* Strongly ergodic: dark → bright green */
+        float u = t / 0.15f;
+        return (RGB){(unsigned char)(8 + 15 * u),
+                     (unsigned char)(40 + 130 * u),
+                     (unsigned char)(15 + 30 * u)};
+    } else if (t < 0.4f) {
+        /* Mildly non-ergodic: green → yellow transition */
+        float u = (t - 0.15f) / 0.25f;
+        return (RGB){(unsigned char)(23 + 150 * u),
+                     (unsigned char)(170 - 30 * u),
+                     (unsigned char)(45 - 20 * u)};
+    } else if (t < 0.7f) {
+        /* Moderately non-ergodic: yellow → magenta */
+        float u = (t - 0.4f) / 0.3f;
+        return (RGB){(unsigned char)(173 + 50 * u),
+                     (unsigned char)(140 - 100 * u),
+                     (unsigned char)(25 + 140 * u)};
+    } else {
+        /* Strongly non-ergodic: deep magenta/purple */
+        float u = (t - 0.7f) / 0.3f;
+        return (RGB){(unsigned char)(223 + 30 * u),
+                     (unsigned char)(40 + 20 * u),
+                     (unsigned char)(165 + 80 * u)};
+    }
+}
+
 /* ── Wave Mechanics computation ───────────────────────────────────────────── */
 /* Damped 2D wave equation: d²u/dt² = c²∇²u - γ du/dt + S(x,y,t)
    where S = impulses from cell births (+) and deaths (-).
@@ -7475,6 +7606,21 @@ static int cell_color(int x, int y, RGB *out) {
                 out->b = (unsigned char)(out->b < 200 ? out->b + 55 : 255);
             }
             return grid[y][x] ? 1 : 25; /* 25 = wave ghost */
+        }
+        return 0;
+    }
+
+    /* Ergodicity metric overlay: time-avg vs space-avg convergence */
+    if (ergo_mode) {
+        float dev = ergo_dev[y][x];
+        if (dev > 0.005f || grid[y][x]) {
+            *out = ergo_to_rgb(dev);
+            if (grid[y][x]) {
+                out->r = (unsigned char)(out->r < 200 ? out->r + 55 : 255);
+                out->g = (unsigned char)(out->g < 200 ? out->g + 55 : 255);
+                out->b = (unsigned char)(out->b < 200 ? out->b + 55 : 255);
+            }
+            return grid[y][x] ? 1 : 27; /* 27 = ergodicity ghost */
         }
         return 0;
     }
@@ -10876,6 +11022,156 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", wrst);
     }
 
+    /* ── Ergodicity Metric overlay panel ─────────────────────────────────── */
+    if (ergo_mode) {
+        int eg_w = 44;
+        int eg_col = term_cols - eg_w - 2;
+        /* Stack below other active panels */
+        int eg_row = 3;
+        if (entropy_mode)   eg_row += 8;
+        if (temp_mode)      eg_row += 9;
+        if (lyapunov_mode)  eg_row += 8;
+        if (fourier_mode)   eg_row += 18;
+        if (fractal_mode)   eg_row += 11;
+        if (wolfram_mode)   eg_row += 14;
+        if (flow_mode)      eg_row += 9;
+        if (attractor_mode) eg_row += 8;
+        if (cone_mode >= 1) eg_row += 8;
+        if (surp_mode)      eg_row += 8;
+        if (mi_mode)        eg_row += 12;
+        if (cplx_mode)      eg_row += 11;
+        if (topo_mode)      eg_row += 11;
+        if (rg_mode)        eg_row += 11;
+        if (kc_mode)        eg_row += 9;
+        if (corr_mode)      eg_row += 9;
+        if (eprod_mode)     eg_row += 9;
+        if (vort_mode)      eg_row += 9;
+        if (wave_mode)      eg_row += 9;
+        if (eg_col < 1) eg_col = 1;
+
+        const char *ebdr = "\033[38;2;60;200;100;48;2;6;14;8m";
+        const char *ebg  = "\033[48;2;6;14;8m";
+        const char *erst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 \xe2\x89\xa1 Ergodicity Metric ",
+                     eg_row, eg_col, ebdr);
+        for (int i = 25; i < eg_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", erst);
+
+        /* Row 1: Ergodicity index & fraction */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     eg_row + 1, eg_col, ebdr, ebg);
+        p += sprintf(p, " \033[38;2;100;200;120mErgo idx:");
+        if (ergo_index > 0.8f)
+            p += sprintf(p, "\033[1;38;2;80;255;120m%.3f", ergo_index);
+        else if (ergo_index > 0.5f)
+            p += sprintf(p, "\033[38;2;200;200;60m%.3f", ergo_index);
+        else
+            p += sprintf(p, "\033[38;2;220;80;200m%.3f", ergo_index);
+        p += sprintf(p, "\033[0;38;2;80;140;90m  frac:");
+        p += sprintf(p, "\033[38;2;180;220;180m%.1f%%", ergo_frac_ergodic * 100.0f);
+        p += sprintf(p, "%s", ebg);
+        { int used = 34; for (int i = used; i < eg_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", ebdr, erst);
+
+        /* Row 2: Spatial average & equilibration */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     eg_row + 2, eg_col, ebdr, ebg);
+        p += sprintf(p, " \033[38;2;100;200;120m\xcf\x81\xcc\x84=");
+        p += sprintf(p, "\033[38;2;180;220;180m%.3f", ergo_space_avg);
+        p += sprintf(p, "\033[38;2;80;140;90m  equil:");
+        if (ergo_equil_gen >= 0)
+            p += sprintf(p, "\033[38;2;80;255;120mgen %d", ergo_equil_gen);
+        else
+            p += sprintf(p, "\033[38;2;160;100;140mnot yet");
+        p += sprintf(p, "%s", ebg);
+        { int used = 32; for (int i = used; i < eg_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", ebdr, erst);
+
+        /* Row 3: Color legend */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     eg_row + 3, eg_col, ebdr, ebg);
+        p += sprintf(p, " ");
+        for (int i = 0; i < 30; i++) {
+            float d = (float)i / 29.0f * 0.25f;
+            RGB c = ergo_to_rgb(d);
+            p += sprintf(p, "\033[38;2;%d;%d;%dm\xe2\x96\x88", c.r, c.g, c.b);
+        }
+        p += sprintf(p, "%s", ebg);
+        { int used = 31; for (int i = used; i < eg_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", ebdr, erst);
+
+        /* Row 4: Legend labels */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     eg_row + 4, eg_col, ebdr, ebg);
+        p += sprintf(p, " \033[38;2;80;200;100mergodic");
+        p += sprintf(p, "\033[38;2;80;100;80m      \xe2\x86\x94      ");
+        p += sprintf(p, "\033[38;2;220;80;200mnon-ergodic");
+        p += sprintf(p, "%s", ebg);
+        { int used = 33; for (int i = used; i < eg_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", ebdr, erst);
+
+        /* Row 5: Ergodicity index sparkline */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     eg_row + 5, eg_col, ebdr, ebg);
+        p += sprintf(p, " \033[38;2;60;120;80mE ");
+        if (ergo_hist_count > 1) {
+            const char *spark_chars[] = {"\xe2\x96\x81","\xe2\x96\x82","\xe2\x96\x83",
+                                         "\xe2\x96\x84","\xe2\x96\x85","\xe2\x96\x86",
+                                         "\xe2\x96\x87","\xe2\x96\x88"};
+            int n = ergo_hist_count < 30 ? ergo_hist_count : 30;
+            for (int i = 0; i < n; i++) {
+                int idx = (ergo_hist_idx - n + i + ERGO_HIST_LEN) % ERGO_HIST_LEN;
+                float v = ergo_hist[idx];
+                if (v > 1.0f) v = 1.0f;
+                if (v < 0.0f) v = 0.0f;
+                int lvl = (int)(v * 7.0f);
+                if (lvl > 7) lvl = 7;
+                if (lvl < 0) lvl = 0;
+                if (v > 0.8f) p += sprintf(p, "\033[38;2;80;240;120m%s", spark_chars[lvl]);
+                else if (v > 0.5f) p += sprintf(p, "\033[38;2;180;200;60m%s", spark_chars[lvl]);
+                else p += sprintf(p, "\033[38;2;180;60;140m%s", spark_chars[lvl]);
+            }
+        }
+        p += sprintf(p, "%s", ebg);
+        { int used = 2 + (ergo_hist_count < 30 ? ergo_hist_count : 30);
+          for (int i = used; i < eg_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", ebdr, erst);
+
+        /* Row 6: Phase classification */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     eg_row + 6, eg_col, ebdr, ebg);
+        p += sprintf(p, " \033[38;2;80;140;90mPhase: ");
+        if (ergo_warmup < 50)
+            p += sprintf(p, "\033[38;2;120;120;130mwarming up...");
+        else if (ergo_index > 0.9f)
+            p += sprintf(p, "\033[1;38;2;80;255;120mErgodic / Equilibrated");
+        else if (ergo_index > 0.7f)
+            p += sprintf(p, "\033[38;2;160;220;80mWeakly Ergodic");
+        else if (ergo_index > 0.4f)
+            p += sprintf(p, "\033[38;2;220;200;60mPartially Broken");
+        else
+            p += sprintf(p, "\033[1;38;2;220;80;200mBroken Ergodicity");
+        p += sprintf(p, "%s", ebg);
+        { int used = 36; for (int i = used; i < eg_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", ebdr, erst);
+
+        /* Row 7: Toggle hint */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     eg_row + 7, eg_col, ebdr, ebg);
+        p += sprintf(p, " \033[38;2;60;100;70m[(]toggle  time-avg vs space-avg");
+        { int used = 35; for (int i = used; i < eg_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", ebdr, erst);
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", eg_row + 8, eg_col, ebdr);
+        for (int i = 0; i < eg_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", erst);
+    }
+
     /* ── Cell Probe Inspector overlay panel ──────────────────────────────── */
     if (probe_mode == 2 && probe_x >= 0 && probe_x < W && probe_y >= 0 && probe_y < H) {
         int pp_w = 48;
@@ -11159,6 +11455,22 @@ static void render(int running, int speed_ms, int draw_mode) {
                          vw > 0.1f ? "CCW" : vw < -0.1f ? "CW" : "irrot.", prst);
             p += sprintf(p, "%s", pbg);
             PROBE_PAD(32);
+        }
+        PROBE_ROW_END();
+
+        /* Row 12f: Ergodicity */
+        PROBE_ROW_START();
+        {
+            float ed = ergo_dev[py][px];
+            float ta = ergo_time_avg[py][px];
+            p += sprintf(p, " %sErgodicity:%s  ", plbl, prst);
+            if (ed < 0.05f) p += sprintf(p, "\033[38;2;80;240;120m");
+            else if (ed < 0.15f) p += sprintf(p, "\033[38;2;200;200;60m");
+            else p += sprintf(p, "\033[38;2;220;80;200m");
+            p += sprintf(p, "dev=%.3f", ed);
+            p += sprintf(p, " %s\xcf\x81\xcc\x84=%.2f%s", pdim, ta, prst);
+            p += sprintf(p, "%s", pbg);
+            PROBE_PAD(34);
         }
         PROBE_ROW_END();
 
@@ -11898,6 +12210,12 @@ int main(int argc, char **argv) {
                 vort_compute(); /* compute on toggle-on */
             }
         }
+        else if (key == '(') {
+            ergo_mode = !ergo_mode;
+            if (ergo_mode) {
+                ergo_compute(); /* compute on toggle-on */
+            }
+        }
         else if (key == '?') {
             if (probe_mode > 0) {
                 probe_mode = 0; /* toggle off */
@@ -12418,6 +12736,11 @@ int main(int argc, char **argv) {
         /* Auto-refresh vorticity every 2 generations (needs temporal differencing) */
         if (vort_mode && vort_stale && (generation % 2 == 0 || !running)) {
             vort_compute();
+        }
+
+        /* Auto-refresh ergodicity metric every 2 generations */
+        if (ergo_mode && ergo_stale && (generation % 2 == 0 || !running)) {
+            ergo_compute();
         }
 
         /* Auto-refresh wave mechanics every generation (continuous propagation) */

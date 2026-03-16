@@ -45,6 +45,7 @@ your terminal.
   - [Entropy Production Rate](#entropy-production-rate)
   - [Wave Mechanics](#wave-mechanics)
   - [Vorticity Detection](#vorticity-detection)
+  - [Percolation Analysis](#percolation-analysis)
   - [Cell Probe Inspector](#cell-probe-inspector)
 - [Visualization](#visualization)
   - [Heatmap & Ghost Trails](#heatmap--ghost-trails)
@@ -462,6 +463,16 @@ Toggle: `*`. Computes the discrete curl of a velocity field estimated from
 temporal density changes. Blue = clockwise rotation, dark = irrotational,
 red = counterclockwise. Detects vortex centers as local maxima of |ω|. Stats
 panel with max/mean vorticity, net circulation (Γ), vortex count, and sparkline.
+
+### Percolation Analysis
+
+Toggle: `|`. Flood-fill cluster connectivity analysis. Each connected cluster of
+live cells gets a unique color; the largest cluster is highlighted in gold. Detects
+spanning clusters — whether the largest cluster connects opposite edges (horizontal
+and/or vertical). Displays the percolation order parameter P∞ (fraction of cells in
+the largest cluster), site density relative to the critical threshold p_c ≈ 0.593
+for square lattice percolation, and phase classification (Supercritical when
+spanning, Near-critical, Subcritical, or Dilute). Sparkline tracks P∞ over time.
 
 ### Cell Probe Inspector
 

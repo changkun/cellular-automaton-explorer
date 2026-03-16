@@ -83,6 +83,8 @@
  *                 Cyan=positive amplitude, dark=zero, orange=negative
  *   (           Toggle ergodicity metric (time-avg vs space-avg convergence)
  *                 Green=ergodic (averages match), magenta=non-ergodic (frozen)
+ *   |           Toggle percolation analysis (cluster connectivity)
+ *                 Gold=largest cluster, spectrum=others; detects spanning clusters
  *   )           Toggle split-screen dual overlay comparison
  *                 Shows two overlays side-by-side on the same simulation
  *                 TAB cycles right panel overlay, ` cycles left panel overlay
@@ -632,6 +634,34 @@ static float ergo_hist[ERGO_HIST_LEN];
 static int   ergo_hist_idx = 0;
 static int   ergo_hist_count = 0;
 
+/* ── Percolation Analysis ─────────────────────────────────────────────────── */
+/* Cluster connectivity analysis via flood fill of live cells.
+   Colors each connected cluster uniquely; largest cluster highlighted in gold.
+   Detects spanning clusters (edge-to-edge connectivity) in H and V directions.
+   Order parameter P∞ = fraction of cells in the largest cluster.
+   Critical threshold for site percolation on square lattice ≈ 0.593. */
+#define PERC_MAX_CLUSTERS 2048   /* max clusters to label */
+#define PERC_HIST_LEN 64         /* sparkline history length */
+
+static unsigned short perc_label[MAX_H][MAX_W]; /* cluster label per cell (0=dead) */
+static int   perc_cluster_size[PERC_MAX_CLUSTERS];
+static unsigned short perc_cluster_hue[PERC_MAX_CLUSTERS];
+static int   perc_mode = 0;
+static int   perc_stale = 1;
+static int   perc_n_clusters = 0;       /* total clusters */
+static int   perc_largest_id = 0;       /* index of largest cluster (0-based) */
+static int   perc_largest_size = 0;     /* size of largest cluster */
+static float perc_order_param = 0.0f;   /* P∞ = largest/total_alive */
+static float perc_density = 0.0f;       /* site occupation probability */
+static int   perc_spans_h = 0;          /* largest cluster spans horizontally */
+static int   perc_spans_v = 0;          /* largest cluster spans vertically */
+
+/* Sparkline history */
+static float perc_hist_order[PERC_HIST_LEN];  /* P∞ history */
+static float perc_hist_density[PERC_HIST_LEN]; /* density history */
+static int   perc_hist_idx = 0;
+static int   perc_hist_count = 0;
+
 /* ── Cell Probe Inspector ─────────────────────────────────────────────────── */
 /* Click-to-inspect tool: shows all analysis metrics for a single cell.
    Toggle with '?' key, then click any cell to display its full diagnostic. */
@@ -644,7 +674,7 @@ static int   probe_y = -1;            /* selected cell y */
    Toggle with ')' key. TAB cycles the right panel, '`' cycles the left. */
 
 /* Overlay table: ordered list of analysis overlays for cycling */
-#define N_SPLIT_OVERLAYS 21
+#define N_SPLIT_OVERLAYS 22
 typedef struct {
     const char *name;   /* short display name */
     char key;           /* toggle key character */
@@ -672,6 +702,7 @@ static const SplitOverlayInfo split_overlay_table[N_SPLIT_OVERLAYS] = {
     { "Ergodicity",    '(' },  /* 18 */
     { "Wolfram",       'C' },  /* 19 */
     { "Census",        'v' },  /* 20 */
+    { "Percolation",   '|' },  /* 21 */
 };
 
 static int split_mode = 0;         /* 0=off, 1=on */
@@ -728,6 +759,7 @@ static void split_set_overlay(int idx) {
     surp_mode = 0; mi_mode = 0; cplx_mode = 0; topo_mode = 0;
     rg_mode = 0; kc_mode = 0; corr_mode = 0; eprod_mode = 0;
     wave_mode = 0; vort_mode = 0; ergo_mode = 0; census_mode = 0;
+    perc_mode = 0;
 
     switch (idx) {
         case  0: break;
@@ -751,6 +783,7 @@ static void split_set_overlay(int idx) {
         case 18: ergo_mode = 1; break;
         case 19: wolfram_mode = 1; break;
         case 20: census_mode = 1; break;
+        case 21: perc_mode = 1; break;
     }
 }
 
@@ -775,6 +808,7 @@ static int split_detect_current(void) {
     if (ergo_mode) return 18;
     if (wolfram_mode) return 19;
     if (census_mode) return 20;
+    if (perc_mode) return 21;
     return 0;
 }
 
@@ -1670,6 +1704,7 @@ static void grid_step(void) {
     wave_stale = 1;
     vort_stale = 1;
     ergo_stale = 1;
+    perc_stale = 1;
 
     /* Always record frames for surprise field (cheap memcpy) */
     surp_record_frame();
@@ -2335,6 +2370,7 @@ static void eprod_compute(void);
 static void wave_compute(void);
 static void vort_compute(void);
 static void ergo_compute(void);
+static void perc_compute(void);
 
 static void demo_reset_overlays(void) {
     freq_mode = 0;
@@ -2353,6 +2389,7 @@ static void demo_reset_overlays(void) {
     wave_mode = 0;
     vort_mode = 0;
     ergo_mode = 0;
+    perc_mode = 0;
     fourier_mode = 0;
     fractal_mode = 0;
     wolfram_mode = 0;
@@ -2415,6 +2452,7 @@ static void demo_setup_scene(int idx) {
             case '~': wave_mode = 1; wave_compute(); break;
             case '*': vort_mode = 1; vort_compute(); break;
             case '(': ergo_mode = 1; ergo_compute(); break;
+            case '|': perc_mode = 1; perc_compute(); break;
             case 'h': heatmap_mode = 1; break;
             case 'g': show_graph = 1; break;
         }
@@ -5665,6 +5703,129 @@ static RGB ergo_to_rgb(float dev) {
     }
 }
 
+/* ── Percolation Analysis computation ──────────────────────────────────────── */
+/* Flood-fill live cells into clusters, find largest, detect spanning. */
+static void perc_compute(void) {
+    memset(perc_label, 0, sizeof(unsigned short) * H * MAX_W);
+    memset(perc_cluster_size, 0, sizeof(perc_cluster_size));
+
+    int n_clust = 0;
+    int total_alive = 0;
+
+    /* Phase 1: Label connected clusters via 4-connected BFS */
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            if (grid[y][x] > 0 && perc_label[y][x] == 0) {
+                if (n_clust >= PERC_MAX_CLUSTERS) goto done_perc;
+                n_clust++;
+                unsigned short lbl = (unsigned short)n_clust;
+                /* BFS using topo queue workspace (shared) */
+                int qh = 0, qt = 0;
+                topo_qx[qt] = x; topo_qy[qt] = y; qt++;
+                perc_label[y][x] = lbl;
+                int sz = 0;
+                while (qh < qt) {
+                    int cx = topo_qx[qh], cy = topo_qy[qh]; qh++;
+                    sz++;
+                    const int dx4[4] = {1, -1, 0, 0};
+                    const int dy4[4] = {0, 0, 1, -1};
+                    for (int d = 0; d < 4; d++) {
+                        int nx = cx + dx4[d], ny = cy + dy4[d];
+                        if (nx >= 0 && nx < W && ny >= 0 && ny < H &&
+                            grid[ny][nx] > 0 && perc_label[ny][nx] == 0) {
+                            perc_label[ny][nx] = lbl;
+                            if (qt < TOPO_QUEUE_SIZE) {
+                                topo_qx[qt] = nx; topo_qy[qt] = ny; qt++;
+                            }
+                        }
+                    }
+                }
+                perc_cluster_size[n_clust - 1] = sz;
+                total_alive += sz;
+                /* Golden-ratio hue for visual separation */
+                perc_cluster_hue[n_clust - 1] = (unsigned short)((n_clust * 137) % 360);
+            }
+        }
+    }
+done_perc:
+    perc_n_clusters = n_clust;
+
+    /* Phase 2: Find largest cluster */
+    int largest = 0, largest_id = 0;
+    for (int i = 0; i < n_clust; i++) {
+        if (perc_cluster_size[i] > largest) {
+            largest = perc_cluster_size[i];
+            largest_id = i;
+        }
+    }
+    perc_largest_id = largest_id;
+    perc_largest_size = largest;
+    perc_density = (float)total_alive / (float)(W * H);
+    perc_order_param = total_alive > 0 ? (float)largest / (float)total_alive : 0.0f;
+
+    /* Phase 3: Check if largest cluster spans edge-to-edge */
+    unsigned short span_lbl = (unsigned short)(largest_id + 1);
+    int touch_left = 0, touch_right = 0, touch_top = 0, touch_bottom = 0;
+    for (int y = 0; y < H; y++) {
+        if (perc_label[y][0] == span_lbl) touch_left = 1;
+        if (perc_label[y][W - 1] == span_lbl) touch_right = 1;
+    }
+    for (int x = 0; x < W; x++) {
+        if (perc_label[0][x] == span_lbl) touch_top = 1;
+        if (perc_label[H - 1][x] == span_lbl) touch_bottom = 1;
+    }
+    perc_spans_h = touch_left && touch_right;
+    perc_spans_v = touch_top && touch_bottom;
+
+    /* Record sparkline history */
+    perc_hist_order[perc_hist_idx] = perc_order_param;
+    perc_hist_density[perc_hist_idx] = perc_density;
+    perc_hist_idx = (perc_hist_idx + 1) % PERC_HIST_LEN;
+    if (perc_hist_count < PERC_HIST_LEN) perc_hist_count++;
+
+    perc_stale = 0;
+}
+
+/* Percolation cluster to RGB:
+   Largest cluster → gold/amber
+   Other clusters → hue by ID (dimmer, scaled by relative size)
+   Dead cells → black */
+static RGB perc_cluster_rgb(int cluster_idx) {
+    if (cluster_idx < 0 || cluster_idx >= PERC_MAX_CLUSTERS)
+        return (RGB){30, 30, 30};
+
+    /* Largest cluster: bright gold */
+    if (cluster_idx == perc_largest_id) {
+        return (RGB){255, 200, 40};
+    }
+
+    /* Other clusters: HSV coloring, brightness scaled by relative size */
+    int hue = perc_cluster_hue[cluster_idx];
+    float rel = perc_largest_size > 0
+        ? (float)perc_cluster_size[cluster_idx] / (float)perc_largest_size
+        : 0.1f;
+    float v = 0.3f + 0.5f * rel; /* brightness: 0.3 (tiny) to 0.8 (near-largest) */
+    if (v > 0.8f) v = 0.8f;
+    float s = 0.7f;
+
+    float h = hue / 60.0f;
+    int hi = (int)h % 6;
+    float f = h - (int)h;
+    float p = v * (1.0f - s);
+    float q = v * (1.0f - s * f);
+    float t = v * (1.0f - s * (1.0f - f));
+    float r, g, b;
+    switch (hi) {
+        case 0: r = v; g = t; b = p; break;
+        case 1: r = q; g = v; b = p; break;
+        case 2: r = p; g = v; b = t; break;
+        case 3: r = p; g = q; b = v; break;
+        case 4: r = t; g = p; b = v; break;
+        default: r = v; g = p; b = q; break;
+    }
+    return (RGB){(unsigned char)(r * 255), (unsigned char)(g * 255), (unsigned char)(b * 255)};
+}
+
 /* ── Wave Mechanics computation ───────────────────────────────────────────── */
 /* Damped 2D wave equation: d²u/dt² = c²∇²u - γ du/dt + S(x,y,t)
    where S = impulses from cell births (+) and deaths (-).
@@ -6173,6 +6334,7 @@ static void split_ensure_computed(int idx) {
         case 18: if (ergo_stale) ergo_compute(); break;
         case 19: if (wolfram_stale) wolfram_classify(); break;
         case 20: if (census_stale) census_scan(); break;
+        case 21: if (perc_stale) perc_compute(); break;
         default: break;
     }
 }
@@ -7759,6 +7921,16 @@ static int cell_color(int x, int y, RGB *out) {
         return 0;
     }
 
+    /* Percolation analysis overlay: cluster connectivity */
+    if (perc_mode) {
+        unsigned short lbl = perc_label[y][x];
+        if (lbl > 0) {
+            *out = perc_cluster_rgb(lbl - 1);
+            return grid[y][x] ? 1 : 28; /* 28 = percolation ghost */
+        }
+        return 0;
+    }
+
     /* Renormalization group flow overlay: multi-scale structure */
     if (rg_mode) {
         if (grid[y][x]) {
@@ -8263,6 +8435,7 @@ static void render(int running, int speed_ms, int draw_mode) {
     int split_saved_surp, split_saved_mi, split_saved_cplx, split_saved_topo;
     int split_saved_rg, split_saved_kc, split_saved_corr, split_saved_eprod;
     int split_saved_wave, split_saved_vort, split_saved_ergo, split_saved_census;
+    int split_saved_perc;
     int split_mid = view_w / 2; /* column divider position */
 
     if (split_mode) {
@@ -8277,6 +8450,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         split_saved_corr = corr_mode; split_saved_eprod = eprod_mode;
         split_saved_wave = wave_mode; split_saved_vort = vort_mode;
         split_saved_ergo = ergo_mode; split_saved_census = census_mode;
+        split_saved_perc = perc_mode;
 
         /* Ensure data is computed for both panels */
         split_ensure_computed(split_left);
@@ -8365,6 +8539,7 @@ static void render(int running, int speed_ms, int draw_mode) {
             corr_mode = split_saved_corr; eprod_mode = split_saved_eprod;
             wave_mode = split_saved_wave; vort_mode = split_saved_vort;
             ergo_mode = split_saved_ergo; census_mode = split_saved_census;
+            perc_mode = split_saved_perc;
         } else {
         /* Normal (non-split) rendering */
         for (int row = 0; row < usable_rows && row < view_h; row++) {
@@ -11405,6 +11580,182 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", erst);
     }
 
+    /* ── Percolation Analysis overlay panel ─────────────────────────────── */
+    if (perc_mode) {
+        int pc_w = 46;
+        int pc_col = term_cols - pc_w - 2;
+        int pc_row = 3;
+        if (entropy_mode)   pc_row += 8;
+        if (temp_mode)      pc_row += 9;
+        if (lyapunov_mode)  pc_row += 8;
+        if (fourier_mode)   pc_row += 18;
+        if (fractal_mode)   pc_row += 11;
+        if (wolfram_mode)   pc_row += 14;
+        if (flow_mode)      pc_row += 9;
+        if (attractor_mode) pc_row += 8;
+        if (cone_mode >= 1) pc_row += 8;
+        if (surp_mode)      pc_row += 8;
+        if (mi_mode)        pc_row += 12;
+        if (cplx_mode)      pc_row += 11;
+        if (topo_mode)      pc_row += 11;
+        if (rg_mode)        pc_row += 11;
+        if (kc_mode)        pc_row += 9;
+        if (corr_mode)      pc_row += 9;
+        if (eprod_mode)     pc_row += 9;
+        if (vort_mode)      pc_row += 9;
+        if (wave_mode)      pc_row += 9;
+        if (ergo_mode)      pc_row += 10;
+        if (pc_col < 1) pc_col = 1;
+
+        const char *pcbdr = "\033[38;2;255;200;40;48;2;14;12;6m";
+        const char *pcbg  = "\033[48;2;14;12;6m";
+        const char *pcrst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 \xe2\x8a\xb6 Percolation Analysis ",
+                     pc_row, pc_col, pcbdr);
+        for (int i = 27; i < pc_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", pcrst);
+
+        /* Row 1: Density & clusters */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     pc_row + 1, pc_col, pcbdr, pcbg);
+        p += sprintf(p, " \033[38;2;200;180;80m\xcf\x81=");
+        /* Color density relative to critical threshold ~0.593 */
+        if (perc_density > 0.58f)
+            p += sprintf(p, "\033[1;38;2;255;200;40m%.3f", perc_density);
+        else if (perc_density > 0.45f)
+            p += sprintf(p, "\033[38;2;200;200;100m%.3f", perc_density);
+        else
+            p += sprintf(p, "\033[38;2;120;120;140m%.3f", perc_density);
+        p += sprintf(p, "\033[0;38;2;140;120;70m%s  clusters:", pcbg);
+        p += sprintf(p, "\033[38;2;200;180;120m%d", perc_n_clusters);
+        p += sprintf(p, "%s", pcbg);
+        { int used = 32; for (int i = used; i < pc_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", pcbdr, pcrst);
+
+        /* Row 2: Order parameter P∞ & largest cluster */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     pc_row + 2, pc_col, pcbdr, pcbg);
+        p += sprintf(p, " \033[38;2;200;180;80mP\xe2\x88\x9e=");
+        if (perc_order_param > 0.5f)
+            p += sprintf(p, "\033[1;38;2;255;200;40m%.3f", perc_order_param);
+        else if (perc_order_param > 0.2f)
+            p += sprintf(p, "\033[38;2;200;180;80m%.3f", perc_order_param);
+        else
+            p += sprintf(p, "\033[38;2;120;100;80m%.3f", perc_order_param);
+        p += sprintf(p, "\033[0;38;2;140;120;70m%s  max:", pcbg);
+        p += sprintf(p, "\033[38;2;255;200;40m%d", perc_largest_size);
+        p += sprintf(p, "%s", pcbg);
+        { int used = 30; for (int i = used; i < pc_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", pcbdr, pcrst);
+
+        /* Row 3: Spanning status */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     pc_row + 3, pc_col, pcbdr, pcbg);
+        p += sprintf(p, " \033[38;2;140;120;70mSpans:");
+        if (perc_spans_h && perc_spans_v)
+            p += sprintf(p, " \033[1;38;2;255;220;60mH+V \xe2\x9c\x93 PERCOLATES");
+        else if (perc_spans_h)
+            p += sprintf(p, " \033[38;2;200;200;80mH \xe2\x9c\x93  V \xe2\x9c\x97");
+        else if (perc_spans_v)
+            p += sprintf(p, " \033[38;2;200;200;80mH \xe2\x9c\x97  V \xe2\x9c\x93");
+        else
+            p += sprintf(p, " \033[38;2;100;80;60mno spanning cluster");
+        p += sprintf(p, "%s", pcbg);
+        { int used = 32; for (int i = used; i < pc_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", pcbdr, pcrst);
+
+        /* Row 4: Color legend — gold (largest) → spectrum (others) */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     pc_row + 4, pc_col, pcbdr, pcbg);
+        p += sprintf(p, " \033[38;2;255;200;40m\xe2\x96\x88\xe2\x96\x88");
+        p += sprintf(p, "\033[38;2;160;140;80mlargest  ");
+        /* Show a rainbow of cluster hues */
+        for (int i = 0; i < 20; i++) {
+            int hue = (i * 18) % 360;
+            float h = hue / 60.0f;
+            int hi = (int)h % 6;
+            float f = h - (int)h;
+            float sv = 0.7f, vv = 0.7f;
+            float pp2 = vv * (1.0f - sv);
+            float qq = vv * (1.0f - sv * f);
+            float tt = vv * (1.0f - sv * (1.0f - f));
+            int cr, cg, cb;
+            switch (hi) {
+                case 0: cr=(int)(vv*255); cg=(int)(tt*255); cb=(int)(pp2*255); break;
+                case 1: cr=(int)(qq*255); cg=(int)(vv*255); cb=(int)(pp2*255); break;
+                case 2: cr=(int)(pp2*255); cg=(int)(vv*255); cb=(int)(tt*255); break;
+                case 3: cr=(int)(pp2*255); cg=(int)(qq*255); cb=(int)(vv*255); break;
+                case 4: cr=(int)(tt*255); cg=(int)(pp2*255); cb=(int)(vv*255); break;
+                default: cr=(int)(vv*255); cg=(int)(pp2*255); cb=(int)(qq*255); break;
+            }
+            p += sprintf(p, "\033[38;2;%d;%d;%dm\xe2\x96\x88", cr, cg, cb);
+        }
+        p += sprintf(p, "%s", pcbg);
+        { int used = 33; for (int i = used; i < pc_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", pcbdr, pcrst);
+
+        /* Row 5: P∞ sparkline */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     pc_row + 5, pc_col, pcbdr, pcbg);
+        p += sprintf(p, " \033[38;2;140;120;60mP\xe2\x88\x9e ");
+        if (perc_hist_count > 1) {
+            const char *spark_chars[] = {"\xe2\x96\x81","\xe2\x96\x82","\xe2\x96\x83",
+                                         "\xe2\x96\x84","\xe2\x96\x85","\xe2\x96\x86",
+                                         "\xe2\x96\x87","\xe2\x96\x88"};
+            int n = perc_hist_count < 30 ? perc_hist_count : 30;
+            for (int i = 0; i < n; i++) {
+                int idx = (perc_hist_idx - n + i + PERC_HIST_LEN) % PERC_HIST_LEN;
+                float v = perc_hist_order[idx];
+                if (v > 1.0f) v = 1.0f;
+                if (v < 0.0f) v = 0.0f;
+                int lvl = (int)(v * 7.0f);
+                if (lvl > 7) lvl = 7;
+                if (lvl < 0) lvl = 0;
+                if (v > 0.5f) p += sprintf(p, "\033[38;2;255;200;40m%s", spark_chars[lvl]);
+                else if (v > 0.2f) p += sprintf(p, "\033[38;2;200;160;60m%s", spark_chars[lvl]);
+                else p += sprintf(p, "\033[38;2;100;80;50m%s", spark_chars[lvl]);
+            }
+        }
+        p += sprintf(p, "%s", pcbg);
+        { int used = 3 + (perc_hist_count < 30 ? perc_hist_count : 30);
+          for (int i = used; i < pc_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", pcbdr, pcrst);
+
+        /* Row 6: Phase classification */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     pc_row + 6, pc_col, pcbdr, pcbg);
+        p += sprintf(p, " \033[38;2;140;120;70mPhase: ");
+        if (perc_density < 0.01f)
+            p += sprintf(p, "\033[38;2;80;80;80mEmpty");
+        else if (perc_spans_h && perc_spans_v)
+            p += sprintf(p, "\033[1;38;2;255;220;40mSupercritical (percolating)");
+        else if (perc_density > 0.55f)
+            p += sprintf(p, "\033[38;2;220;180;60mNear-critical");
+        else if (perc_density > 0.35f)
+            p += sprintf(p, "\033[38;2;180;140;80mSubcritical (fragmented)");
+        else
+            p += sprintf(p, "\033[38;2;120;100;80mDilute (isolated clusters)");
+        p += sprintf(p, "%s", pcbg);
+        { int used = 40; for (int i = used; i < pc_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", pcbdr, pcrst);
+
+        /* Row 7: Toggle hint */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     pc_row + 7, pc_col, pcbdr, pcbg);
+        p += sprintf(p, " \033[38;2;100;80;50m[|]toggle  p_c\xe2\x89\x88" "0.593 (square)");
+        { int used = 36; for (int i = used; i < pc_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", pcbdr, pcrst);
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", pc_row + 8, pc_col, pcbdr);
+        for (int i = 0; i < pc_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", pcrst);
+    }
+
     /* ── Cell Probe Inspector overlay panel ──────────────────────────────── */
     if (probe_mode == 2 && probe_x >= 0 && probe_x < W && probe_y >= 0 && probe_y < H) {
         int pp_w = 48;
@@ -12451,6 +12802,12 @@ int main(int argc, char **argv) {
                 ergo_compute(); /* compute on toggle-on */
             }
         }
+        else if (key == '|') {
+            perc_mode = !perc_mode;
+            if (perc_mode) {
+                perc_compute(); /* compute on toggle-on */
+            }
+        }
         else if (key == ')') {
             split_mode = !split_mode;
             if (split_mode) {
@@ -12998,6 +13355,11 @@ int main(int argc, char **argv) {
         /* Auto-refresh ergodicity metric every 2 generations */
         if (ergo_mode && ergo_stale && (generation % 2 == 0 || !running)) {
             ergo_compute();
+        }
+
+        /* Auto-refresh percolation analysis every 2 generations */
+        if (perc_mode && perc_stale && (generation % 2 == 0 || !running)) {
+            perc_compute();
         }
 
         /* Auto-refresh wave mechanics every generation (continuous propagation) */

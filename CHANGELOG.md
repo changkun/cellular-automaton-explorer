@@ -1,8 +1,19 @@
 # Changelog
 
 Development history organized by round. Each round adds one or two major
-features. The project grew from ~790 lines (Round 1) to ~13,013 lines
-(Round 48).
+features. The project grew from ~790 lines (Round 1) to ~13,375 lines
+(Round 49).
+
+## Round 49 — Percolation Analysis Overlay
+
+Cluster connectivity analysis via flood fill. Toggle with `|` — colors
+each connected cluster uniquely with the largest cluster highlighted in
+gold. Detects spanning clusters (edge-to-edge connectivity in H/V
+directions) and displays percolation order parameter P∞ (fraction of
+cells in largest cluster). Sidebar shows density relative to the square
+lattice critical threshold p_c ≈ 0.593, spanning status, P∞ sparkline,
+and phase classification (Supercritical/Near-critical/Subcritical/Dilute).
+Full split-screen support as overlay index 21. +362 lines.
 
 ## Round 48 — Split-Screen Dual Overlay Comparison
 

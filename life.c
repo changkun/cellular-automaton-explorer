@@ -108,6 +108,9 @@
  *                 Auto-pause mode halts simulation on critical events (>3.5σ)
  *                 Tracks connected components across frames, computes velocities
  *                 Blue=still, green=slow, yellow=medium, red=fast
+ *   3           Toggle early warning overlay (critical slowing down detector)
+ *                 Monitors 16 metrics for rising autocorrelation & variance
+ *                 Green=stable, yellow=caution, red=imminent transition
  *   K           Toggle spacetime kymograph (1D slice through time)
  *                 Y-axis=time (scrolling up), X-axis=space (scan row)
  *                 Arrow Up/Down to move scan row; gliders appear as diagonals
@@ -1041,7 +1044,7 @@ static int   probe_y = -1;            /* selected cell y */
    Toggle with '\\' key. TAB cycles the right panel, '`' cycles the left. */
 
 /* Overlay table: ordered list of analysis overlays for cycling */
-#define N_SPLIT_OVERLAYS 31
+#define N_SPLIT_OVERLAYS 32
 typedef struct {
     const char *name;   /* short display name */
     char key;           /* toggle key character */
@@ -1079,6 +1082,7 @@ static const SplitOverlayInfo split_overlay_table[N_SPLIT_OVERLAYS] = {
     { "Coherence",    '`'  },  /* 28 */
     { "CausalEmrg",   ')'  },  /* 29 */
     { "PowerSpec",     '6'  },  /* 30 */
+    { "EarlyWarn",    '3'  },  /* 31 */
 };
 
 static int split_mode = 0;         /* 0=off, 1=on */
@@ -1237,6 +1241,55 @@ static int   ce_hist_count = 0;
 
 static void  ce_compute(void);
 
+/* ── Early Warning Signals (Critical Slowing Down) ─────────────────────── */
+/* Monitors all 16 metrics for signs of impending phase transitions using
+   classical early warning signals: rising lag-1 autocorrelation (AC1),
+   variance amplification, and Kendall-tau trend detection.
+   Toggle with '3' key. */
+
+#define EW_WINDOW  128   /* sliding window for statistics */
+#define EW_N       PP_N_METRICS
+#define EW_HIST_LEN 64   /* sparkline history of warning index */
+
+static int   ew_mode = 0;           /* 0=off, 1=on */
+static float ew_buf[EW_WINDOW][EW_N]; /* ring buffer of metric snapshots */
+static int   ew_head = 0;
+static int   ew_count = 0;
+static float ew_ac1[EW_N];          /* lag-1 autocorrelation per metric */
+static float ew_variance[EW_N];     /* variance per metric */
+static float ew_ac1_trend[EW_N];    /* Kendall-tau of AC1 over rolling windows */
+static float ew_var_trend[EW_N];    /* Kendall-tau of variance over rolling windows */
+static float ew_warning[EW_N];      /* composite warning level per metric [0,1] */
+static float ew_global_warning = 0.0f;  /* max warning across all metrics */
+static int   ew_top_metric = 0;     /* metric with highest warning */
+static float ew_hist[EW_HIST_LEN];  /* sparkline of global warning */
+static int   ew_hist_idx = 0;
+static int   ew_hist_count = 0;
+static int   ew_stale = 1;
+
+/* Per-cell warning grid: based on local variance of entropy grid */
+static float ew_grid[MAX_H][MAX_W];
+
+static void ew_record(void);
+static void ew_compute(void);
+static void ew_reset(void) {
+    ew_head = 0;
+    ew_count = 0;
+    ew_hist_idx = 0;
+    ew_hist_count = 0;
+    ew_global_warning = 0.0f;
+    ew_top_metric = 0;
+    ew_stale = 1;
+    for (int i = 0; i < EW_N; i++) {
+        ew_ac1[i] = 0.0f;
+        ew_variance[i] = 0.0f;
+        ew_ac1_trend[i] = 0.0f;
+        ew_var_trend[i] = 0.0f;
+        ew_warning[i] = 0.0f;
+    }
+    memset(ew_grid, 0, sizeof(float) * MAX_H * MAX_W);
+}
+
 /* ── Anomaly Detector ─────────────────────────────────────────────────────── */
 /* Real-time watchdog that monitors all 16 scalar metrics for statistical
    anomalies.  Maintains running mean and variance (Welford's algorithm) over
@@ -1302,6 +1355,7 @@ static void split_set_overlay(int idx) {
     pt_mode = 0;
     coh_mode = 0;
     ce_mode = 0;
+    ew_mode = 0;
 
     switch (idx) {
         case  0: break;
@@ -1335,6 +1389,7 @@ static void split_set_overlay(int idx) {
         case 28: coh_mode = 1; break;
         case 29: ce_mode = 1; break;
         case 30: ps_mode = 1; break;
+        case 31: ew_mode = 1; break;
     }
 }
 
@@ -1369,6 +1424,7 @@ static int split_detect_current(void) {
     if (coh_mode) return 28;
     if (ce_mode) return 29;
     if (ps_mode) return 30;
+    if (ew_mode) return 31;
     return 0;
 }
 
@@ -1720,6 +1776,15 @@ static void ad_record(void) {
             }
         }
     }
+}
+
+/* ── Early Warning Signals: ew_record (ew_compute defined later after timeline) ── */
+static void ew_record(void) {
+    for (int i = 0; i < EW_N; i++)
+        ew_buf[ew_head][i] = pp_read_metric(i);
+    ew_head = (ew_head + 1) % EW_WINDOW;
+    if (ew_count < EW_WINDOW) ew_count++;
+    ew_stale = 1;
 }
 
 /* ── Metric Correlation Matrix implementations ────────────────────────────── */
@@ -2688,6 +2753,7 @@ static void grid_step(void) {
     pt_stale = 1;
     coh_stale = 1;
     ce_stale = 1;
+    ew_stale = 1;
 
     /* Always record frames for surprise field (cheap memcpy) */
     surp_record_frame();
@@ -3560,6 +3626,7 @@ static void demo_reset_overlays(void) {
     sa_mode = 0;
     coh_mode = 0;
     ce_mode = 0;
+    ew_mode = 0;
     fourier_mode = 0;
     fractal_mode = 0;
     wolfram_mode = 0;
@@ -7063,6 +7130,194 @@ static void coh_compute(void) {
     coh_stale = 0;
 }
 
+/* ── Early Warning Signals computation ─────────────────────────────────────── */
+static void ew_compute(void) {
+    if (ew_count < 16) return;
+    ew_stale = 0;
+    int n = ew_count;
+
+    /* For each metric, compute AC1 and variance over the full window */
+    for (int m = 0; m < EW_N; m++) {
+        /* Compute mean */
+        double sum = 0.0;
+        for (int k = 0; k < n; k++) {
+            int idx = (ew_head - n + k + EW_WINDOW) % EW_WINDOW;
+            sum += ew_buf[idx][m];
+        }
+        double mean = sum / n;
+
+        /* Compute variance and lag-1 autocovariance */
+        double var = 0.0, cov1 = 0.0;
+        for (int k = 0; k < n; k++) {
+            int idx = (ew_head - n + k + EW_WINDOW) % EW_WINDOW;
+            double d = ew_buf[idx][m] - mean;
+            var += d * d;
+            if (k > 0) {
+                int prev = (ew_head - n + k - 1 + EW_WINDOW) % EW_WINDOW;
+                double dp = ew_buf[prev][m] - mean;
+                cov1 += d * dp;
+            }
+        }
+        var /= n;
+        cov1 /= (n - 1);
+
+        ew_variance[m] = (float)var;
+        ew_ac1[m] = (var > 1e-12) ? (float)(cov1 / var) : 0.0f;
+        if (ew_ac1[m] > 1.0f) ew_ac1[m] = 1.0f;
+        if (ew_ac1[m] < -1.0f) ew_ac1[m] = -1.0f;
+    }
+
+    /* Compute Kendall-tau trends using rolling sub-windows.
+       Split the buffer into 8 overlapping sub-windows, compute AC1 and variance
+       for each, then check if they're trending upward (positive Kendall-tau). */
+    #define EW_NSUB 8
+    if (n >= 32) {
+        int sub_len = n / EW_NSUB;
+        if (sub_len < 8) sub_len = 8;
+
+        float sub_ac1[EW_NSUB];
+        float sub_var[EW_NSUB];
+
+        for (int m = 0; m < EW_N; m++) {
+            /* Compute AC1 and variance for each sub-window */
+            for (int s = 0; s < EW_NSUB; s++) {
+                int start = (n * s) / EW_NSUB;
+                int end = start + sub_len;
+                if (end > n) end = n;
+                int sn = end - start;
+                if (sn < 4) { sub_ac1[s] = 0; sub_var[s] = 0; continue; }
+
+                double sm = 0.0;
+                for (int k = start; k < end; k++) {
+                    int idx = (ew_head - n + k + EW_WINDOW) % EW_WINDOW;
+                    sm += ew_buf[idx][m];
+                }
+                double smean = sm / sn;
+
+                double sv = 0.0, sc = 0.0;
+                for (int k = start; k < end; k++) {
+                    int idx = (ew_head - n + k + EW_WINDOW) % EW_WINDOW;
+                    double d = ew_buf[idx][m] - smean;
+                    sv += d * d;
+                    if (k > start) {
+                        int prev = (ew_head - n + k - 1 + EW_WINDOW) % EW_WINDOW;
+                        double dp = ew_buf[prev][m] - smean;
+                        sc += d * dp;
+                    }
+                }
+                sv /= sn;
+                sc /= (sn - 1);
+                sub_var[s] = (float)sv;
+                sub_ac1[s] = (sv > 1e-12) ? (float)(sc / sv) : 0.0f;
+            }
+
+            /* Kendall-tau: count concordant vs discordant pairs */
+            int conc_ac = 0, disc_ac = 0;
+            int conc_var = 0, disc_var = 0;
+            for (int i = 0; i < EW_NSUB - 1; i++) {
+                for (int j = i + 1; j < EW_NSUB; j++) {
+                    if (sub_ac1[j] > sub_ac1[i]) conc_ac++;
+                    else if (sub_ac1[j] < sub_ac1[i]) disc_ac++;
+                    if (sub_var[j] > sub_var[i]) conc_var++;
+                    else if (sub_var[j] < sub_var[i]) disc_var++;
+                }
+            }
+            int npairs = EW_NSUB * (EW_NSUB - 1) / 2;
+            ew_ac1_trend[m] = (float)(conc_ac - disc_ac) / (float)npairs;
+            ew_var_trend[m] = (float)(conc_var - disc_var) / (float)npairs;
+
+            /* Composite warning: combine AC1, variance trend, and AC1 trend.
+               High AC1 (>0.7) + rising trend = strong warning. */
+            float w = 0.0f;
+            /* AC1 component: 0 when ac1<0.3, 1 when ac1>=0.9 */
+            float ac_comp = (ew_ac1[m] - 0.3f) / 0.6f;
+            if (ac_comp < 0) ac_comp = 0;
+            if (ac_comp > 1) ac_comp = 1;
+            w += ac_comp * 0.4f;
+
+            /* AC1 trend component: positive trend = warning */
+            float at_comp = (ew_ac1_trend[m] + 1.0f) / 2.0f;  /* map [-1,1] -> [0,1] */
+            if (at_comp > 1) at_comp = 1;
+            if (at_comp < 0) at_comp = 0;
+            w += at_comp * 0.3f;
+
+            /* Variance trend component: rising variance = warning */
+            float vt_comp = (ew_var_trend[m] + 1.0f) / 2.0f;
+            if (vt_comp > 1) vt_comp = 1;
+            if (vt_comp < 0) vt_comp = 0;
+            w += vt_comp * 0.3f;
+
+            ew_warning[m] = w;
+        }
+    } else {
+        /* Not enough data for trends, use AC1 alone */
+        for (int m = 0; m < EW_N; m++) {
+            float ac_comp = (ew_ac1[m] - 0.3f) / 0.6f;
+            if (ac_comp < 0) ac_comp = 0;
+            if (ac_comp > 1) ac_comp = 1;
+            ew_warning[m] = ac_comp * 0.5f;
+        }
+    }
+    #undef EW_NSUB
+
+    /* Find global max warning and top metric */
+    ew_global_warning = 0.0f;
+    ew_top_metric = 0;
+    for (int m = 0; m < EW_N; m++) {
+        if (ew_warning[m] > ew_global_warning) {
+            ew_global_warning = ew_warning[m];
+            ew_top_metric = m;
+        }
+    }
+
+    /* Record sparkline history */
+    ew_hist[ew_hist_idx] = ew_global_warning;
+    ew_hist_idx = (ew_hist_idx + 1) % EW_HIST_LEN;
+    if (ew_hist_count < EW_HIST_LEN) ew_hist_count++;
+
+    /* Per-cell warning grid: local variance of recent cell states (from timeline).
+       Regions with rising local variance are approaching transition. */
+    {
+        int frames_avail = tl_len < 32 ? tl_len : 32;
+        if (frames_avail >= 8) {
+            for (int y = 0; y < H; y++) {
+                for (int x = 0; x < W; x++) {
+                    /* Compute local variance of cell state over recent frames */
+                    double csum = 0.0, csum2 = 0.0;
+                    for (int f = 0; f < frames_avail; f++) {
+                        int fi = (tl_head - 1 - f + TL_MAX) % TL_MAX;
+                        double v = timeline[fi].grid[y][x] > 0 ? 1.0 : 0.0;
+                        csum += v;
+                        csum2 += v * v;
+                    }
+                    double cmean = csum / frames_avail;
+                    double cvar = csum2 / frames_avail - cmean * cmean;
+                    /* Max variance for binary signal is 0.25 (p=0.5) */
+                    /* Also compute AC1 for the cell */
+                    double ccov = 0.0;
+                    for (int f = 0; f < frames_avail - 1; f++) {
+                        int fi = (tl_head - 1 - f + TL_MAX) % TL_MAX;
+                        int fi2 = (tl_head - 2 - f + TL_MAX) % TL_MAX;
+                        double v1 = timeline[fi].grid[y][x] > 0 ? 1.0 : 0.0;
+                        double v2 = timeline[fi2].grid[y][x] > 0 ? 1.0 : 0.0;
+                        ccov += (v1 - cmean) * (v2 - cmean);
+                    }
+                    ccov /= (frames_avail - 1);
+                    float cell_ac1 = (cvar > 1e-8) ? (float)(ccov / cvar) : 0.0f;
+                    if (cell_ac1 > 1.0f) cell_ac1 = 1.0f;
+                    if (cell_ac1 < 0.0f) cell_ac1 = 0.0f;
+                    /* Warning = combination of high variance + high AC1 */
+                    float cell_w = (float)(cvar / 0.25) * 0.5f + cell_ac1 * 0.5f;
+                    if (cell_w > 1.0f) cell_w = 1.0f;
+                    ew_grid[y][x] = cell_w;
+                }
+            }
+        } else {
+            memset(ew_grid, 0, sizeof(float) * MAX_H * MAX_W);
+        }
+    }
+}
+
 /* ── Causal Emergence computation ──────────────────────────────────────────── */
 /* Color mapping: scale 0 (micro best) = cool blue,
    scale 1 (2x2) = green, scale 2 (4x4) = warm orange,
@@ -8351,6 +8606,7 @@ static void split_ensure_computed(int idx) {
         case 27: if (pt_stale) pt_compute(); break;
         case 28: if (coh_stale) coh_compute(); break;
         case 29: if (ce_stale) ce_compute(); break;
+        case 31: if (ew_stale && ew_count >= 16) ew_compute(); break;
         default: break;
     }
 }
@@ -9964,6 +10220,46 @@ static int cell_color(int x, int y, RGB *out) {
                 out->b = (unsigned char)(out->b < 200 ? out->b + 55 : 255);
             }
             return grid[y][x] ? 1 : 30; /* 30 = causal emergence ghost */
+        }
+        return 0;
+    }
+
+    /* Early warning overlay: critical slowing down signals */
+    if (ew_mode) {
+        float w = ew_grid[y][x];
+        if (w > 0.01f || grid[y][x]) {
+            /* Green (safe) -> Yellow (caution) -> Orange (warning) -> Red (critical) */
+            unsigned char r, g, b;
+            if (w < 0.25f) {
+                float t = w * 4.0f;
+                r = (unsigned char)(20 + 40 * t);
+                g = (unsigned char)(80 + 120 * t);
+                b = (unsigned char)(40 - 20 * t);
+            } else if (w < 0.5f) {
+                float t = (w - 0.25f) * 4.0f;
+                r = (unsigned char)(60 + 140 * t);
+                g = (unsigned char)(200 - 20 * t);
+                b = (unsigned char)(20 - 10 * t);
+            } else if (w < 0.75f) {
+                float t = (w - 0.5f) * 4.0f;
+                r = (unsigned char)(200 + 55 * t);
+                g = (unsigned char)(180 - 130 * t);
+                b = (unsigned char)(10);
+            } else {
+                float t = (w - 0.75f) * 4.0f;
+                if (t > 1.0f) t = 1.0f;
+                r = 255;
+                g = (unsigned char)(50 - 30 * t);
+                b = (unsigned char)(10 + 50 * t);
+            }
+            /* Boost alive cells */
+            if (grid[y][x]) {
+                r = (unsigned char)(r < 200 ? r + 55 : 255);
+                g = (unsigned char)(g < 200 ? g + 55 : 255);
+                b = (unsigned char)(b < 200 ? b + 55 : 255);
+            }
+            out->r = r; out->g = g; out->b = b;
+            return grid[y][x] ? 1 : 31;
         }
         return 0;
     }
@@ -14290,6 +14586,225 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", cerst);
     }
 
+    /* ── Early Warning Signals overlay panel ──────────────────────────── */
+    if (ew_mode) {
+        int ew_w = 50;
+        int ew_col = term_cols - ew_w - 2;
+        int ew_row = 3;
+        if (entropy_mode)   ew_row += 8;
+        if (temp_mode)      ew_row += 9;
+        if (lyapunov_mode)  ew_row += 8;
+        if (fourier_mode)   ew_row += 18;
+        if (fractal_mode)   ew_row += 11;
+        if (wolfram_mode)   ew_row += 14;
+        if (flow_mode)      ew_row += 9;
+        if (attractor_mode) ew_row += 8;
+        if (cone_mode >= 1) ew_row += 8;
+        if (surp_mode)      ew_row += 8;
+        if (mi_mode)        ew_row += 12;
+        if (cplx_mode)      ew_row += 11;
+        if (topo_mode)      ew_row += 11;
+        if (rg_mode)        ew_row += 11;
+        if (kc_mode)        ew_row += 9;
+        if (corr_mode)      ew_row += 9;
+        if (eprod_mode)     ew_row += 9;
+        if (vort_mode)      ew_row += 9;
+        if (wave_mode)      ew_row += 9;
+        if (ergo_mode)      ew_row += 10;
+        if (coh_mode)       ew_row += 8;
+        if (ce_mode)        ew_row += 9;
+        if (ew_mode)        ew_row += 10;
+        if (ew_col < 1) ew_col = 1;
+
+        const char *ewbdr = "\033[38;2;220;180;40;48;2;12;8;2m";  /* amber border */
+        const char *ewbg  = "\033[48;2;12;8;2m";
+        const char *ewrst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 \xe2\x9a\xa0 Early Warning Signals ",
+                     ew_row, ew_col, ewbdr);
+        for (int i = 25; i < ew_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", ewrst);
+
+        /* Row 1: Global warning level with color coding */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ew_row + 1, ew_col, ewbdr, ewbg);
+        p += sprintf(p, " \033[38;2;220;180;60mWarning:");
+        if (ew_global_warning > 0.7f)
+            p += sprintf(p, "\033[1;38;2;255;60;40m%.3f", ew_global_warning);
+        else if (ew_global_warning > 0.4f)
+            p += sprintf(p, "\033[38;2;255;180;40m%.3f", ew_global_warning);
+        else
+            p += sprintf(p, "\033[38;2;80;200;80m%.3f", ew_global_warning);
+        p += sprintf(p, "\033[0m%s\033[38;2;160;140;50m  samples:%d/%d",
+                     ewbg, ew_count, EW_WINDOW);
+        p += sprintf(p, "%s", ewbg);
+        { int used = 36; for (int i = used; i < ew_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", ewbdr, ewrst);
+
+        /* Row 2: Top alerting metric */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ew_row + 2, ew_col, ewbdr, ewbg);
+        p += sprintf(p, " \033[38;2;160;140;50mTop: ");
+        if (ew_count >= 16) {
+            p += sprintf(p, "\033[38;2;220;200;80m%-8s", pp_metric_table[ew_top_metric].name);
+            p += sprintf(p, "\033[38;2;160;140;50m AC1:");
+            if (ew_ac1[ew_top_metric] > 0.7f)
+                p += sprintf(p, "\033[1;38;2;255;80;40m%.2f", ew_ac1[ew_top_metric]);
+            else
+                p += sprintf(p, "\033[38;2;180;180;80m%.2f", ew_ac1[ew_top_metric]);
+            p += sprintf(p, "\033[38;2;160;140;50m w:");
+            p += sprintf(p, "\033[38;2;220;180;60m%.2f", ew_warning[ew_top_metric]);
+        } else {
+            p += sprintf(p, "\033[38;2;100;80;40m(collecting data...)     ");
+        }
+        p += sprintf(p, "%s", ewbg);
+        { int used = 40; for (int i = used; i < ew_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", ewbdr, ewrst);
+
+        /* Row 3: Bar chart of AC1 for top 4 most-warned metrics */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ew_row + 3, ew_col, ewbdr, ewbg);
+        p += sprintf(p, " ");
+        if (ew_count >= 16) {
+            /* Find top 4 by warning level */
+            int top4[4] = {0, 1, 2, 3};
+            for (int m = 0; m < EW_N; m++) {
+                for (int t = 0; t < 4; t++) {
+                    if (ew_warning[m] > ew_warning[top4[t]]) {
+                        for (int u = 3; u > t; u--) top4[u] = top4[u-1];
+                        top4[t] = m;
+                        break;
+                    }
+                }
+            }
+            for (int t = 0; t < 4; t++) {
+                int m = top4[t];
+                float ac = ew_ac1[m];
+                if (ac < 0) ac = 0;
+                int bar = (int)(ac * 6.0f + 0.5f);
+                if (bar > 6) bar = 6;
+                /* Color by warning level */
+                unsigned char br, bg2, bb;
+                if (ew_warning[m] > 0.7f) { br = 255; bg2 = 60; bb = 40; }
+                else if (ew_warning[m] > 0.4f) { br = 255; bg2 = 180; bb = 40; }
+                else { br = 80; bg2 = 200; bb = 80; }
+                p += sprintf(p, "\033[38;2;160;140;50m%.3s:", pp_metric_table[m].name);
+                p += sprintf(p, "\033[38;2;%d;%d;%dm", br, bg2, bb);
+                for (int i = 0; i < bar; i++) p += sprintf(p, "\xe2\x96\x88");
+                p += sprintf(p, "%s", ewbg);
+                for (int i = bar; i < 6; i++) *p++ = ' ';
+                if (t < 3) *p++ = ' ';
+            }
+        } else {
+            p += sprintf(p, "\033[38;2;100;80;40m(need 16+ samples)");
+        }
+        p += sprintf(p, "%s", ewbg);
+        { int used = 45; for (int i = used; i < ew_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", ewbdr, ewrst);
+
+        /* Row 4: Kendall-tau trends for top metric */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ew_row + 4, ew_col, ewbdr, ewbg);
+        p += sprintf(p, " \033[38;2;160;140;50m\xcf\x84_AC1:");
+        if (ew_ac1_trend[ew_top_metric] > 0.3f)
+            p += sprintf(p, "\033[38;2;255;100;40m%+.2f", ew_ac1_trend[ew_top_metric]);
+        else if (ew_ac1_trend[ew_top_metric] > 0.0f)
+            p += sprintf(p, "\033[38;2;220;200;60m%+.2f", ew_ac1_trend[ew_top_metric]);
+        else
+            p += sprintf(p, "\033[38;2;80;180;80m%+.2f", ew_ac1_trend[ew_top_metric]);
+        p += sprintf(p, "\033[0m%s\033[38;2;160;140;50m  \xcf\x84_var:", ewbg);
+        if (ew_var_trend[ew_top_metric] > 0.3f)
+            p += sprintf(p, "\033[38;2;255;100;40m%+.2f", ew_var_trend[ew_top_metric]);
+        else if (ew_var_trend[ew_top_metric] > 0.0f)
+            p += sprintf(p, "\033[38;2;220;200;60m%+.2f", ew_var_trend[ew_top_metric]);
+        else
+            p += sprintf(p, "\033[38;2;80;180;80m%+.2f", ew_var_trend[ew_top_metric]);
+        p += sprintf(p, "\033[0m%s\033[38;2;160;140;50m  var:", ewbg);
+        p += sprintf(p, "\033[38;2;180;180;80m%.4f", ew_variance[ew_top_metric]);
+        p += sprintf(p, "%s", ewbg);
+        { int used = 44; for (int i = used; i < ew_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", ewbdr, ewrst);
+
+        /* Row 5: Color gradient legend */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ew_row + 5, ew_col, ewbdr, ewbg);
+        p += sprintf(p, " ");
+        for (int i = 0; i < 36; i++) {
+            float w = (float)i / 35.0f;
+            unsigned char lr, lg, lb;
+            if (w < 0.25f) {
+                float t = w * 4.0f;
+                lr = (unsigned char)(20 + 40 * t); lg = (unsigned char)(80 + 120 * t); lb = (unsigned char)(40 - 20 * t);
+            } else if (w < 0.5f) {
+                float t = (w - 0.25f) * 4.0f;
+                lr = (unsigned char)(60 + 140 * t); lg = (unsigned char)(200 - 20 * t); lb = (unsigned char)(20 - 10 * t);
+            } else if (w < 0.75f) {
+                float t = (w - 0.5f) * 4.0f;
+                lr = (unsigned char)(200 + 55 * t); lg = (unsigned char)(180 - 130 * t); lb = 10;
+            } else {
+                float t = (w - 0.75f) * 4.0f;
+                if (t > 1.0f) t = 1.0f;
+                lr = 255; lg = (unsigned char)(50 - 30 * t); lb = (unsigned char)(10 + 50 * t);
+            }
+            p += sprintf(p, "\033[38;2;%d;%d;%dm\xe2\x96\x88", lr, lg, lb);
+        }
+        p += sprintf(p, "%s", ewbg);
+        { int used = 37; for (int i = used; i < ew_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", ewbdr, ewrst);
+
+        /* Row 6: Sparkline of global warning over time */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ew_row + 6, ew_col, ewbdr, ewbg);
+        p += sprintf(p, " \033[38;2;160;140;50mhist:");
+        {
+            const char *spark_chars[] = {"\xe2\x96\x81","\xe2\x96\x82","\xe2\x96\x83",
+                                         "\xe2\x96\x84","\xe2\x96\x85","\xe2\x96\x86",
+                                         "\xe2\x96\x87","\xe2\x96\x88"};
+            int slen = ew_hist_count < 36 ? ew_hist_count : 36;
+            for (int i = 0; i < slen; i++) {
+                int idx = (ew_hist_idx - slen + i + EW_HIST_LEN) % EW_HIST_LEN;
+                float v = ew_hist[idx];
+                if (v < 0.0f) v = 0.0f;
+                if (v > 1.0f) v = 1.0f;
+                int si = (int)(v * 7.99f);
+                if (si > 7) si = 7;
+                unsigned char sr, sg2, sb;
+                if (v < 0.4f) { sr = 60; sg2 = (unsigned char)(150 + 100 * v); sb = 60; }
+                else if (v < 0.7f) { sr = (unsigned char)(200 + 55 * v); sg2 = (unsigned char)(200 - 100 * v); sb = 40; }
+                else { sr = 255; sg2 = (unsigned char)(60 - 40 * v); sb = 40; }
+                p += sprintf(p, "\033[38;2;%d;%d;%dm%s", sr, sg2, sb, spark_chars[si]);
+            }
+        }
+        p += sprintf(p, "%s", ewbg);
+        { int used = 5 + (ew_hist_count < 36 ? ew_hist_count : 36);
+          for (int i = used; i < ew_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", ewbdr, ewrst);
+
+        /* Row 7: Classification */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ew_row + 7, ew_col, ewbdr, ewbg);
+        p += sprintf(p, " \033[38;2;160;140;50mStatus: ");
+        if (ew_global_warning > 0.75f)
+            p += sprintf(p, "\033[1;5;38;2;255;40;20mCRITICAL");
+        else if (ew_global_warning > 0.5f)
+            p += sprintf(p, "\033[1;38;2;255;140;20mWARNING");
+        else if (ew_global_warning > 0.3f)
+            p += sprintf(p, "\033[38;2;220;200;40mCAUTION");
+        else
+            p += sprintf(p, "\033[38;2;60;200;60mSTABLE");
+        p += sprintf(p, "%s", ewbg);
+        { int used = 24; for (int i = used; i < ew_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", ewbdr, ewrst);
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", ew_row + 8, ew_col, ewbdr);
+        for (int i = 0; i < ew_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", ewrst);
+    }
+
     /* ── Percolation Analysis overlay panel ─────────────────────────────── */
     if (perc_mode) {
         int pc_w = 46;
@@ -14317,6 +14832,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (ergo_mode)      pc_row += 10;
         if (coh_mode)       pc_row += 8;
         if (ce_mode)        pc_row += 9;
+        if (ew_mode)        pc_row += 10;
         if (pc_col < 1) pc_col = 1;
 
         const char *pcbdr = "\033[38;2;255;200;40;48;2;14;12;6m";
@@ -14495,6 +15011,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (ergo_mode)      is_row += 10;
         if (coh_mode)       is_row += 8;
         if (ce_mode)        is_row += 9;
+        if (ew_mode)        is_row += 10;
         if (perc_mode)      is_row += 10;
         if (is_col < 1) is_col = 1;
 
@@ -14665,6 +15182,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (ergo_mode)      pb_row += 10;
         if (coh_mode)       pb_row += 8;
         if (ce_mode)        pb_row += 9;
+        if (ew_mode)        pb_row += 10;
         if (perc_mode)      pb_row += 10;
         if (ising_mode)     pb_row += 10;
         if (pb_col < 1) pb_col = 1;
@@ -14878,6 +15396,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (ergo_mode)      gd_row_p += 10;
         if (coh_mode)       gd_row_p += 8;
         if (ce_mode)        gd_row_p += 9;
+        if (ew_mode)        gd_row_p += 10;
         if (perc_mode)      gd_row_p += 10;
         if (ising_mode)     gd_row_p += 10;
         if (pb_mode)        gd_row_p += 14;
@@ -15013,6 +15532,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (ergo_mode)     pp_row += 10;
         if (coh_mode)      pp_row += 8;
         if (ce_mode)       pp_row += 9;
+        if (ew_mode)       pp_row += 10;
         if (perc_mode)     pp_row += 10;
         if (ising_mode)    pp_row += 10;
         if (pb_mode)       pp_row += 14;
@@ -15234,6 +15754,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (ergo_mode)     cm_row += 10;
         if (coh_mode)      cm_row += 8;
         if (ce_mode)       cm_row += 9;
+        if (ew_mode)       cm_row += 10;
         if (perc_mode)     cm_row += 10;
         if (ising_mode)    cm_row += 10;
         if (pb_mode)       cm_row += 14;
@@ -15439,6 +15960,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (ergo_mode)      ps_row_p += 10;
         if (coh_mode)       ps_row_p += 8;
         if (ce_mode)        ps_row_p += 9;
+        if (ew_mode)        ps_row_p += 10;
         if (perc_mode)      ps_row_p += 10;
         if (ising_mode)     ps_row_p += 10;
         if (pb_mode)        ps_row_p += 14;
@@ -15679,6 +16201,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (ergo_mode)      rp_row_p += 10;
         if (coh_mode)       rp_row_p += 8;
         if (ce_mode)        rp_row_p += 9;
+        if (ew_mode)        rp_row_p += 10;
         if (perc_mode)      rp_row_p += 10;
         if (ising_mode)     rp_row_p += 10;
         if (pb_mode)        rp_row_p += 14;
@@ -15881,6 +16404,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (ergo_mode)      sa_row_p += 10;
         if (coh_mode)       sa_row_p += 8;
         if (ce_mode)        sa_row_p += 9;
+        if (ew_mode)        sa_row_p += 10;
         if (perc_mode)      sa_row_p += 10;
         if (ising_mode)     sa_row_p += 10;
         if (pb_mode)        sa_row_p += 14;
@@ -16108,6 +16632,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (ergo_mode)      pt_row_p += 10;
         if (coh_mode)       pt_row_p += 8;
         if (ce_mode)        pt_row_p += 9;
+        if (ew_mode)        pt_row_p += 10;
         if (perc_mode)      pt_row_p += 10;
         if (ising_mode)     pt_row_p += 10;
         if (pb_mode)        pt_row_p += 14;
@@ -17487,6 +18012,19 @@ int main(int argc, char **argv) {
                 printf("\033[2J"); fflush(stdout);
             }
         }
+        else if (key == '3') {
+            if (!ecosystem_mode) {
+                ew_mode = !ew_mode;
+                if (ew_mode) {
+                    ew_reset();
+                    flash_set("Early Warning: critical slowing down [3]exit");
+                    printf("\033[2J"); fflush(stdout);
+                } else {
+                    flash_set("Early Warning off");
+                    printf("\033[2J"); fflush(stdout);
+                }
+            }
+        }
         else if (key == '?') {
             if (probe_mode > 0) {
                 probe_mode = 0; /* toggle off */
@@ -18177,6 +18715,14 @@ int main(int argc, char **argv) {
                         break;
                     }
                 }
+            }
+        }
+
+        /* Early warning: record all metrics every 2 generations */
+        if (ew_mode && running && (generation % 2 == 0)) {
+            ew_record();
+            if (ew_stale && ew_count >= 16) {
+                ew_compute();
             }
         }
 

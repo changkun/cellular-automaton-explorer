@@ -1,8 +1,22 @@
 # Changelog
 
 Development history organized by round. Each round adds one or two major
-features. The project grew from ~790 lines (Round 1) to ~14,457 lines
-(Round 52).
+features. The project grew from ~790 lines (Round 1) to ~14,830 lines
+(Round 53).
+
+## Round 53 — Phase Portrait Mode
+
+Dynamical systems visualization for the automaton. Press `)` to plot any
+two overlay scalar metrics against each other as a real-time 2D trajectory,
+revealing attractor structure — limit cycles, fixed points, bifurcations,
+chaotic wandering. Choose from 16 metrics (Pop, Entropy, Lyapunov, Fractal D,
+Flow, Vortices, Wave Energy, dS/dt, β₀, β₁, ξ, Ising H, Magnetization,
+Complexity, Kolmogorov, Ergodicity) cycled with `<`/`>`. Rendered as a
+30×12 Braille dot scatter plot with 128-point trailing history fading from
+bright gold (newest) to dim amber (oldest). Auto-scaling axes with labels,
+current values display, and `◎PHASE:X×Y` status indicator. Pure exploitation
+round — zero new analysis math, just combines existing scalar outputs into a
+powerful visualization. Split-screen moved from `)` to `\`. +370 lines.
 
 ## Round 52 — Topological Persistence Barcode
 

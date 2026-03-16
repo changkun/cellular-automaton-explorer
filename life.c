@@ -746,6 +746,66 @@ static int   pb_hist_count = 0;
 /* Per-cell persistence value for overlay coloring */
 static float pb_cell_age[MAX_H][MAX_W];  /* normalized age of component this cell belongs to */
 
+/* ── Phase Portrait Mode ────────────────────────────────────────────────── */
+/* Plots two overlay scalar metrics against each other as a real-time 2D
+   trajectory, revealing attractor structure (limit cycles, fixed points,
+   bifurcations, chaotic wandering).  Toggle with ')' key.
+   '<' / '>' cycle X/Y axis metric pairs while in the mode. */
+
+#define PP_HIST_LEN 128   /* trailing history points */
+#define PP_N_METRICS 16   /* number of available scalar metrics */
+
+typedef struct {
+    const char *name;     /* short label for axis */
+    const char *unit;     /* unit string */
+} PPMetricInfo;
+
+static const PPMetricInfo pp_metric_table[PP_N_METRICS] = {
+    { "Pop",       ""    },  /*  0: population */
+    { "Entropy",   "H"   },  /*  1: entropy_global */
+    { "Lyapunov",  "λ"   },  /*  2: lyapunov_global */
+    { "Fractal",   "D"   },  /*  3: fractal_dbox */
+    { "Flow",      "|F|" },  /*  4: flow_global_mag */
+    { "Vortices",  "n"   },  /*  5: vort_n_vortices */
+    { "WaveE",     "E"   },  /*  6: wave_energy */
+    { "dS/dt",     ""    },  /*  7: eprod_global */
+    { "β₀",       ""    },  /*  8: topo_beta0 */
+    { "β₁",       ""    },  /*  9: topo_beta1 */
+    { "ξ",        "cells"},  /* 10: corr_xi */
+    { "Ising H",   ""    },  /* 11: ising_total_energy */
+    { "Magnet",    "M"   },  /* 12: ising_magnetization */
+    { "Cmplx",     ""    },  /* 13: cplx_global */
+    { "Kolmo",     ""    },  /* 14: kc_global_mean */
+    { "Ergo",      ""    },  /* 15: ergo_index */
+};
+
+static int   pp_mode = 0;          /* 0=off, 1=on */
+static int   pp_x_metric = 0;      /* index into pp_metric_table for X axis */
+static int   pp_y_metric = 1;      /* index into pp_metric_table for Y axis */
+static float pp_hist_x[PP_HIST_LEN]; /* ring buffer of X values */
+static float pp_hist_y[PP_HIST_LEN]; /* ring buffer of Y values */
+static int   pp_hist_head = 0;     /* next write position */
+static int   pp_hist_count = 0;    /* number of valid entries (≤ PP_HIST_LEN) */
+
+/* Axis auto-range tracking */
+static float pp_x_min = 1e30f, pp_x_max = -1e30f;
+static float pp_y_min = 1e30f, pp_y_max = -1e30f;
+
+/* Read a metric value by index — defined after all globals */
+static float pp_read_metric(int idx);
+
+/* Record current metrics into history */
+/* pp_record: defined after all globals (needs pp_read_metric) */
+static void pp_record(void);
+
+/* Reset history (on metric change or toggle) */
+static void pp_reset(void) {
+    pp_hist_head = 0;
+    pp_hist_count = 0;
+    pp_x_min = 1e30f; pp_x_max = -1e30f;
+    pp_y_min = 1e30f; pp_y_max = -1e30f;
+}
+
 /* ── Spacetime Kymograph ─────────────────────────────────────────────────── */
 /* Displays a 1D horizontal slice of the grid evolving over time as a 2D
    spacetime diagram.  Y-axis = time (scrolling upward), X-axis = grid row.
@@ -778,7 +838,7 @@ static int   probe_y = -1;            /* selected cell y */
 
 /* ── Split-Screen Dual Overlay Comparison ────────────────────────────────── */
 /* Shows two overlays side-by-side on the same simulation.
-   Toggle with ')' key. TAB cycles the right panel, '`' cycles the left. */
+   Toggle with '\\' key. TAB cycles the right panel, '`' cycles the left. */
 
 /* Overlay table: ordered list of analysis overlays for cycling */
 #define N_SPLIT_OVERLAYS 24
@@ -1122,6 +1182,43 @@ static unsigned short species_b_survival = 0x00C; /* S23 */
 static int re_col0, re_row0; /* top-left corner (1-based terminal coords) */
 #define RE_WIDTH 40
 #define RE_HEIGHT 6
+
+/* ── Phase Portrait metric reader (needs all overlay globals) ─────────────── */
+static float pp_read_metric(int idx) {
+    switch (idx) {
+        case  0: return (float)population;
+        case  1: return entropy_global;
+        case  2: return lyapunov_global;
+        case  3: return fractal_dbox;
+        case  4: return flow_global_mag;
+        case  5: return (float)vort_n_vortices;
+        case  6: return wave_energy;
+        case  7: return eprod_global;
+        case  8: return (float)topo_beta0;
+        case  9: return (float)topo_beta1;
+        case 10: return corr_xi;
+        case 11: return ising_total_energy;
+        case 12: return ising_magnetization;
+        case 13: return cplx_global;
+        case 14: return kc_global_mean;
+        case 15: return ergo_index;
+        default: return 0.0f;
+    }
+}
+
+static void pp_record(void) {
+    float x = pp_read_metric(pp_x_metric);
+    float y = pp_read_metric(pp_y_metric);
+    pp_hist_x[pp_hist_head] = x;
+    pp_hist_y[pp_hist_head] = y;
+    pp_hist_head = (pp_hist_head + 1) % PP_HIST_LEN;
+    if (pp_hist_count < PP_HIST_LEN) pp_hist_count++;
+    /* Update auto-range */
+    if (x < pp_x_min) pp_x_min = x;
+    if (x > pp_x_max) pp_x_max = x;
+    if (y < pp_y_min) pp_y_min = y;
+    if (y > pp_y_max) pp_y_max = y;
+}
 
 /* ── Kymograph record implementation (needs W, H) ────────────────────────── */
 static void kymo_record(void) {
@@ -2537,6 +2634,7 @@ static void demo_reset_overlays(void) {
     perc_mode = 0;
     ising_mode = 0;
     pb_mode = 0;
+    pp_mode = 0;
     fourier_mode = 0;
     fractal_mode = 0;
     wolfram_mode = 0;
@@ -8718,6 +8816,15 @@ static void render(int running, int speed_ms, int draw_mode) {
                  " \033[38;2;40;200;220m\xe2\x97\x86\xe2\x89\x88%.1fE\033[0m", wave_energy);
     }
 
+    /* Phase portrait indicator */
+    char pp_str[128] = "";
+    if (pp_mode) {
+        snprintf(pp_str, sizeof(pp_str),
+                 " \033[38;2;255;200;80m\xe2\x97\x8e" "PHASE:%s\xc3\x97%s\033[0m",
+                 pp_metric_table[pp_x_metric].name,
+                 pp_metric_table[pp_y_metric].name);
+    }
+
     /* Split-screen indicator */
     char split_str[128] = "";
     if (split_mode) {
@@ -8864,9 +8971,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, corr_str, eprod_str, wave_str, split_str, kymo_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
+                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, corr_str, eprod_str, wave_str, pp_str, split_str, kymo_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -12792,6 +12899,224 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", pbrst);
     }
 
+    /* ── Phase Portrait overlay panel ────────────────────────────────────── */
+    if (pp_mode && pp_hist_count > 1) {
+        int pp_w = 44;  /* panel width in terminal columns */
+        int pp_col = term_cols - pp_w - 2;
+        /* Stack below other active panels */
+        int pp_row = 3;
+        if (entropy_mode)  pp_row += 8;
+        if (temp_mode)     pp_row += 9;
+        if (lyapunov_mode) pp_row += 8;
+        if (fourier_mode)  pp_row += 18;
+        if (fractal_mode)  pp_row += 11;
+        if (wolfram_mode)  pp_row += 14;
+        if (flow_mode)     pp_row += 9;
+        if (attractor_mode) pp_row += 7;
+        if (cone_mode)     pp_row += 12;
+        if (surp_mode)     pp_row += 8;
+        if (mi_mode)       pp_row += 8;
+        if (cplx_mode)     pp_row += 8;
+        if (topo_mode)     pp_row += 10;
+        if (rg_mode)       pp_row += 12;
+        if (kc_mode)       pp_row += 11;
+        if (corr_mode)     pp_row += 10;
+        if (eprod_mode)    pp_row += 8;
+        if (vort_mode)     pp_row += 8;
+        if (wave_mode)     pp_row += 8;
+        if (ergo_mode)     pp_row += 10;
+        if (perc_mode)     pp_row += 10;
+        if (ising_mode)    pp_row += 10;
+        if (pb_mode)       pp_row += 14;
+        if (pp_col < 1) pp_col = 1;
+
+        /* Braille canvas: 30 chars wide × 12 chars tall = 60×48 dots */
+        #define PP_CW 30   /* canvas width in chars */
+        #define PP_CH 12   /* canvas height in chars */
+        #define PP_DW (PP_CW * 2)   /* dot width */
+        #define PP_DH (PP_CH * 4)   /* dot height */
+
+        unsigned char pp_canvas[PP_CH][PP_CW];
+        /* Brightness per dot (for fading) — we'll track max brightness per char cell */
+        unsigned char pp_bright[PP_CH][PP_CW];
+        for (int j = 0; j < PP_CH; j++)
+            for (int i = 0; i < PP_CW; i++) {
+                pp_canvas[j][i] = 0;
+                pp_bright[j][i] = 0;
+            }
+
+        /* Compute axis range with padding */
+        float xmin = pp_x_min, xmax = pp_x_max;
+        float ymin = pp_y_min, ymax = pp_y_max;
+        float xpad = (xmax - xmin) * 0.05f + 1e-6f;
+        float ypad = (ymax - ymin) * 0.05f + 1e-6f;
+        xmin -= xpad; xmax += xpad;
+        ymin -= ypad; ymax += ypad;
+        float xrange = xmax - xmin;
+        float yrange = ymax - ymin;
+        if (xrange < 1e-12f) xrange = 1.0f;
+        if (yrange < 1e-12f) yrange = 1.0f;
+
+        /* Plot points from history (oldest first) */
+        for (int k = 0; k < pp_hist_count; k++) {
+            int idx = (pp_hist_head - pp_hist_count + k + PP_HIST_LEN) % PP_HIST_LEN;
+            float fx = (pp_hist_x[idx] - xmin) / xrange;
+            float fy = (pp_hist_y[idx] - ymin) / yrange;
+            int dx = (int)(fx * (PP_DW - 1));
+            int dy = (int)((1.0f - fy) * (PP_DH - 1)); /* Y inverted: top=max */
+            if (dx < 0) dx = 0; if (dx >= PP_DW) dx = PP_DW - 1;
+            if (dy < 0) dy = 0; if (dy >= PP_DH) dy = PP_DH - 1;
+
+            /* Map dot (dx, dy) to braille char cell */
+            int cx = dx / 2;    /* char column */
+            int cy = dy / 4;    /* char row */
+            int bx = dx % 2;    /* bit column (0 or 1) within char */
+            int by = dy % 4;    /* bit row (0-3) within char */
+
+            /* Braille dot bit index:
+               col0: row0=bit0, row1=bit1, row2=bit2, row3=bit6
+               col1: row0=bit3, row1=bit4, row2=bit5, row3=bit7 */
+            unsigned char bit;
+            if (bx == 0) {
+                bit = (by < 3) ? (1 << by) : (1 << 6);
+            } else {
+                bit = (by < 3) ? (1 << (by + 3)) : (1 << 7);
+            }
+            pp_canvas[cy][cx] |= bit;
+
+            /* Brightness: newer = brighter (k goes from 0=oldest to count-1=newest) */
+            unsigned char br = (unsigned char)(40 + (215 * k) / (pp_hist_count > 1 ? pp_hist_count - 1 : 1));
+            if (br > pp_bright[cy][cx]) pp_bright[cy][cx] = br;
+        }
+
+        const char *ppbdr = "\033[38;2;200;160;40;48;2;10;8;4m";
+        const char *ppbg  = "\033[48;2;10;8;4m";
+        const char *pprst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 Phase Portrait ",
+                     pp_row, pp_col, ppbdr);
+        for (int i = 18; i < pp_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", pprst);
+
+        /* Row 1: Current X,Y values */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     pp_row + 1, pp_col, ppbdr, ppbg);
+        {
+            float cur_x = pp_read_metric(pp_x_metric);
+            float cur_y = pp_read_metric(pp_y_metric);
+            int n = sprintf(p, " \033[38;2;255;200;80mX:\033[38;2;255;240;180m%-8.2f "
+                               "\033[38;2;255;200;80mY:\033[38;2;255;240;180m%-8.2f",
+                            cur_x, cur_y);
+            p += n;
+            /* Pad to panel width — estimate visible chars */
+            int used = 26;
+            for (int i = used; i < pp_w - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", ppbdr, pprst);
+
+        /* Row 2: Axis labels */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     pp_row + 2, pp_col, ppbdr, ppbg);
+        {
+            int n = sprintf(p, " \033[38;2;160;130;40m[<]X:%s  [>]Y:%s  n=%d",
+                            pp_metric_table[pp_x_metric].name,
+                            pp_metric_table[pp_y_metric].name,
+                            pp_hist_count);
+            p += n;
+            int used = 6 + (int)strlen(pp_metric_table[pp_x_metric].name) + 6
+                     + (int)strlen(pp_metric_table[pp_y_metric].name) + 3
+                     + (pp_hist_count >= 100 ? 3 : pp_hist_count >= 10 ? 2 : 1);
+            for (int i = used; i < pp_w - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", ppbdr, pprst);
+
+        /* Rows 3..3+PP_CH-1: Braille scatter plot canvas */
+        for (int row = 0; row < PP_CH; row++) {
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                         pp_row + 3 + row, pp_col, ppbdr, ppbg);
+            /* Y axis label on first and last row */
+            if (row == 0) {
+                int n = sprintf(p, "\033[38;2;120;100;40m%6.1f\033[38;2;80;60;20m\xe2\x94\x82", ymax);
+                p += n;
+            } else if (row == PP_CH - 1) {
+                int n = sprintf(p, "\033[38;2;120;100;40m%6.1f\033[38;2;80;60;20m\xe2\x94\x82", ymin);
+                p += n;
+            } else {
+                p += sprintf(p, "      \033[38;2;80;60;20m\xe2\x94\x82");
+            }
+            /* Render braille chars */
+            for (int col = 0; col < PP_CW; col++) {
+                unsigned char dots = pp_canvas[row][col];
+                /* Encode as braille: U+2800 + dots */
+                unsigned int cp = 0x2800 + dots;
+                /* UTF-8 encode (all braille are 3-byte: 0xE2 0xAx 0x8x) */
+                unsigned char b1 = 0xE0 | (cp >> 12);
+                unsigned char b2 = 0x80 | ((cp >> 6) & 0x3F);
+                unsigned char b3 = 0x80 | (cp & 0x3F);
+                if (dots > 0) {
+                    unsigned char br = pp_bright[row][col];
+                    /* Color: gold/amber with brightness */
+                    int r = (int)(br);
+                    int g = (int)(br * 0.75f);
+                    int b = (int)(br * 0.2f);
+                    if (r > 255) r = 255;
+                    if (g > 255) g = 255;
+                    p += sprintf(p, "\033[38;2;%d;%d;%dm", r, g, b);
+                }
+                *p++ = b1; *p++ = b2; *p++ = b3;
+                if (dots > 0) {
+                    /* Reset to bg color for next char */
+                    p += sprintf(p, "%s", ppbg);
+                }
+            }
+            /* Pad remaining space */
+            {
+                int used = 7 + PP_CW; /* 6 label + 1 separator + canvas chars */
+                for (int i = used; i < pp_w - 1; i++) *p++ = ' ';
+            }
+            p += sprintf(p, "%s\xe2\x94\x82%s", ppbdr, pprst);
+        }
+
+        /* X axis label row */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     pp_row + 3 + PP_CH, pp_col, ppbdr, ppbg);
+        {
+            int n = sprintf(p, "      \033[38;2;80;60;20m\xe2\x94\x94");
+            p += n;
+            for (int i = 0; i < PP_CW; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+            n = sprintf(p, "\033[38;2;120;100;40m");
+            p += n;
+            int lbl_n = sprintf(p, "%.1f", xmin);
+            p += lbl_n;
+            /* Right-align xmax */
+            int used = 7 + PP_CW + lbl_n;
+            int xmax_len = snprintf(NULL, 0, "%.1f", xmax);
+            int gap = pp_w - 1 - used - xmax_len;
+            for (int i = 0; i < gap; i++) *p++ = ' ';
+            if (gap >= 0) {
+                n = sprintf(p, "%.1f", xmax);
+                p += n;
+                used += gap + n;
+            }
+            for (int i = used; i < pp_w - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", ppbdr, pprst);
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94",
+                     pp_row + 4 + PP_CH, pp_col, ppbdr);
+        for (int i = 0; i < pp_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", pprst);
+
+        #undef PP_CW
+        #undef PP_CH
+        #undef PP_DW
+        #undef PP_DH
+    }
+
     /* ── Cell Probe Inspector overlay panel ──────────────────────────────── */
     if (probe_mode == 2 && probe_x >= 0 && probe_x < W && probe_y >= 0 && probe_y < H) {
         int pp_w = 48;
@@ -13582,6 +13907,30 @@ int main(int argc, char **argv) {
                 grid_step();
             }
         }
+        else if ((key == '<' || key == ',') && pp_mode) {
+            /* Phase portrait: cycle X metric */
+            pp_x_metric = (pp_x_metric + 1) % PP_N_METRICS;
+            if (pp_x_metric == pp_y_metric)
+                pp_x_metric = (pp_x_metric + 1) % PP_N_METRICS;
+            pp_reset();
+            {
+                char fb[128];
+                snprintf(fb, sizeof(fb), "Phase X: %s", pp_metric_table[pp_x_metric].name);
+                flash_set(fb);
+            }
+        }
+        else if ((key == '>' || key == '.') && pp_mode) {
+            /* Phase portrait: cycle Y metric */
+            pp_y_metric = (pp_y_metric + 1) % PP_N_METRICS;
+            if (pp_y_metric == pp_x_metric)
+                pp_y_metric = (pp_y_metric + 1) % PP_N_METRICS;
+            pp_reset();
+            {
+                char fb[128];
+                snprintf(fb, sizeof(fb), "Phase Y: %s", pp_metric_table[pp_y_metric].name);
+                flash_set(fb);
+            }
+        }
         else if (key == '<' || key == ',') {
             /* Rewind: enter/deepen replay */
             if (tl_len > 1) {
@@ -13868,13 +14217,24 @@ int main(int argc, char **argv) {
             }
         }
         else if (key == ')') {
+            pp_mode = !pp_mode;
+            if (pp_mode) {
+                pp_reset();
+                flash_set("Phase Portrait: [<]X metric [>]Y metric [)]exit");
+                printf("\033[2J"); fflush(stdout);
+            } else {
+                flash_set("Phase Portrait off");
+                printf("\033[2J"); fflush(stdout);
+            }
+        }
+        else if (key == '\\') {
             split_mode = !split_mode;
             if (split_mode) {
                 /* Initialize panels: left = current overlay, right = something different */
                 split_left = split_detect_current();
                 split_right = (split_left + 1) % N_SPLIT_OVERLAYS;
                 if (split_right == 0) split_right = 1; /* skip "None" for right */
-                flash_set("Split: [`]left [TAB]right [)]exit");
+                flash_set("Split: [`]left [TAB]right [\\]exit");
                 printf("\033[2J"); fflush(stdout); /* clear for redraw */
             } else {
                 flash_set("Split off");
@@ -14447,6 +14807,11 @@ int main(int argc, char **argv) {
         /* Auto-refresh wave mechanics every generation (continuous propagation) */
         if (wave_mode && wave_stale) {
             wave_compute();
+        }
+
+        /* Phase portrait: record metric pair every 2 generations */
+        if (pp_mode && running && (generation % 2 == 0)) {
+            pp_record();
         }
 
         render(running, speed_ms, draw_mode);

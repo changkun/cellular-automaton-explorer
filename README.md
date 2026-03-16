@@ -187,6 +187,8 @@ Load an RLE pattern file:
 | `Ctrl-S` | Save state to `.life` file |
 | `Ctrl-O` | Load most recent save |
 | `Ctrl-E` | Export grid as RLE file |
+| `Ctrl-G` | Toggle symmetry group detection |
+| `Ctrl-D` | Toggle topological defect tracker |
 
 #### Replay
 

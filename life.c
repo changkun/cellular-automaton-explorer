@@ -128,6 +128,9 @@
  *   Ctrl-G      Toggle symmetry group detection (discrete symmetry classification)
  *                 Classifies 5×5 neighborhoods into groups: C1,C2,D1,D2,C4,D4
  *                 Dark=asymmetric, blue=2-fold, green=4-fold, gold=full D4
+ *   Ctrl-D      Toggle topological defect tracker (vortex/wall/charge detection)
+ *                 Computes winding numbers on density-gradient orientation field
+ *                 Pink=+1 vortex, cyan=-1 vortex, yellow=domain wall
  *   Ctrl-E      Export current grid as RLE file (auto-numbered export_NNN.rle)
  *   Arrow keys  Pan viewport across the full 400×200 grid
  *   0           Re-center viewport on grid center
@@ -1050,7 +1053,7 @@ static int   probe_y = -1;            /* selected cell y */
    Toggle with '\\' key. TAB cycles the right panel, '`' cycles the left. */
 
 /* Overlay table: ordered list of analysis overlays for cycling */
-#define N_SPLIT_OVERLAYS 36
+#define N_SPLIT_OVERLAYS 37
 typedef struct {
     const char *name;   /* short display name */
     char key;           /* toggle key character */
@@ -1093,6 +1096,7 @@ static const SplitOverlayInfo split_overlay_table[N_SPLIT_OVERLAYS] = {
     { "Dashboard",    '5'  },  /* 33 */
     { "CrossCorr",    '2'  },  /* 34 */
     { "SymmGroup",    'G'-64 },  /* 35: Ctrl-G */
+    { "TopoDefect",   'D'-64 },  /* 36: Ctrl-D */
 };
 
 static int split_mode = 0;         /* 0=off, 1=on */
@@ -1511,6 +1515,69 @@ static void sg_reset(void) {
     memset(sg_hist, 0, sizeof(sg_hist));
 }
 
+/* ── Topological Defect Tracker ────────────────────────────────────────────── */
+/* Detects topological defects in the automaton's orientation/order parameter
+   field by computing discrete winding numbers around each cell.  The orientation
+   field is derived from local density gradients.  Classifies defects:
+   - Vortex cores: winding number +1 (hot pink) or -1 (cyan)
+   - Domain walls: boundaries between incompatible order regions (yellow seams)
+   - Saddle points: winding number +2/-2 (rare, bright white)
+   Panel shows defect census, net topological charge, creation/annihilation rate,
+   and charge conservation tracking.  Ghost code = 37. */
+
+#define TD_HIST_LEN 64
+#define TD_MAX_DEFECTS 2000   /* max tracked defect positions per frame */
+
+static int   td_mode = 0;
+static int   td_stale = 1;
+
+/* Per-cell: orientation angle [0,2π), winding number, defect type */
+static float td_angle[MAX_H][MAX_W];     /* orientation field θ(x,y) */
+static signed char td_winding[MAX_H][MAX_W]; /* winding number at each cell */
+static unsigned char td_dtype[MAX_H][MAX_W]; /* 0=none, 1=vortex+, 2=vortex-, 3=wall, 4=saddle+, 5=saddle- */
+static float td_wall_strength[MAX_H][MAX_W]; /* domain wall intensity [0,1] */
+
+/* Global aggregates */
+static int   td_n_vortex_pos = 0;   /* count of +1 vortices */
+static int   td_n_vortex_neg = 0;   /* count of -1 vortices */
+static int   td_n_saddle = 0;       /* count of higher-order defects */
+static int   td_n_walls = 0;        /* count of wall cells */
+static int   td_net_charge = 0;     /* net topological charge (should be conserved) */
+static float td_creation_rate = 0.0f; /* smoothed pair creation rate */
+static float td_annihil_rate = 0.0f;  /* smoothed annihilation rate */
+static int   td_prev_charge = 0;     /* previous frame's net charge */
+static int   td_prev_total = 0;      /* previous frame's total defect count */
+static int   td_charge_violations = 0; /* count of charge conservation violations */
+
+/* Sparkline history of net charge and total defects */
+static float td_hist_charge[TD_HIST_LEN];
+static float td_hist_total[TD_HIST_LEN];
+static int   td_hist_idx = 0;
+static int   td_hist_count = 0;
+
+static void td_compute(void);
+static void td_reset(void) {
+    td_stale = 1;
+    td_n_vortex_pos = 0;
+    td_n_vortex_neg = 0;
+    td_n_saddle = 0;
+    td_n_walls = 0;
+    td_net_charge = 0;
+    td_creation_rate = 0.0f;
+    td_annihil_rate = 0.0f;
+    td_prev_charge = 0;
+    td_prev_total = 0;
+    td_charge_violations = 0;
+    td_hist_idx = 0;
+    td_hist_count = 0;
+    memset(td_angle, 0, sizeof(td_angle));
+    memset(td_winding, 0, sizeof(td_winding));
+    memset(td_dtype, 0, sizeof(td_dtype));
+    memset(td_wall_strength, 0, sizeof(td_wall_strength));
+    memset(td_hist_charge, 0, sizeof(td_hist_charge));
+    memset(td_hist_total, 0, sizeof(td_hist_total));
+}
+
 /* ── Cross-Correlation Matrix ──────────────────────────────────────────────── */
 /* Computes pairwise time-lagged cross-correlation across all 16 metric streams
    at lags -8 to +8.  For each pair, identifies the optimal lag (peak |r|),
@@ -1638,6 +1705,7 @@ static void split_set_overlay(int idx) {
     xc_mode = 0;
     fi_mode = 0;
     sg_mode = 0;
+    td_mode = 0;
 
     switch (idx) {
         case  0: break;
@@ -1676,6 +1744,7 @@ static void split_set_overlay(int idx) {
         case 33: rd_mode = 1; break;
         case 34: xc_mode = 1; break;
         case 35: sg_mode = 1; break;
+        case 36: td_mode = 1; break;
     }
 }
 
@@ -1715,6 +1784,7 @@ static int split_detect_current(void) {
     if (rd_mode) return 33;
     if (xc_mode) return 34;
     if (sg_mode) return 35;
+    if (td_mode) return 36;
     return 0;
 }
 
@@ -3073,6 +3143,7 @@ static void grid_step(void) {
     ew_stale = 1;
     fi_stale = 1;
     sg_stale = 1;
+    td_stale = 1;
 
     /* Always record frames for surprise field (cheap memcpy) */
     surp_record_frame();
@@ -8361,6 +8432,159 @@ static void sg_compute(void) {
     if (sg_hist_count < SG_HIST_LEN) sg_hist_count++;
 }
 
+/* ── Topological Defect Tracker computation ────────────────────────────────── */
+static void td_compute(void) {
+    td_stale = 0;
+
+    /* Step 1: Compute orientation field from local density gradient.
+       θ(x,y) = atan2(∂ρ/∂y, ∂ρ/∂x) where ρ is a smoothed density field.
+       We use a 3×3 Sobel-like gradient on cell ages (clamped to 0/1 for alive/dead). */
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            /* 3×3 neighborhood density with Sobel weights */
+            float gx = 0.0f, gy = 0.0f;
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    if (dx == 0 && dy == 0) continue;
+                    int ny = y + dy, nx = x + dx;
+                    float v = 0.0f;
+                    if (ny >= 0 && ny < H && nx >= 0 && nx < W)
+                        v = grid[ny][nx] > 0 ? 1.0f : 0.0f;
+                    /* Sobel weights: corners ±1, edges ±2 */
+                    float wx = (float)dx * (dy == 0 ? 2.0f : 1.0f);
+                    float wy = (float)dy * (dx == 0 ? 2.0f : 1.0f);
+                    gx += v * wx;
+                    gy += v * wy;
+                }
+            }
+            /* atan2 gives angle in [-π, π]; shift to [0, 2π) */
+            float theta = atan2f(gy, gx);
+            if (theta < 0.0f) theta += 2.0f * 3.14159265f;
+            td_angle[y][x] = theta;
+        }
+    }
+
+    /* Step 2: Compute winding number around each cell.
+       Walk a discrete contour around the cell (the 4 neighboring cells in a
+       square loop: right, down, left, up) and sum the angle differences.
+       The winding number = total angle change / 2π, rounded to nearest integer.
+
+       For a 2×2 plaquette at (x,y), the corners are:
+         (x,y) → (x+1,y) → (x+1,y+1) → (x,y+1) → back
+       Sum of angular jumps around this circuit gives 2π·n where n is the
+       topological charge enclosed. */
+
+    memset(td_winding, 0, sizeof(td_winding));
+    memset(td_dtype, 0, sizeof(td_dtype));
+
+    int vp = 0, vn = 0, sd = 0, wl = 0;
+    float pi2 = 2.0f * 3.14159265f;
+
+    for (int y = 0; y < H - 1; y++) {
+        for (int x = 0; x < W - 1; x++) {
+            /* 2×2 plaquette corners */
+            float a0 = td_angle[y][x];
+            float a1 = td_angle[y][x+1];
+            float a2 = td_angle[y+1][x+1];
+            float a3 = td_angle[y+1][x];
+
+            /* Compute angle differences, wrapped to [-π, π] */
+            float d01 = a1 - a0;
+            float d12 = a2 - a1;
+            float d23 = a3 - a2;
+            float d30 = a0 - a3;
+
+            /* Wrap to [-π, π] */
+            while (d01 >  3.14159265f) d01 -= pi2;
+            while (d01 < -3.14159265f) d01 += pi2;
+            while (d12 >  3.14159265f) d12 -= pi2;
+            while (d12 < -3.14159265f) d12 += pi2;
+            while (d23 >  3.14159265f) d23 -= pi2;
+            while (d23 < -3.14159265f) d23 += pi2;
+            while (d30 >  3.14159265f) d30 -= pi2;
+            while (d30 < -3.14159265f) d30 += pi2;
+
+            float total = d01 + d12 + d23 + d30;
+            int wn = (int)roundf(total / pi2);
+
+            if (wn != 0) {
+                /* Place defect at plaquette center (attribute to top-left cell) */
+                td_winding[y][x] = (signed char)wn;
+                if (wn == 1) { td_dtype[y][x] = 1; vp++; }
+                else if (wn == -1) { td_dtype[y][x] = 2; vn++; }
+                else if (wn >= 2) { td_dtype[y][x] = 4; sd++; }
+                else { td_dtype[y][x] = 5; sd++; }
+            }
+        }
+    }
+
+    /* Step 3: Detect domain walls — regions where neighboring cells have
+       strongly different orientations (angle difference > π/2) */
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            float a = td_angle[y][x];
+            float max_diff = 0.0f;
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    if (dx == 0 && dy == 0) continue;
+                    int ny = y + dy, nx = x + dx;
+                    if (ny >= 0 && ny < H && nx >= 0 && nx < W) {
+                        float diff = fabsf(td_angle[ny][nx] - a);
+                        if (diff > 3.14159265f) diff = pi2 - diff;
+                        if (diff > max_diff) max_diff = diff;
+                    }
+                }
+            }
+            /* Normalize wall strength: 0 at π/4, 1 at π */
+            float ws = (max_diff - 0.7854f) / 2.356f;
+            if (ws < 0.0f) ws = 0.0f;
+            if (ws > 1.0f) ws = 1.0f;
+            td_wall_strength[y][x] = ws;
+            if (ws > 0.3f && td_dtype[y][x] == 0) {
+                td_dtype[y][x] = 3; /* domain wall */
+                wl++;
+            }
+        }
+    }
+
+    /* Step 4: Update global aggregates */
+    int prev_total = td_n_vortex_pos + td_n_vortex_neg + td_n_saddle;
+    int new_total = vp + vn + sd;
+
+    td_prev_charge = td_net_charge;
+    td_prev_total = prev_total;
+
+    td_n_vortex_pos = vp;
+    td_n_vortex_neg = vn;
+    td_n_saddle = sd;
+    td_n_walls = wl;
+    td_net_charge = vp - vn;
+
+    /* Estimate creation/annihilation from total defect count changes.
+       Defects are created/annihilated in pairs (charge neutral), so:
+       - If total increased: creation events ≈ (new - old) / 2
+       - If total decreased: annihilation events ≈ (old - new) / 2 */
+    if (new_total > prev_total) {
+        float cr = (float)(new_total - prev_total) / 2.0f / (H * W);
+        td_creation_rate = td_creation_rate * 0.8f + cr * 0.2f;
+    } else if (new_total < prev_total) {
+        float ar = (float)(prev_total - new_total) / 2.0f / (H * W);
+        td_annihil_rate = td_annihil_rate * 0.8f + ar * 0.2f;
+    }
+    td_creation_rate *= 0.99f;  /* slow decay */
+    td_annihil_rate *= 0.99f;
+
+    /* Charge conservation check */
+    if (td_hist_count > 0 && td_net_charge != td_prev_charge)
+        td_charge_violations++;
+
+    /* Sparkline history */
+    td_hist_charge[td_hist_idx] = (float)td_net_charge;
+    td_hist_total[td_hist_idx] = (float)(vp + vn);
+    td_hist_idx = (td_hist_idx + 1) % TD_HIST_LEN;
+    if (td_hist_count < TD_HIST_LEN) td_hist_count++;
+}
+
 /* ── Causal Emergence computation ──────────────────────────────────────────── */
 /* Color mapping: scale 0 (micro best) = cool blue,
    scale 1 (2x2) = green, scale 2 (4x4) = warm orange,
@@ -9653,6 +9877,7 @@ static void split_ensure_computed(int idx) {
         case 33: if (rd_stale) rd_compute(); break;
         case 34: if (xc_stale && xc_count >= 20) xc_compute(); break;
         case 35: if (sg_stale) sg_compute(); break;
+        case 36: if (td_stale) td_compute(); break;
         default: break;
     }
 }
@@ -11478,6 +11703,47 @@ static int cell_color(int x, int y, RGB *out) {
             }
             out->r = r; out->g = g; out->b = b;
             return grid[y][x] ? 1 : 36; /* 36 = symmetry ghost */
+        }
+        return 0;
+    }
+
+    /* Topological Defect Tracker overlay: vortices, domain walls, saddles */
+    if (td_mode) {
+        int dt = td_dtype[y][x];
+        float ws = td_wall_strength[y][x];
+        if (grid[y][x] || dt > 0 || ws > 0.1f) {
+            unsigned char r, g, b;
+            if (dt == 1) {
+                /* +1 vortex: hot pink-magenta */
+                r = 255; g = 50; b = 180;
+            } else if (dt == 2) {
+                /* -1 vortex: bright cyan */
+                r = 50; g = 220; b = 255;
+            } else if (dt == 4) {
+                /* +2 saddle: bright white */
+                r = 255; g = 255; b = 240;
+            } else if (dt == 5) {
+                /* -2 saddle: pale lavender */
+                r = 200; g = 180; b = 255;
+            } else if (dt == 3 || ws > 0.1f) {
+                /* Domain wall: yellow seam, intensity by wall strength */
+                float w = ws > 0.1f ? ws : 0.3f;
+                r = (unsigned char)(60 + 195 * w);
+                g = (unsigned char)(50 + 180 * w);
+                b = (unsigned char)(10 + 30 * w);
+            } else {
+                /* Ordered region: neutral dark gray-blue */
+                r = 20; g = 22; b = 35;
+                if (grid[y][x]) { r = 40; g = 45; b = 65; }
+            }
+            if (grid[y][x] && dt > 0) {
+                /* Brighten live defect cells */
+                r = (unsigned char)(r < 200 ? r + 55 : 255);
+                g = (unsigned char)(g < 200 ? g + 55 : 255);
+                b = (unsigned char)(b < 200 ? b + 55 : 255);
+            }
+            out->r = r; out->g = g; out->b = b;
+            return grid[y][x] ? 1 : 37; /* 37 = defect ghost */
         }
         return 0;
     }
@@ -17288,6 +17554,202 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", sgrst);
     }
 
+    /* ── Topological Defect Tracker overlay panel ──────────────────────── */
+    if (td_mode) {
+        int td_pw = 50;
+        int td_col = term_cols - td_pw - 2;
+        int td_row = 3;
+        /* Stack below other panels */
+        if (entropy_mode)   td_row += 8;
+        if (temp_mode)      td_row += 9;
+        if (lyapunov_mode)  td_row += 8;
+        if (fourier_mode)   td_row += 18;
+        if (fractal_mode)   td_row += 11;
+        if (wolfram_mode)   td_row += 14;
+        if (flow_mode)      td_row += 9;
+        if (attractor_mode) td_row += 8;
+        if (cone_mode >= 1) td_row += 8;
+        if (surp_mode)      td_row += 8;
+        if (mi_mode)        td_row += 12;
+        if (cplx_mode)      td_row += 11;
+        if (topo_mode)      td_row += 11;
+        if (rg_mode)        td_row += 11;
+        if (kc_mode)        td_row += 9;
+        if (corr_mode)      td_row += 9;
+        if (eprod_mode)     td_row += 9;
+        if (vort_mode)      td_row += 9;
+        if (wave_mode)      td_row += 9;
+        if (ergo_mode)      td_row += 10;
+        if (coh_mode)       td_row += 8;
+        if (ce_mode)        td_row += 9;
+        if (ew_mode)        td_row += 10;
+        if (hr_mode)        td_row += 10;
+        if (rd_mode)        td_row += 13;
+        if (xc_mode && xc_count >= 20) td_row += 28;
+        if (fi_mode && fi_count >= 16)  td_row += 12;
+        if (sg_mode)        td_row += 12;
+        if (td_col < 1) td_col = 1;
+
+        const char *tdbdr = "\033[38;2;255;80;200;48;2;12;6;14m";  /* pink border */
+        const char *tdbg  = "\033[48;2;12;6;14m";
+        const char *tdrst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 \xe2\x9a\xa1 Topo Defects ",
+                     td_row, td_col, tdbdr);
+        for (int i = 19; i < td_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", tdrst);
+
+        /* Row 1: Vortex census */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     td_row + 1, td_col, tdbdr, tdbg);
+        {
+            int n = sprintf(p, " \033[38;2;255;80;200m\xe2\x9c\xba +1:%d"
+                               "  \033[38;2;80;220;255m\xe2\x9c\xba -1:%d"
+                               "  \033[38;2;200;200;80m\xe2\x96\xac wall:%d",
+                            td_n_vortex_pos, td_n_vortex_neg, td_n_walls);
+            p += n;
+            int used = 40;
+            for (int i = used; i < td_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", tdbdr, tdrst);
+
+        /* Row 2: Net charge + conservation */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     td_row + 2, td_col, tdbdr, tdbg);
+        {
+            const char *charge_clr;
+            if (td_net_charge > 0) charge_clr = "\033[38;2;255;100;180m";
+            else if (td_net_charge < 0) charge_clr = "\033[38;2;80;200;255m";
+            else charge_clr = "\033[38;2;150;150;150m";
+            int n = sprintf(p, " \033[38;2;180;160;200mQ=%s%+d"
+                               " \033[38;2;120;120;100msaddle:%d"
+                               " \033[38;2;255;80;60m\xce\x94Q:%d",
+                            charge_clr, td_net_charge,
+                            td_n_saddle, td_charge_violations);
+            p += n;
+            int used = 36;
+            for (int i = used; i < td_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", tdbdr, tdrst);
+
+        /* Row 3: Creation/annihilation rates */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     td_row + 3, td_col, tdbdr, tdbg);
+        {
+            int n = sprintf(p, " \033[38;2;80;255;120m\xe2\x86\x91 create:%.3f%%"
+                               "  \033[38;2;255;80;80m\xe2\x86\x93 annihil:%.3f%%",
+                            td_creation_rate * 100.0f,
+                            td_annihil_rate * 100.0f);
+            p += n;
+            int used = 38;
+            for (int i = used; i < td_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", tdbdr, tdrst);
+
+        /* Row 4: Separator */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     td_row + 4, td_col, tdbdr, tdbg);
+        p += sprintf(p, " \033[38;2;80;50;90m");
+        for (int i = 1; i < td_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", tdbdr, tdrst);
+
+        /* Row 5: Color legend */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     td_row + 5, td_col, tdbdr, tdbg);
+        {
+            int n = sprintf(p, " \033[38;2;255;80;200m\xe2\x97\x8f\033[38;2;140;130;160m+vortex"
+                               " \033[38;2;80;220;255m\xe2\x97\x8f\033[38;2;140;130;160m-vortex"
+                               " \033[38;2;200;180;30m\xe2\x94\x80\033[38;2;140;130;160mwall"
+                               " \033[38;2;140;130;160m[^D]");
+            p += n;
+            int used = 40;
+            for (int i = used; i < td_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", tdbdr, tdrst);
+
+        /* Row 6: Sparkline — total vortex count over time */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     td_row + 6, td_col, tdbdr, tdbg);
+        p += sprintf(p, " \033[38;2;160;140;180mN(t): ");
+        {
+            const char *spark_chars[] = {"\xe2\x96\x81","\xe2\x96\x82","\xe2\x96\x83",
+                                         "\xe2\x96\x84","\xe2\x96\x85","\xe2\x96\x86",
+                                         "\xe2\x96\x87","\xe2\x96\x88"};
+            int nsp = td_hist_count < 32 ? td_hist_count : 32;
+            /* Find max for normalization */
+            float mx = 1.0f;
+            for (int s = 0; s < nsp; s++) {
+                int si = (td_hist_idx - nsp + s + TD_HIST_LEN) % TD_HIST_LEN;
+                if (td_hist_total[si] > mx) mx = td_hist_total[si];
+            }
+            for (int s = 0; s < nsp; s++) {
+                int si = (td_hist_idx - nsp + s + TD_HIST_LEN) % TD_HIST_LEN;
+                float v = td_hist_total[si] / mx;
+                if (v < 0.0f) v = 0.0f;
+                if (v > 1.0f) v = 1.0f;
+                int bi = (int)(v * 7.99f);
+                if (bi > 7) bi = 7;
+                /* Color: pink for positive bias, cyan for negative */
+                float ch = td_hist_charge[si];
+                int sr, sg2, sb;
+                if (ch > 0) { sr = 255; sg2 = (int)(100 + 100*(1-v)); sb = 200; }
+                else if (ch < 0) { sr = 80; sg2 = (int)(180 + 60*v); sb = 255; }
+                else { sr = 160; sg2 = 160; sb = 160; }
+                if (sr > 255) sr = 255; if (sg2 > 255) sg2 = 255;
+                p += sprintf(p, "\033[38;2;%d;%d;%dm%s", sr, sg2, sb, spark_chars[bi]);
+            }
+            for (int i = nsp; i < 32; i++) p += sprintf(p, " ");
+            int used = 7 + 32;
+            for (int i = used; i < td_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", tdbdr, tdrst);
+
+        /* Row 7: Charge sparkline */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     td_row + 7, td_col, tdbdr, tdbg);
+        p += sprintf(p, " \033[38;2;160;140;180mQ(t): ");
+        {
+            const char *spark_chars[] = {"\xe2\x96\x81","\xe2\x96\x82","\xe2\x96\x83",
+                                         "\xe2\x96\x84","\xe2\x96\x85","\xe2\x96\x86",
+                                         "\xe2\x96\x87","\xe2\x96\x88"};
+            int nsp = td_hist_count < 32 ? td_hist_count : 32;
+            float mn = 0.0f, mx2 = 1.0f;
+            for (int s = 0; s < nsp; s++) {
+                int si = (td_hist_idx - nsp + s + TD_HIST_LEN) % TD_HIST_LEN;
+                if (td_hist_charge[si] < mn) mn = td_hist_charge[si];
+                if (td_hist_charge[si] > mx2) mx2 = td_hist_charge[si];
+            }
+            float range = mx2 - mn;
+            if (range < 1.0f) range = 1.0f;
+            for (int s = 0; s < nsp; s++) {
+                int si = (td_hist_idx - nsp + s + TD_HIST_LEN) % TD_HIST_LEN;
+                float v = (td_hist_charge[si] - mn) / range;
+                if (v < 0.0f) v = 0.0f;
+                if (v > 1.0f) v = 1.0f;
+                int bi = (int)(v * 7.99f);
+                if (bi > 7) bi = 7;
+                int cr = (int)(80 + 175 * v);
+                int cg = (int)(80 + 100 * (1.0f - fabsf(v - 0.5f) * 2.0f));
+                int cb = (int)(200 - 120 * v);
+                if (cr > 255) cr = 255; if (cg > 255) cg = 255;
+                p += sprintf(p, "\033[38;2;%d;%d;%dm%s", cr, cg, cb, spark_chars[bi]);
+            }
+            for (int i = nsp; i < 32; i++) p += sprintf(p, " ");
+            int used = 7 + 32;
+            for (int i = used; i < td_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", tdbdr, tdrst);
+
+        /* Bottom border */
+        int td_bottom = td_row + 8;
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", td_bottom, td_col, tdbdr);
+        for (int i = 0; i < td_pw; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", tdrst);
+    }
+
     /* ── Percolation Analysis overlay panel ─────────────────────────────── */
     if (perc_mode) {
         int pc_w = 46;
@@ -20603,6 +21065,19 @@ int main(int argc, char **argv) {
                     printf("\033[2J"); fflush(stdout);
                 } else {
                     flash_set("Symmetry Groups off");
+                    printf("\033[2J"); fflush(stdout);
+                }
+            }
+        }
+        else if (key == 4) { /* Ctrl-D: Topological Defect Tracker */
+            if (!ecosystem_mode) {
+                td_mode = !td_mode;
+                if (td_mode) {
+                    td_reset();
+                    flash_set("Topo Defects: vortices + domain walls + charge [^D]exit");
+                    printf("\033[2J"); fflush(stdout);
+                } else {
+                    flash_set("Topo Defects off");
                     printf("\033[2J"); fflush(stdout);
                 }
             }

@@ -1819,6 +1819,85 @@ DOI: [10.1073/pnas.1314922110](https://doi.org/10.1073/pnas.1314922110)
 
 ---
 
+## Topological Defect Tracker
+
+### Concept
+
+Topological defects are singularities in an order parameter field where the
+field cannot be smoothly defined. They arise in systems undergoing symmetry
+breaking — from superfluid helium to the early universe. In a cellular
+automaton, the "order parameter" is the local orientation of the density
+gradient, and topological defects are points where this orientation becomes
+undefined (all directions equally likely).
+
+The key quantity is the **winding number**: the total angle swept by the
+orientation field as you traverse a closed loop around a point, divided by 2π.
+In continuous systems this is always an integer (a topological invariant). A
+winding number of +1 indicates a vortex (counterclockwise rotation), -1 an
+anti-vortex (clockwise), and 0 means the point is in an ordered region.
+
+### Algorithm
+
+1. **Orientation field**: At each cell, compute the Sobel-weighted gradient
+   (∂ρ/∂x, ∂ρ/∂y) of the binary density field. The orientation angle is
+   θ = atan2(∂ρ/∂y, ∂ρ/∂x) ∈ [0, 2π).
+
+2. **Winding number**: For each 2×2 plaquette, traverse the four corners in
+   order and sum the wrapped angle differences. The total divided by 2π,
+   rounded to the nearest integer, gives the winding number.
+
+3. **Domain walls**: Cells where the maximum angular difference to any
+   neighbor exceeds π/2 are classified as domain wall sites, with intensity
+   proportional to the angular disagreement.
+
+4. **Charge conservation**: In smooth deformations, net topological charge
+   Q = Σ(winding numbers) is conserved. Violations indicate topological
+   phase transitions — events where the field topology changes discontinuously.
+
+### Physical connections
+
+- **Superfluid vortices**: Quantized vortices in He-4 and BECs are +1/-1
+  defects in the superfluid phase. Their dynamics govern turbulence.
+- **Liquid crystals**: Disclinations (half-integer and integer defects) in
+  nematic ordering control texture and response to external fields.
+- **Cosmic strings**: Topological defects formed during cosmological phase
+  transitions. The Kibble-Zurek mechanism predicts defect density from
+  quench rate.
+- **XY model**: The Berezinskii-Kosterlitz-Thouless (BKT) transition is
+  driven by vortex-antivortex unbinding — directly observable in this overlay.
+
+### Color scheme
+
+| Feature | Color | Meaning |
+|---------|-------|---------|
+| +1 vortex | Hot pink (255,50,180) | CCW orientation rotation |
+| -1 vortex | Cyan (50,220,255) | CW orientation rotation |
+| Domain wall | Yellow gradient | Orientation discontinuity |
+| ±2 saddle | White/lavender | Higher-order defect (rare) |
+| Ordered region | Dark gray-blue | Smooth orientation field |
+
+### Panel statistics
+
+- **Vortex census**: Count of +1, -1 vortices and domain wall cells
+- **Net charge Q**: Sum of all winding numbers (ideally conserved)
+- **ΔQ violations**: Count of frames where charge changed unexpectedly
+- **Creation/annihilation rates**: Smoothed pair production/destruction
+- **N(t) sparkline**: Total vortex count history, colored by charge bias
+- **Q(t) sparkline**: Net charge history over time
+
+### References
+
+N. D. Mermin, "The topological theory of defects in ordered media,"
+*Reviews of Modern Physics*, vol. 51, no. 3, pp. 591–648, 1979.
+DOI: [10.1103/RevModPhys.51.591](https://doi.org/10.1103/RevModPhys.51.591)
+
+J. M. Kosterlitz and D. J. Thouless, "Ordering, metastability and phase
+transitions in two-dimensional systems," *Journal of Physics C*, vol. 6,
+pp. 1181–1203, 1973.
+DOI: [10.1088/0022-3719/6/7/010](https://doi.org/10.1088/0022-3719/6/7/010)
+
+---
+
 ## References
 
 [1] M. Gardner, "Mathematical Games: The fantastic combinations of John

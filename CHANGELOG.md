@@ -1,8 +1,32 @@
 # Changelog
 
 Development history organized by round. Each round adds one or two major
-features. The project grew from ~790 lines (Round 1) to ~21,300 lines
-(Round 69).
+features. The project grew from ~790 lines (Round 1) to ~21,800 lines
+(Round 70).
+
+## Round 70 — Topological Defect Tracker Overlay
+
+Opens a new analytical domain: **condensed matter defect physics and
+topological charge dynamics**. Press `Ctrl-D` to detect and classify
+topological defects in the automaton's orientation field. Computes a
+Sobel-weighted density gradient at each cell to derive a continuous
+orientation angle θ(x,y), then calculates discrete winding numbers
+around every 2×2 plaquette — the total angular rotation around a closed
+loop, divided by 2π. Non-zero winding number = topological defect.
+Classifies: **+1 vortices** (hot pink, orientation rotates one full CCW
+turn), **-1 vortices** (cyan, CW turn), **domain walls** (yellow seams
+where neighboring orientations disagree by >π/2), and **higher-order
+saddles** (±2, rare, white/lavender). Tracks net topological charge Q
+(should be conserved in smooth deformations — violations signal
+topological phase transitions). Monitors defect pair creation and
+annihilation rates with exponential smoothing. Sidebar panel shows full
+defect census, net charge with conservation violation counter,
+creation/annihilation rates, color legend, and dual sparklines (total
+vortex count colored by charge bias, and net charge history). Ghost layer
+#37. Connects to superfluid vortex dynamics, liquid crystal disclination
+networks, and cosmic string theory. Complements Symmetry Group (what
+order exists) by revealing *where order breaks down* and classifying
+*how* it breaks. 37th analysis overlay. +480 lines.
 
 ## Round 69 — Symmetry Group Detection Overlay
 

@@ -94,6 +94,9 @@
  *   "           Toggle geodesic distance field (click to set seed)
  *                 BFS shortest-path through live cell network
  *                 White=seed, cyan→green→yellow→red by distance, gray=isolated
+ *   /           Toggle 3D strange attractor (rotating metric trajectory)
+ *                 [</>] cycle X metric, [{/}] cycle Z metric
+ *                 Arrow keys rotate camera, [R] toggle auto-rotate
  *   K           Toggle spacetime kymograph (1D slice through time)
  *                 Y-axis=time (scrolling up), X-axis=space (scan row)
  *                 Arrow Up/Down to move scan row; gliders appear as diagonals
@@ -907,6 +910,47 @@ static void  rp_reset(void) {
             rp_dist[i][j] = 0.0f;
 }
 
+/* ── 3D Strange Attractor Viewer ──────────────────────────────────────────── */
+/* Extends the 2D phase portrait into 3D: pick any 3 of the 16 scalar metrics
+   as X/Y/Z axes, accumulate a trajectory in a ring buffer, project through a
+   rotatable camera using pitch/yaw angles, and render as a Braille dot cloud
+   with depth-based coloring (bright near, dim far).  Reveals toroidal orbits,
+   strange attractors, and bifurcation manifolds invisible in any 2D slice.
+   Toggle with '/' key.  '<'/'>' cycle X metric, arrow-up/down cycle Y,
+   '{'/'}' cycle Z metric while active. */
+
+#define SA_HIST_LEN 256   /* 3D trajectory history length */
+
+static int   sa_mode = 0;             /* 0=off, 1=on */
+static int   sa_x_metric = 0;         /* X axis metric index */
+static int   sa_y_metric = 1;         /* Y axis metric index */
+static int   sa_z_metric = 2;         /* Z axis metric index */
+
+static float sa_hist_x[SA_HIST_LEN];
+static float sa_hist_y[SA_HIST_LEN];
+static float sa_hist_z[SA_HIST_LEN];
+static int   sa_hist_head = 0;
+static int   sa_hist_count = 0;
+
+/* Auto-range tracking */
+static float sa_x_min = 1e30f, sa_x_max = -1e30f;
+static float sa_y_min = 1e30f, sa_y_max = -1e30f;
+static float sa_z_min = 1e30f, sa_z_max = -1e30f;
+
+/* Camera angles (radians) */
+static float sa_yaw   = 0.4f;   /* rotation around vertical axis */
+static float sa_pitch = 0.3f;   /* tilt up/down */
+static int   sa_auto_rotate = 1; /* auto-rotate when 1 */
+
+static void sa_record(void);
+static void sa_reset(void) {
+    sa_hist_head = 0;
+    sa_hist_count = 0;
+    sa_x_min = 1e30f; sa_x_max = -1e30f;
+    sa_y_min = 1e30f; sa_y_max = -1e30f;
+    sa_z_min = 1e30f; sa_z_max = -1e30f;
+}
+
 /* ── Spacetime Kymograph ─────────────────────────────────────────────────── */
 /* Displays a 1D horizontal slice of the grid evolving over time as a 2D
    spacetime diagram.  Y-axis = time (scrolling upward), X-axis = grid row.
@@ -1329,6 +1373,24 @@ static void pp_record(void) {
     if (x > pp_x_max) pp_x_max = x;
     if (y < pp_y_min) pp_y_min = y;
     if (y > pp_y_max) pp_y_max = y;
+}
+
+/* ── 3D Strange Attractor record implementation ───────────────────────────── */
+static void sa_record(void) {
+    float x = pp_read_metric(sa_x_metric);
+    float y = pp_read_metric(sa_y_metric);
+    float z = pp_read_metric(sa_z_metric);
+    sa_hist_x[sa_hist_head] = x;
+    sa_hist_y[sa_hist_head] = y;
+    sa_hist_z[sa_hist_head] = z;
+    sa_hist_head = (sa_hist_head + 1) % SA_HIST_LEN;
+    if (sa_hist_count < SA_HIST_LEN) sa_hist_count++;
+    if (x < sa_x_min) sa_x_min = x;
+    if (x > sa_x_max) sa_x_max = x;
+    if (y < sa_y_min) sa_y_min = y;
+    if (y > sa_y_max) sa_y_max = y;
+    if (z < sa_z_min) sa_z_min = z;
+    if (z > sa_z_max) sa_z_max = z;
 }
 
 /* ── Kymograph record implementation (needs W, H) ────────────────────────── */
@@ -2919,6 +2981,7 @@ static void demo_reset_overlays(void) {
     cm_mode = 0;
     gd_mode = 0;
     rp_mode = 0;
+    sa_mode = 0;
     fourier_mode = 0;
     fractal_mode = 0;
     wolfram_mode = 0;
@@ -9259,6 +9322,16 @@ static void render(int running, int speed_ms, int draw_mode) {
                  rp_count, RP_SIZE);
     }
 
+    /* 3D attractor indicator */
+    char sa_str[128] = "";
+    if (sa_mode) {
+        snprintf(sa_str, sizeof(sa_str),
+                 " \033[38;2;60;180;220m\xe2\x97\x86" "3D:%s\xc3\x97%s\xc3\x97%s\033[0m",
+                 pp_metric_table[sa_x_metric].name,
+                 pp_metric_table[sa_y_metric].name,
+                 pp_metric_table[sa_z_metric].name);
+    }
+
     /* Split-screen indicator */
     char split_str[128] = "";
     if (split_mode) {
@@ -9405,9 +9478,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, gd_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, corr_str, eprod_str, wave_str, pp_str, cm_str, rp_str, split_str, kymo_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
+                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, gd_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, corr_str, eprod_str, wave_str, pp_str, cm_str, rp_str, sa_str, split_str, kymo_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -14081,6 +14154,229 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", rprst);
     }
 
+    /* ── 3D Strange Attractor overlay panel ──────────────────────────────── */
+    if (sa_mode && sa_hist_count > 2) {
+        int sa_pw = 48;  /* panel width in terminal columns */
+        int sa_col = term_cols - sa_pw - 2;
+        int sa_row_p = 3;
+        /* Stack below other active panels */
+        if (entropy_mode)   sa_row_p += 8;
+        if (temp_mode)      sa_row_p += 9;
+        if (lyapunov_mode)  sa_row_p += 8;
+        if (fourier_mode)   sa_row_p += 18;
+        if (fractal_mode)   sa_row_p += 11;
+        if (wolfram_mode)   sa_row_p += 14;
+        if (flow_mode)      sa_row_p += 9;
+        if (attractor_mode) sa_row_p += 8;
+        if (cone_mode)      sa_row_p += 12;
+        if (surp_mode)      sa_row_p += 8;
+        if (mi_mode)        sa_row_p += 8;
+        if (cplx_mode)      sa_row_p += 8;
+        if (topo_mode)      sa_row_p += 10;
+        if (rg_mode)        sa_row_p += 12;
+        if (kc_mode)        sa_row_p += 11;
+        if (corr_mode)      sa_row_p += 10;
+        if (eprod_mode)     sa_row_p += 8;
+        if (vort_mode)      sa_row_p += 8;
+        if (wave_mode)      sa_row_p += 8;
+        if (ergo_mode)      sa_row_p += 10;
+        if (perc_mode)      sa_row_p += 10;
+        if (ising_mode)     sa_row_p += 10;
+        if (pb_mode)        sa_row_p += 14;
+        if (gd_mode >= 2)   sa_row_p += 8;
+        if (pp_mode)        sa_row_p += 18;
+        if (cm_mode && cm_count >= 4) sa_row_p += 8 + CM_N;
+        if (rp_mode && rp_count >= 4) sa_row_p += 10 + (rp_count < RP_DISP ? (rp_count+1)/2 : (RP_DISP+1)/2);
+        if (sa_col < 1) sa_col = 1;
+
+        /* Braille canvas: 36 chars wide × 16 chars tall = 72×64 dots */
+        #define SA_CW 36
+        #define SA_CH 16
+        #define SA_DW (SA_CW * 2)
+        #define SA_DH (SA_CH * 4)
+
+        unsigned char sa_canvas[SA_CH][SA_CW];
+        unsigned char sa_depth[SA_CH][SA_CW]; /* depth-based brightness (0-255) */
+        for (int j = 0; j < SA_CH; j++)
+            for (int i = 0; i < SA_CW; i++) {
+                sa_canvas[j][i] = 0;
+                sa_depth[j][i] = 0;
+            }
+
+        /* Compute axis ranges with padding */
+        float xmin3 = sa_x_min, xmax3 = sa_x_max;
+        float ymin3 = sa_y_min, ymax3 = sa_y_max;
+        float zmin3 = sa_z_min, zmax3 = sa_z_max;
+        float xpad3 = (xmax3 - xmin3) * 0.05f + 1e-6f;
+        float ypad3 = (ymax3 - ymin3) * 0.05f + 1e-6f;
+        float zpad3 = (zmax3 - zmin3) * 0.05f + 1e-6f;
+        xmin3 -= xpad3; xmax3 += xpad3;
+        ymin3 -= ypad3; ymax3 += ypad3;
+        zmin3 -= zpad3; zmax3 += zpad3;
+        float xr3 = xmax3 - xmin3; if (xr3 < 1e-12f) xr3 = 1.0f;
+        float yr3 = ymax3 - ymin3; if (yr3 < 1e-12f) yr3 = 1.0f;
+        float zr3 = zmax3 - zmin3; if (zr3 < 1e-12f) zr3 = 1.0f;
+
+        /* Auto-rotate camera */
+        if (sa_auto_rotate && running) {
+            sa_yaw += 0.02f;
+            if (sa_yaw > 6.2832f) sa_yaw -= 6.2832f;
+        }
+
+        /* Precompute rotation matrix (yaw around Y, pitch around X) */
+        float cy = cosf(sa_yaw),  sy = sinf(sa_yaw);
+        float cp = cosf(sa_pitch), sp = sinf(sa_pitch);
+
+        /* Project and plot all history points */
+        for (int k = 0; k < sa_hist_count; k++) {
+            int idx = (sa_hist_head - sa_hist_count + k + SA_HIST_LEN) % SA_HIST_LEN;
+            /* Normalize to [-1, 1] */
+            float nx = 2.0f * (sa_hist_x[idx] - xmin3) / xr3 - 1.0f;
+            float ny = 2.0f * (sa_hist_y[idx] - ymin3) / yr3 - 1.0f;
+            float nz = 2.0f * (sa_hist_z[idx] - zmin3) / zr3 - 1.0f;
+
+            /* Rotate: yaw around Y axis, then pitch around X axis */
+            float rx =  nx * cy + nz * sy;
+            float ry2 = ny * cp - (-nx * sy + nz * cy) * sp;
+            float rz = ny * sp + (-nx * sy + nz * cy) * cp;
+
+            /* Perspective projection (weak perspective: camera at z=4) */
+            float persp = 4.0f / (4.0f + rz);
+            float sx2 = rx * persp;
+            float sy2 = ry2 * persp;
+
+            /* Map to dot coordinates */
+            int dx = (int)((sx2 + 1.0f) * 0.5f * (SA_DW - 1));
+            int dy = (int)((1.0f - (sy2 + 1.0f) * 0.5f) * (SA_DH - 1));
+            if (dx < 0) dx = 0; if (dx >= SA_DW) dx = SA_DW - 1;
+            if (dy < 0) dy = 0; if (dy >= SA_DH) dy = SA_DH - 1;
+
+            int cx2 = dx / 2;
+            int cy2 = dy / 4;
+            int bx = dx % 2;
+            int by = dy % 4;
+
+            unsigned char bit;
+            if (bx == 0) bit = (by < 3) ? (1 << by) : (1 << 6);
+            else         bit = (by < 3) ? (1 << (by + 3)) : (1 << 7);
+            sa_canvas[cy2][cx2] |= bit;
+
+            /* Brightness: combine recency and depth */
+            /* Recency: older=dim, newer=bright */
+            float age_f = (float)k / (sa_hist_count > 1 ? (float)(sa_hist_count - 1) : 1.0f);
+            /* Depth: near(rz<0)=bright, far(rz>0)=dim */
+            float depth_f = 1.0f - (rz + 1.0f) * 0.25f; /* rz in [-1,1] roughly */
+            if (depth_f < 0.2f) depth_f = 0.2f;
+            if (depth_f > 1.0f) depth_f = 1.0f;
+            unsigned char br = (unsigned char)(30 + (225 * age_f * depth_f));
+            if (br > sa_depth[cy2][cx2]) sa_depth[cy2][cx2] = br;
+        }
+
+        const char *sabdr = "\033[38;2;60;180;220;48;2;4;12;18m";
+        const char *sabg  = "\033[48;2;4;12;18m";
+        const char *sarst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 3D Attractor ",
+                     sa_row_p, sa_col, sabdr);
+        for (int i = 16; i < sa_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", sarst);
+
+        /* Row 1: Current values */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     sa_row_p + 1, sa_col, sabdr, sabg);
+        {
+            float cur_x = pp_read_metric(sa_x_metric);
+            float cur_y = pp_read_metric(sa_y_metric);
+            float cur_z = pp_read_metric(sa_z_metric);
+            int nn = sprintf(p, " \033[38;2;255;100;100mX:\033[38;2;255;200;200m%-7.1f"
+                                " \033[38;2;100;255;100mY:\033[38;2;200;255;200m%-7.1f"
+                                " \033[38;2;100;150;255mZ:\033[38;2;200;220;255m%-7.1f",
+                             cur_x, cur_y, cur_z);
+            p += nn;
+            int used = 36;
+            for (int i = used; i < sa_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", sabdr, sarst);
+
+        /* Row 2: Axis labels + point count */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     sa_row_p + 2, sa_col, sabdr, sabg);
+        {
+            int nn = sprintf(p, " \033[38;2;120;160;180m%s/%s/%s  n=%d  %s",
+                             pp_metric_table[sa_x_metric].name,
+                             pp_metric_table[sa_y_metric].name,
+                             pp_metric_table[sa_z_metric].name,
+                             sa_hist_count,
+                             sa_auto_rotate ? "\xe2\x86\xbb" : "\xe2\x97\x8b");
+            p += nn;
+            int used = 4 + (int)strlen(pp_metric_table[sa_x_metric].name) + 1
+                     + (int)strlen(pp_metric_table[sa_y_metric].name) + 1
+                     + (int)strlen(pp_metric_table[sa_z_metric].name)
+                     + 5 + (sa_hist_count >= 100 ? 3 : sa_hist_count >= 10 ? 2 : 1)
+                     + 2;
+            for (int i = used; i < sa_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", sabdr, sarst);
+
+        /* Rows 3..3+SA_CH-1: Braille 3D scatter plot */
+        for (int row = 0; row < SA_CH; row++) {
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s ",
+                         sa_row_p + 3 + row, sa_col, sabdr, sabg);
+            for (int col = 0; col < SA_CW; col++) {
+                unsigned char dots = sa_canvas[row][col];
+                unsigned int cp2 = 0x2800 + dots;
+                unsigned char b1 = 0xE0 | (cp2 >> 12);
+                unsigned char b2 = 0x80 | ((cp2 >> 6) & 0x3F);
+                unsigned char b3 = 0x80 | (cp2 & 0x3F);
+                if (dots > 0) {
+                    unsigned char br2 = sa_depth[row][col];
+                    /* Color: cyan-to-white based on depth brightness */
+                    int r3 = (int)(br2 * 0.4f);
+                    int g3 = (int)(br2 * 0.85f);
+                    int b4 = (int)(br2);
+                    if (r3 > 255) r3 = 255;
+                    if (g3 > 255) g3 = 255;
+                    if (b4 > 255) b4 = 255;
+                    p += sprintf(p, "\033[38;2;%d;%d;%dm", r3, g3, b4);
+                }
+                *p++ = b1; *p++ = b2; *p++ = b3;
+                if (dots > 0) p += sprintf(p, "%s", sabg);
+            }
+            {
+                int used = 1 + SA_CW;
+                for (int i = used; i < sa_pw - 1; i++) *p++ = ' ';
+            }
+            p += sprintf(p, "%s\xe2\x94\x82%s", sabdr, sarst);
+        }
+
+        /* Row: Camera info */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     sa_row_p + 3 + SA_CH, sa_col, sabdr, sabg);
+        {
+            int nn = sprintf(p, " \033[38;2;100;140;160myaw=%.0f\xc2\xb0 pitch=%.0f\xc2\xb0"
+                                "  [/]exit [R]rotate",
+                             sa_yaw * 57.2958f, sa_pitch * 57.2958f);
+            p += nn;
+            int used = 38;
+            for (int i = used; i < sa_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", sabdr, sarst);
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94",
+                     sa_row_p + 4 + SA_CH, sa_col, sabdr);
+        for (int i = 0; i < sa_pw; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", sarst);
+
+        #undef SA_CW
+        #undef SA_CH
+        #undef SA_DW
+        #undef SA_DH
+    }
+
     /* ── Cell Probe Inspector overlay panel ──────────────────────────────── */
     if (probe_mode == 2 && probe_x >= 0 && probe_x < W && probe_y >= 0 && probe_y < H) {
         int pp_w = 48;
@@ -14871,6 +15167,30 @@ int main(int argc, char **argv) {
                 grid_step();
             }
         }
+        else if ((key == '<' || key == ',') && sa_mode) {
+            /* 3D attractor: cycle X metric */
+            sa_x_metric = (sa_x_metric + 1) % PP_N_METRICS;
+            while (sa_x_metric == sa_y_metric || sa_x_metric == sa_z_metric)
+                sa_x_metric = (sa_x_metric + 1) % PP_N_METRICS;
+            sa_reset();
+            {
+                char fb[128];
+                snprintf(fb, sizeof(fb), "3D X: %s", pp_metric_table[sa_x_metric].name);
+                flash_set(fb);
+            }
+        }
+        else if ((key == '>' || key == '.') && sa_mode) {
+            /* 3D attractor: cycle Y metric */
+            sa_y_metric = (sa_y_metric + 1) % PP_N_METRICS;
+            while (sa_y_metric == sa_x_metric || sa_y_metric == sa_z_metric)
+                sa_y_metric = (sa_y_metric + 1) % PP_N_METRICS;
+            sa_reset();
+            {
+                char fb[128];
+                snprintf(fb, sizeof(fb), "3D Y: %s", pp_metric_table[sa_y_metric].name);
+                flash_set(fb);
+            }
+        }
         else if ((key == '<' || key == ',') && pp_mode) {
             /* Phase portrait: cycle X metric */
             pp_x_metric = (pp_x_metric + 1) % PP_N_METRICS;
@@ -14937,6 +15257,10 @@ int main(int argc, char **argv) {
         }
         else if (key == 5) /* Ctrl-E: export RLE */
             export_rle();
+        else if (key == 'R' && sa_mode) {
+            sa_auto_rotate = !sa_auto_rotate;
+            flash_set(sa_auto_rotate ? "3D: auto-rotate ON" : "3D: auto-rotate OFF");
+        }
         else if (key == 'r' || key == 'R') {
             grid_randomize(0.25);
             timeline_push(); /* save initial state */
@@ -15225,6 +15549,17 @@ int main(int argc, char **argv) {
                 printf("\033[2J"); fflush(stdout);
             }
         }
+        else if (key == '/') {
+            sa_mode = !sa_mode;
+            if (sa_mode) {
+                sa_reset();
+                flash_set("3D Attractor: [<>]X [{|}]Z [\xe2\x86\x91\xe2\x86\x93]pitch [R]rotate [/]exit");
+                printf("\033[2J"); fflush(stdout);
+            } else {
+                flash_set("3D Attractor off");
+                printf("\033[2J"); fflush(stdout);
+            }
+        }
         else if (key == '\\') {
             split_mode = !split_mode;
             if (split_mode) {
@@ -15368,7 +15703,18 @@ int main(int argc, char **argv) {
                 brush_species = (brush_species == 1) ? 2 : 1;
         }
         else if (key == '{') {
-            if (temp_mode) {
+            if (sa_mode) {
+                /* 3D attractor: cycle Z metric backward */
+                sa_z_metric = (sa_z_metric - 1 + PP_N_METRICS) % PP_N_METRICS;
+                while (sa_z_metric == sa_x_metric || sa_z_metric == sa_y_metric)
+                    sa_z_metric = (sa_z_metric - 1 + PP_N_METRICS) % PP_N_METRICS;
+                sa_reset();
+                {
+                    char fb[128];
+                    snprintf(fb, sizeof(fb), "3D Z: %s", pp_metric_table[sa_z_metric].name);
+                    flash_set(fb);
+                }
+            } else if (temp_mode) {
                 temp_global -= 0.01f;
                 if (temp_global < 0.0f) temp_global = 0.0f;
             } else {
@@ -15377,7 +15723,18 @@ int main(int argc, char **argv) {
             }
         }
         else if (key == '}') {
-            if (temp_mode) {
+            if (sa_mode) {
+                /* 3D attractor: cycle Z metric forward */
+                sa_z_metric = (sa_z_metric + 1) % PP_N_METRICS;
+                while (sa_z_metric == sa_x_metric || sa_z_metric == sa_y_metric)
+                    sa_z_metric = (sa_z_metric + 1) % PP_N_METRICS;
+                sa_reset();
+                {
+                    char fb[128];
+                    snprintf(fb, sizeof(fb), "3D Z: %s", pp_metric_table[sa_z_metric].name);
+                    flash_set(fb);
+                }
+            } else if (temp_mode) {
                 temp_global += 0.01f;
                 if (temp_global > 1.0f) temp_global = 1.0f;
             } else {
@@ -15424,7 +15781,10 @@ int main(int argc, char **argv) {
             viewport_center();
         }
         else if (key == KEY_UP) {
-            if (kymo_mode) {
+            if (sa_mode) {
+                sa_pitch -= 0.15f;
+                sa_auto_rotate = 0;
+            } else if (kymo_mode) {
                 kymo_scan_row--;
                 if (kymo_scan_row < 0) kymo_scan_row = H - 1;
                 /* Clear buffer when scan row changes for clean view */
@@ -15432,14 +15792,23 @@ int main(int argc, char **argv) {
             } else viewport_pan(0, -1);
         }
         else if (key == KEY_DOWN) {
-            if (kymo_mode) {
+            if (sa_mode) {
+                sa_pitch += 0.15f;
+                sa_auto_rotate = 0;
+            } else if (kymo_mode) {
                 kymo_scan_row++;
                 if (kymo_scan_row >= H) kymo_scan_row = 0;
                 kymo_count = 0; kymo_head = 0;
             } else viewport_pan(0, 1);
         }
-        else if (key == KEY_LEFT) viewport_pan(-1, 0);
-        else if (key == KEY_RIGHT) viewport_pan(1, 0);
+        else if (key == KEY_LEFT) {
+            if (sa_mode) { sa_yaw -= 0.15f; sa_auto_rotate = 0; }
+            else viewport_pan(-1, 0);
+        }
+        else if (key == KEY_RIGHT) {
+            if (sa_mode) { sa_yaw += 0.15f; sa_auto_rotate = 0; }
+            else viewport_pan(1, 0);
+        }
         else if (key == KEY_MOUSE) {
             MouseEvent *m = &last_mouse;
             int btn = m->button & 0x43;
@@ -15843,6 +16212,11 @@ int main(int argc, char **argv) {
             if (rp_stale && rp_count >= 4) {
                 rp_compute();
             }
+        }
+
+        /* 3D attractor: record 3-metric state every 2 generations */
+        if (sa_mode && running && (generation % 2 == 0)) {
+            sa_record();
         }
 
         render(running, speed_ms, draw_mode);

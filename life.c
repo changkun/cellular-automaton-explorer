@@ -83,6 +83,9 @@
  *                 Cyan=positive amplitude, dark=zero, orange=negative
  *   (           Toggle ergodicity metric (time-avg vs space-avg convergence)
  *                 Green=ergodic (averages match), magenta=non-ergodic (frozen)
+ *   )           Toggle split-screen dual overlay comparison
+ *                 Shows two overlays side-by-side on the same simulation
+ *                 TAB cycles right panel overlay, ` cycles left panel overlay
  *   D           Auto-demo mode — curated tour of pattern + overlay combos
  *                 Cycles through 10 scenes; press any key to exit and explore
  *   ?           Toggle cell probe inspector (click any cell for all metrics)
@@ -636,6 +639,51 @@ static int   probe_mode = 0;          /* 0=off, 1=on (awaiting click), 2=showing
 static int   probe_x = -1;            /* selected cell x */
 static int   probe_y = -1;            /* selected cell y */
 
+/* ── Split-Screen Dual Overlay Comparison ────────────────────────────────── */
+/* Shows two overlays side-by-side on the same simulation.
+   Toggle with ')' key. TAB cycles the right panel, '`' cycles the left. */
+
+/* Overlay table: ordered list of analysis overlays for cycling */
+#define N_SPLIT_OVERLAYS 21
+typedef struct {
+    const char *name;   /* short display name */
+    char key;           /* toggle key character */
+} SplitOverlayInfo;
+
+static const SplitOverlayInfo split_overlay_table[N_SPLIT_OVERLAYS] = {
+    { "None",          '0' },  /*  0: plain cells (heatmap/base) */
+    { "Frequency",     'f' },  /*  1 */
+    { "Entropy",       'i' },  /*  2 */
+    { "Lyapunov",      'L' },  /*  3 */
+    { "Fourier",       'u' },  /*  4 */
+    { "Fractal",       'F' },  /*  5 */
+    { "Flow",          'O' },  /*  6 */
+    { "Attractor",     'A' },  /*  7 */
+    { "Surprise",      '!' },  /*  8 */
+    { "Mutual Info",   '@' },  /*  9 */
+    { "Complexity",    '#' },  /* 10 */
+    { "Topology",      '$' },  /* 11 */
+    { "RG Flow",       '%' },  /* 12 */
+    { "Kolmogorov",    '^' },  /* 13 */
+    { "Correlation",   '&' },  /* 14 */
+    { "dS/dt",         '=' },  /* 15 */
+    { "Vorticity",     '*' },  /* 16 */
+    { "Wave",          '~' },  /* 17 */
+    { "Ergodicity",    '(' },  /* 18 */
+    { "Wolfram",       'C' },  /* 19 */
+    { "Census",        'v' },  /* 20 */
+};
+
+static int split_mode = 0;         /* 0=off, 1=on */
+static int split_left = 2;         /* overlay index for left panel (default: Entropy) */
+static int split_right = 16;       /* overlay index for right panel (default: Vorticity) */
+static int split_active = -1;      /* runtime: which overlay to force in cell_color (-1=normal) */
+
+/* Forward declarations — defined after all overlay mode vars are declared */
+static void split_set_overlay(int idx);
+static int  split_detect_current(void);
+static void split_ensure_computed(int idx);
+
 /* ── Auto-Demo Mode ──────────────────────────────────────────────────────── */
 
 #define DEMO_N_SCENES 10
@@ -671,6 +719,64 @@ static char demo_caption[256] = "";
 /* ── Pattern Census ───────────────────────────────────────────────────────── */
 static int census_mode = 0;    /* 0=off, 1=on */
 static int census_stale = 1;   /* 1=needs recomputation */
+
+/* ── Split-screen function implementations (need census_mode to be declared) ── */
+static void split_set_overlay(int idx) {
+    /* Disable all analysis overlays */
+    freq_mode = 0; entropy_mode = 0; lyapunov_mode = 0; fourier_mode = 0;
+    fractal_mode = 0; wolfram_mode = 0; flow_mode = 0; attractor_mode = 0;
+    surp_mode = 0; mi_mode = 0; cplx_mode = 0; topo_mode = 0;
+    rg_mode = 0; kc_mode = 0; corr_mode = 0; eprod_mode = 0;
+    wave_mode = 0; vort_mode = 0; ergo_mode = 0; census_mode = 0;
+
+    switch (idx) {
+        case  0: break;
+        case  1: freq_mode = 1; break;
+        case  2: entropy_mode = 1; break;
+        case  3: lyapunov_mode = 1; break;
+        case  4: fourier_mode = 1; break;
+        case  5: fractal_mode = 1; break;
+        case  6: flow_mode = 1; break;
+        case  7: attractor_mode = 1; break;
+        case  8: surp_mode = 1; break;
+        case  9: mi_mode = 1; break;
+        case 10: cplx_mode = 1; break;
+        case 11: topo_mode = 1; break;
+        case 12: rg_mode = 1; break;
+        case 13: kc_mode = 1; break;
+        case 14: corr_mode = 1; break;
+        case 15: eprod_mode = 1; break;
+        case 16: vort_mode = 1; break;
+        case 17: wave_mode = 1; break;
+        case 18: ergo_mode = 1; break;
+        case 19: wolfram_mode = 1; break;
+        case 20: census_mode = 1; break;
+    }
+}
+
+static int split_detect_current(void) {
+    if (freq_mode) return 1;
+    if (entropy_mode) return 2;
+    if (lyapunov_mode) return 3;
+    if (fourier_mode) return 4;
+    if (fractal_mode) return 5;
+    if (flow_mode) return 6;
+    if (attractor_mode) return 7;
+    if (surp_mode) return 8;
+    if (mi_mode) return 9;
+    if (cplx_mode) return 10;
+    if (topo_mode) return 11;
+    if (rg_mode) return 12;
+    if (kc_mode) return 13;
+    if (corr_mode) return 14;
+    if (eprod_mode) return 15;
+    if (vort_mode) return 16;
+    if (wave_mode) return 17;
+    if (ergo_mode) return 18;
+    if (wolfram_mode) return 19;
+    if (census_mode) return 20;
+    return 0;
+}
 
 /* Census pattern templates: bitmask-based matching for small patterns.
    Each pattern is stored as a WxH bitmask grid (max 6x6).
@@ -2266,6 +2372,7 @@ static void demo_reset_overlays(void) {
     portal_mode = 0;
     temp_mode = 0;
     ecosystem_mode = 0;
+    split_mode = 0;
 }
 
 static void demo_setup_scene(int idx) {
@@ -6043,6 +6150,33 @@ static int flash_active(void) {
     return now < flash_until;
 }
 
+/* ── Split-screen overlay compute helper ─────────────────────────────────── */
+static void split_ensure_computed(int idx) {
+    switch (idx) {
+        case  1: if (freq_stale) freq_analyze(); break;
+        case  2: if (entropy_stale) entropy_compute(); break;
+        case  3: if (lyapunov_stale) lyapunov_compute(); break;
+        case  4: if (fourier_stale) fourier_compute(); break;
+        case  5: if (fractal_stale) fractal_compute(); break;
+        case  6: if (flow_stale) flow_compute(); break;
+        case  7: if (attractor_stale) attractor_compute(); break;
+        case  8: if (surp_stale) surp_compute(); break;
+        case  9: if (mi_stale) mi_compute(); break;
+        case 10: if (cplx_stale) cplx_compute(); break;
+        case 11: if (topo_stale) topo_compute(); break;
+        case 12: if (rg_stale) rg_compute(); break;
+        case 13: if (kc_stale) kc_compute(); break;
+        case 14: if (corr_stale) corr_compute(); break;
+        case 15: if (eprod_stale) eprod_compute(); break;
+        case 16: if (vort_stale) vort_compute(); break;
+        case 17: if (wave_stale) wave_compute(); break;
+        case 18: if (ergo_stale) ergo_compute(); break;
+        case 19: if (wolfram_stale) wolfram_classify(); break;
+        case 20: if (census_stale) census_scan(); break;
+        default: break;
+    }
+}
+
 /* Forward declaration for cell_color (defined later after rendering helpers) */
 static int cell_color(int x, int y, RGB *out);
 
@@ -7937,6 +8071,15 @@ static void render(int running, int speed_ms, int draw_mode) {
                  " \033[38;2;40;200;220m\xe2\x97\x86\xe2\x89\x88%.1fE\033[0m", wave_energy);
     }
 
+    /* Split-screen indicator */
+    char split_str[128] = "";
+    if (split_mode) {
+        snprintf(split_str, sizeof(split_str),
+                 " \033[38;2;180;140;255m\xe2\x96\x8a" "SPLIT:%s|%s\033[0m",
+                 split_overlay_table[split_left].name,
+                 split_overlay_table[split_right].name);
+    }
+
     /* Probe mode indicator */
     char probe_str[96] = "";
     if (probe_mode == 1)
@@ -8065,9 +8208,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, corr_str, eprod_str, wave_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
+                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, corr_str, eprod_str, wave_str, split_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -8106,77 +8249,134 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
                          "[1-5]pre [d]draw [D]demo [k]sym [g]graph [y]dash [w]topo [h]heat [T]trace [f]freq [i]ent [L]lyap [u]fft "
                          "[X]temp [C]class [O]flow [9]cone [!]surp [@]mi [#]cplx [$]topo [=]dS/dt [/]rule [m]mut [b]edit [G]evolve [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
-                         "[S]stamp [v]census [?]probe [z/x]zoom [n]map [<>]time [t]tbar [P]snap C-p:seq "
+                         "[S]stamp [v]census [?]probe [)]split [z/x]zoom [n]map [<>]time [t]tbar [P]snap C-p:seq "
                          "C-s:save C-o:load C-e:rle [q]quit\033[0m\033[K\n");
     }
 
     int usable_rows = term_rows - 3;
     if (usable_rows < 5) usable_rows = 5;
 
+    /* ── Split-screen: save/restore overlay state around rendering ──── */
+    /* We save all overlay mode flags so we can swap them per-half */
+    int split_saved_freq, split_saved_entropy, split_saved_lyapunov, split_saved_fourier;
+    int split_saved_fractal, split_saved_wolfram, split_saved_flow, split_saved_attractor;
+    int split_saved_surp, split_saved_mi, split_saved_cplx, split_saved_topo;
+    int split_saved_rg, split_saved_kc, split_saved_corr, split_saved_eprod;
+    int split_saved_wave, split_saved_vort, split_saved_ergo, split_saved_census;
+    int split_mid = view_w / 2; /* column divider position */
+
+    if (split_mode) {
+        /* Save all mode flags */
+        split_saved_freq = freq_mode; split_saved_entropy = entropy_mode;
+        split_saved_lyapunov = lyapunov_mode; split_saved_fourier = fourier_mode;
+        split_saved_fractal = fractal_mode; split_saved_wolfram = wolfram_mode;
+        split_saved_flow = flow_mode; split_saved_attractor = attractor_mode;
+        split_saved_surp = surp_mode; split_saved_mi = mi_mode;
+        split_saved_cplx = cplx_mode; split_saved_topo = topo_mode;
+        split_saved_rg = rg_mode; split_saved_kc = kc_mode;
+        split_saved_corr = corr_mode; split_saved_eprod = eprod_mode;
+        split_saved_wave = wave_mode; split_saved_vort = vort_mode;
+        split_saved_ergo = ergo_mode; split_saved_census = census_mode;
+
+        /* Ensure data is computed for both panels */
+        split_ensure_computed(split_left);
+        split_ensure_computed(split_right);
+    }
+
+    /* Helper macro: emit one cell at zoom==1 (duplicated in left/right half logic) */
+    #define EMIT_CELL_Z1(gx, gy) do { \
+        RGB c; \
+        int t = cell_color(gx, gy, &c); \
+        demo_fade_apply(&c); \
+        if (t == 1) { \
+            if (flow_mode && (gx % FLOW_BLOCK == FLOW_BLOCK/2) && (gy % FLOW_BLOCK == FLOW_BLOCK/2)) { \
+                float m = flow_mag[gy][gx]; \
+                const char *arrow = flow_arrow(flow_vx[gy][gx], flow_vy[gy][gx], m); \
+                p += sprintf(p, "\033[48;2;%d;%d;%dm\033[38;2;255;255;255m%s \033[0m", \
+                             c.r, c.g, c.b, arrow); \
+            } else { \
+                p += sprintf(p, "\033[48;2;%d;%d;%dm  \033[0m", c.r, c.g, c.b); \
+            } \
+        } else if (t == 2) { \
+            p += sprintf(p, "\033[38;2;%d;%d;%dm\xC2\xB7 \033[0m", c.r, c.g, c.b); \
+        } else if (t == 3) { \
+            p += sprintf(p, "\033[48;2;%d;%d;%dm  \033[0m", c.r, c.g, c.b); \
+        } else if (t == 4) { \
+            p += sprintf(p, "\033[48;2;%d;%d;%dm\033[97m\xe2\x97\x89 \033[0m", c.r/3, c.g/3, c.b/3); \
+        } else if (t == 5) { \
+            p += sprintf(p, "\033[48;2;%d;%d;%dm\033[97m\xe2\x97\x8b \033[0m", c.r/3, c.g/3, c.b/3); \
+        } else if (t == 6) { \
+            p += sprintf(p, "\033[48;2;%d;%d;%dm  \033[0m", c.r, c.g, c.b); \
+        } else if (t == 7) { \
+            p += sprintf(p, "\033[48;2;%d;%d;%dm  \033[0m", c.r, c.g, c.b); \
+        } else if (t == 8) { \
+            p += sprintf(p, "\033[48;2;%d;%d;%dm\033[97m\xE2\x97\x8E \033[0m", c.r/3, c.g/3, c.b/3); \
+        } else if (t == 9) { \
+            p += sprintf(p, "\033[48;2;%d;%d;%dm\033[97m\xE2\x97\x8E \033[0m", c.r/3, c.g/3, c.b/3); \
+        } else if (t == 10) { \
+            p += sprintf(p, "\033[48;2;%d;%d;%dm\033[97m\xE2\x97\x8C \033[0m", c.r/3, c.g/3, c.b/3); \
+        } else if (t == 14) { \
+            int in_center = (gx % FLOW_BLOCK == FLOW_BLOCK/2) && (gy % FLOW_BLOCK == FLOW_BLOCK/2); \
+            if (in_center) { \
+                float m = flow_mag[gy][gx]; \
+                const char *arrow = flow_arrow(flow_vx[gy][gx], flow_vy[gy][gx], m); \
+                p += sprintf(p, "\033[48;2;%d;%d;%dm\033[38;2;255;255;255m%s \033[0m", \
+                             c.r/2, c.g/2, c.b/2, arrow); \
+            } else { \
+                p += sprintf(p, "\033[48;2;%d;%d;%dm  \033[0m", c.r, c.g, c.b); \
+            } \
+        } else if (t == 18) { \
+            p += sprintf(p, "\033[48;2;%d;%d;%dm  \033[0m", c.r, c.g, c.b); \
+        } else { \
+            *p++ = ' '; *p++ = ' '; \
+        } \
+    } while (0)
+
     if (zoom == 1) {
         /* ── Normal zoom: 2 chars per cell ── */
+        if (split_mode) {
+            /* Split-screen: render left and right halves with different overlays */
+            for (int row = 0; row < usable_rows && row < view_h; row++) {
+                int gy = view_y + row;
+                /* Left half */
+                split_set_overlay(split_left);
+                for (int col = 0; col < split_mid; col++) {
+                    int gx = view_x + col;
+                    EMIT_CELL_Z1(gx, gy);
+                }
+                /* Divider: thin vertical bar */
+                p += sprintf(p, "\033[38;2;80;80;120m\xe2\x94\x82\033[0m");
+                /* Right half */
+                split_set_overlay(split_right);
+                for (int col = split_mid; col < view_w; col++) {
+                    int gx = view_x + col;
+                    EMIT_CELL_Z1(gx, gy);
+                }
+                *p++ = '\033'; *p++ = '['; *p++ = 'K'; *p++ = '\n';
+            }
+            /* Restore saved modes */
+            freq_mode = split_saved_freq; entropy_mode = split_saved_entropy;
+            lyapunov_mode = split_saved_lyapunov; fourier_mode = split_saved_fourier;
+            fractal_mode = split_saved_fractal; wolfram_mode = split_saved_wolfram;
+            flow_mode = split_saved_flow; attractor_mode = split_saved_attractor;
+            surp_mode = split_saved_surp; mi_mode = split_saved_mi;
+            cplx_mode = split_saved_cplx; topo_mode = split_saved_topo;
+            rg_mode = split_saved_rg; kc_mode = split_saved_kc;
+            corr_mode = split_saved_corr; eprod_mode = split_saved_eprod;
+            wave_mode = split_saved_wave; vort_mode = split_saved_vort;
+            ergo_mode = split_saved_ergo; census_mode = split_saved_census;
+        } else {
+        /* Normal (non-split) rendering */
         for (int row = 0; row < usable_rows && row < view_h; row++) {
             int gy = view_y + row;
             for (int col = 0; col < view_w; col++) {
                 int gx = view_x + col;
-                RGB c;
-                int t = cell_color(gx, gy, &c);
-                demo_fade_apply(&c);
-                if (t == 1) {
-                    /* Show arrow glyphs at block centers in flow mode */
-                    if (flow_mode && (gx % FLOW_BLOCK == FLOW_BLOCK/2) && (gy % FLOW_BLOCK == FLOW_BLOCK/2)) {
-                        float m = flow_mag[gy][gx];
-                        const char *arrow = flow_arrow(flow_vx[gy][gx], flow_vy[gy][gx], m);
-                        p += sprintf(p, "\033[48;2;%d;%d;%dm\033[38;2;255;255;255m%s \033[0m",
-                                     c.r, c.g, c.b, arrow);
-                    } else {
-                        p += sprintf(p, "\033[48;2;%d;%d;%dm  \033[0m", c.r, c.g, c.b);
-                    }
-                } else if (t == 2) {
-                    p += sprintf(p, "\033[38;2;%d;%d;%dm\xC2\xB7 \033[0m", c.r, c.g, c.b);
-                } else if (t == 3) {
-                    p += sprintf(p, "\033[48;2;%d;%d;%dm  \033[0m", c.r, c.g, c.b);
-                } else if (t == 4) {
-                    /* Emitter: bright marker */
-                    p += sprintf(p, "\033[48;2;%d;%d;%dm\033[97m\xe2\x97\x89 \033[0m", c.r/3, c.g/3, c.b/3);
-                } else if (t == 5) {
-                    /* Absorber: dark vortex marker */
-                    p += sprintf(p, "\033[48;2;%d;%d;%dm\033[97m\xe2\x97\x8b \033[0m", c.r/3, c.g/3, c.b/3);
-                } else if (t == 6) {
-                    /* Tracer trail: colored background */
-                    p += sprintf(p, "\033[48;2;%d;%d;%dm  \033[0m", c.r, c.g, c.b);
-                } else if (t == 7) {
-                    /* Freq analysis ghost: dim colored background */
-                    p += sprintf(p, "\033[48;2;%d;%d;%dm  \033[0m", c.r, c.g, c.b);
-                } else if (t == 8) {
-                    /* Portal entrance: swirling cyan ring */
-                    p += sprintf(p, "\033[48;2;%d;%d;%dm\033[97m\xE2\x97\x8E \033[0m", c.r/3, c.g/3, c.b/3);
-                } else if (t == 9) {
-                    /* Portal exit: swirling magenta ring */
-                    p += sprintf(p, "\033[48;2;%d;%d;%dm\033[97m\xE2\x97\x8E \033[0m", c.r/3, c.g/3, c.b/3);
-                } else if (t == 10) {
-                    /* WIP portal entrance (placing) */
-                    p += sprintf(p, "\033[48;2;%d;%d;%dm\033[97m\xE2\x97\x8C \033[0m", c.r/3, c.g/3, c.b/3);
-                } else if (t == 14) {
-                    /* Flow field ghost: show arrow glyph at block centers, colored bg elsewhere */
-                    int in_center = (gx % FLOW_BLOCK == FLOW_BLOCK/2) && (gy % FLOW_BLOCK == FLOW_BLOCK/2);
-                    if (in_center) {
-                        float m = flow_mag[gy][gx];
-                        const char *arrow = flow_arrow(flow_vx[gy][gx], flow_vy[gy][gx], m);
-                        p += sprintf(p, "\033[48;2;%d;%d;%dm\033[38;2;255;255;255m%s \033[0m",
-                                     c.r/2, c.g/2, c.b/2, arrow);
-                    } else {
-                        p += sprintf(p, "\033[48;2;%d;%d;%dm  \033[0m", c.r, c.g, c.b);
-                    }
-                } else if (t == 18) {
-                    /* MI network grid lines: dim colored background */
-                    p += sprintf(p, "\033[48;2;%d;%d;%dm  \033[0m", c.r, c.g, c.b);
-                } else {
-                    *p++ = ' '; *p++ = ' ';
-                }
+                EMIT_CELL_Z1(gx, gy);
             }
             *p++ = '\033'; *p++ = '['; *p++ = 'K'; *p++ = '\n';
         }
+        } /* end split_mode check */
+    #undef EMIT_CELL_Z1
     } else if (zoom == 2) {
         /* ── Half-block zoom: 1 char per cell, 2 rows per terminal row ── */
         /* Use ▀ (upper half block) with fg=top cell, bg=bottom cell */
@@ -8386,6 +8586,36 @@ static void render(int running, int speed_ms, int draw_mode) {
 
     /* Minimap overlay (only when zoomed) */
     render_minimap(&p);
+
+    /* ── Split-screen overlay labels ──────────────────────────────────────── */
+    if (split_mode && zoom == 1) {
+        /* Label at top of each panel half */
+        int label_row = 3; /* row 3 = first grid row */
+        const char *lname = split_overlay_table[split_left].name;
+        const char *rname = split_overlay_table[split_right].name;
+
+        /* Left label: centered in left half */
+        int left_center_col = split_mid; /* in char columns (2 chars per cell) */
+        int llen = (int)strlen(lname);
+        int lpos = left_center_col - llen / 2;
+        if (lpos < 1) lpos = 1;
+        p += sprintf(p, "\033[%d;%dH\033[48;2;20;20;35;38;2;180;220;255m %s \033[0m",
+                     label_row, lpos, lname);
+
+        /* Right label: centered in right half */
+        int right_start = split_mid * 2 + 1; /* +1 for divider */
+        int right_width = (view_w - split_mid) * 2;
+        int rlen = (int)strlen(rname);
+        int rpos = right_start + right_width / 2 - rlen / 2;
+        if (rpos < right_start) rpos = right_start;
+        p += sprintf(p, "\033[%d;%dH\033[48;2;20;20;35;38;2;255;200;120m %s \033[0m",
+                     label_row, rpos, rname);
+
+        /* Tab/backtick hint at bottom */
+        int hint_row = 3 + (usable_rows < view_h ? usable_rows : view_h) - 1;
+        p += sprintf(p, "\033[%d;2H\033[48;2;15;15;25;38;2;100;100;140m [`]cycle left  [TAB]cycle right \033[0m",
+                     hint_row);
+    }
 
     /* Frequency analysis legend overlay */
     if (freq_mode) {
@@ -8633,6 +8863,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
         p += sprintf(p, "%s", rst2);
     }
+
+    /* ── Suppress overlay detail panels in split-screen mode ─────────────── */
+    if (!split_mode) {
 
     /* ── Entropy Heatmap overlay panel ────────────────────────────────────── */
     if (entropy_mode) {
@@ -11820,6 +12053,8 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", rst3);
     }
 
+    } /* end !split_mode panel suppression */
+
     *p = '\0';
 
     (void)!write(STDOUT_FILENO, render_buf, p - render_buf);
@@ -12215,6 +12450,28 @@ int main(int argc, char **argv) {
             if (ergo_mode) {
                 ergo_compute(); /* compute on toggle-on */
             }
+        }
+        else if (key == ')') {
+            split_mode = !split_mode;
+            if (split_mode) {
+                /* Initialize panels: left = current overlay, right = something different */
+                split_left = split_detect_current();
+                split_right = (split_left + 1) % N_SPLIT_OVERLAYS;
+                if (split_right == 0) split_right = 1; /* skip "None" for right */
+                flash_set("Split: [`]left [TAB]right [)]exit");
+                printf("\033[2J"); fflush(stdout); /* clear for redraw */
+            } else {
+                flash_set("Split off");
+                printf("\033[2J"); fflush(stdout);
+            }
+        }
+        else if (key == '\t' && split_mode) {
+            /* Tab: cycle right panel overlay forward */
+            split_right = (split_right + 1) % N_SPLIT_OVERLAYS;
+        }
+        else if (key == '`' && split_mode) {
+            /* Backtick: cycle left panel overlay forward */
+            split_left = (split_left + 1) % N_SPLIT_OVERLAYS;
         }
         else if (key == '?') {
             if (probe_mode > 0) {

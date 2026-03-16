@@ -125,6 +125,9 @@
  *   ?           Toggle cell probe inspector (click any cell for all metrics)
  *                 Shows entropy, temperature, Lyapunov, Fourier, fractal, surprisal,
  *                 mutual info, Kolmogorov, complexity, frequency, flow, RG, topology
+ *   Ctrl-G      Toggle symmetry group detection (discrete symmetry classification)
+ *                 Classifies 5×5 neighborhoods into groups: C1,C2,D1,D2,C4,D4
+ *                 Dark=asymmetric, blue=2-fold, green=4-fold, gold=full D4
  *   Ctrl-E      Export current grid as RLE file (auto-numbered export_NNN.rle)
  *   Arrow keys  Pan viewport across the full 400×200 grid
  *   0           Re-center viewport on grid center
@@ -1047,7 +1050,7 @@ static int   probe_y = -1;            /* selected cell y */
    Toggle with '\\' key. TAB cycles the right panel, '`' cycles the left. */
 
 /* Overlay table: ordered list of analysis overlays for cycling */
-#define N_SPLIT_OVERLAYS 35
+#define N_SPLIT_OVERLAYS 36
 typedef struct {
     const char *name;   /* short display name */
     char key;           /* toggle key character */
@@ -1089,6 +1092,7 @@ static const SplitOverlayInfo split_overlay_table[N_SPLIT_OVERLAYS] = {
     { "HurstExp",     '4'  },  /* 32 */
     { "Dashboard",    '5'  },  /* 33 */
     { "CrossCorr",    '2'  },  /* 34 */
+    { "SymmGroup",    'G'-64 },  /* 35: Ctrl-G */
 };
 
 static int split_mode = 0;         /* 0=off, 1=on */
@@ -1441,6 +1445,72 @@ static void fi_reset(void) {
     memset(fi_hist, 0, sizeof(fi_hist));
 }
 
+/* ── Symmetry Group Detection ─────────────────────────────────────────────── */
+/* Classifies each cell's local 5×5 neighborhood into its discrete symmetry
+   group by testing rotational (90°, 180°) and reflective (horizontal,
+   vertical, diagonal) invariances.  Tracks symmetry-breaking events when
+   neighborhoods transition from higher to lower symmetry order.
+   Color: dark (C1, asymmetric) → cool (C2/D1) → warm (D2/C4) → bright (D4/D8).
+   Sidebar: group distribution, mean symmetry order, breaking rate, sparkline.
+   Toggle with Ctrl-G key. */
+
+/* Symmetry group codes:
+   0 = C1  (identity only — no symmetry)
+   1 = C2  (180° rotation)
+   2 = D1h (horizontal reflection)
+   3 = D1v (vertical reflection)
+   4 = D1d (diagonal / reflection)
+   5 = D1a (anti-diagonal reflection)
+   6 = D2  (C2 + both reflections, no 90° rotation)
+   7 = C4  (90° + 180° + 270° rotation, no reflections)
+   8 = D4  (C4 + reflections — full square dihedral group)
+   We assign a symmetry ORDER (number of group elements):
+     C1=1, C2=2, D1=2, D2=4, C4=4, D4=8
+*/
+#define SG_NGROUPS 9
+#define SG_HIST_LEN 64
+#define SG_PATCH 5   /* 5×5 neighborhood for symmetry testing */
+
+static int   sg_mode = 0;           /* 0=off, 1=on */
+static int   sg_stale = 1;
+
+/* Per-cell symmetry group index [0..8] and order [1..8] */
+static unsigned char sg_group[MAX_H][MAX_W];
+static unsigned char sg_order[MAX_H][MAX_W];
+
+/* Previous frame's symmetry order for break detection */
+static unsigned char sg_prev_order[MAX_H][MAX_W];
+
+/* Global aggregates */
+static float sg_mean_order = 1.0f;       /* mean symmetry order across grid */
+static int   sg_group_counts[SG_NGROUPS]; /* count of each group */
+static int   sg_break_count = 0;          /* cells that lost symmetry this frame */
+static int   sg_form_count = 0;           /* cells that gained symmetry this frame */
+static float sg_break_rate = 0.0f;        /* smoothed breaking rate */
+static int   sg_dominant_group = 0;       /* most common non-C1 group */
+
+/* Sparkline history of mean symmetry order */
+static float sg_hist[SG_HIST_LEN];
+static int   sg_hist_idx = 0;
+static int   sg_hist_count = 0;
+
+static void sg_compute(void);
+static void sg_reset(void) {
+    sg_stale = 1;
+    sg_mean_order = 1.0f;
+    sg_break_count = 0;
+    sg_form_count = 0;
+    sg_break_rate = 0.0f;
+    sg_dominant_group = 0;
+    sg_hist_idx = 0;
+    sg_hist_count = 0;
+    memset(sg_group, 0, sizeof(sg_group));
+    memset(sg_order, 0, sizeof(sg_order));
+    memset(sg_prev_order, 0, sizeof(sg_prev_order));
+    memset(sg_group_counts, 0, sizeof(sg_group_counts));
+    memset(sg_hist, 0, sizeof(sg_hist));
+}
+
 /* ── Cross-Correlation Matrix ──────────────────────────────────────────────── */
 /* Computes pairwise time-lagged cross-correlation across all 16 metric streams
    at lags -8 to +8.  For each pair, identifies the optimal lag (peak |r|),
@@ -1567,6 +1637,7 @@ static void split_set_overlay(int idx) {
     hr_mode = 0;
     xc_mode = 0;
     fi_mode = 0;
+    sg_mode = 0;
 
     switch (idx) {
         case  0: break;
@@ -1604,6 +1675,7 @@ static void split_set_overlay(int idx) {
         case 32: hr_mode = 1; break;
         case 33: rd_mode = 1; break;
         case 34: xc_mode = 1; break;
+        case 35: sg_mode = 1; break;
     }
 }
 
@@ -1642,6 +1714,7 @@ static int split_detect_current(void) {
     if (hr_mode) return 32;
     if (rd_mode) return 33;
     if (xc_mode) return 34;
+    if (sg_mode) return 35;
     return 0;
 }
 
@@ -2999,6 +3072,7 @@ static void grid_step(void) {
     ce_stale = 1;
     ew_stale = 1;
     fi_stale = 1;
+    sg_stale = 1;
 
     /* Always record frames for surprise field (cheap memcpy) */
     surp_record_frame();
@@ -8166,6 +8240,127 @@ static void fi_compute(void) {
     if (fi_hist_count < FI_HIST_LEN) fi_hist_count++;
 }
 
+/* ── Symmetry Group Detection computation ──────────────────────────────────── */
+static void sg_compute(void) {
+    sg_stale = 0;
+
+    /* Save previous order for break detection */
+    memcpy(sg_prev_order, sg_order, sizeof(sg_order));
+
+    memset(sg_group_counts, 0, sizeof(sg_group_counts));
+    double order_sum = 0.0;
+    int break_cnt = 0, form_cnt = 0;
+
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            /* Extract 5×5 patch centered at (x,y), treating out-of-bounds as dead */
+            int patch[SG_PATCH][SG_PATCH];
+            for (int dy = 0; dy < SG_PATCH; dy++) {
+                for (int dx = 0; dx < SG_PATCH; dx++) {
+                    int ny = y + dy - SG_PATCH/2;
+                    int nx = x + dx - SG_PATCH/2;
+                    if (ny >= 0 && ny < H && nx >= 0 && nx < W)
+                        patch[dy][dx] = grid[ny][nx] > 0 ? 1 : 0;
+                    else
+                        patch[dy][dx] = 0;
+                }
+            }
+
+            /* Test symmetries by comparing patch with transformed versions.
+               For a 5×5 patch indexed [r][c] (r=row, c=col):
+               - Rot90:    patch[r][c] == patch[c][4-r]
+               - Rot180:   patch[r][c] == patch[4-r][4-c]
+               - FlipH:    patch[r][c] == patch[4-r][c]    (horizontal axis)
+               - FlipV:    patch[r][c] == patch[r][4-c]    (vertical axis)
+               - FlipD:    patch[r][c] == patch[c][r]      (main diagonal)
+               - FlipA:    patch[r][c] == patch[4-c][4-r]  (anti-diagonal)
+            */
+            int match_rot90 = 1, match_rot180 = 1;
+            int match_flipH = 1, match_flipV = 1;
+            int match_flipD = 1, match_flipA = 1;
+
+            for (int r = 0; r < SG_PATCH && (match_rot90 || match_rot180 ||
+                 match_flipH || match_flipV || match_flipD || match_flipA); r++) {
+                for (int c = 0; c < SG_PATCH && (match_rot90 || match_rot180 ||
+                     match_flipH || match_flipV || match_flipD || match_flipA); c++) {
+                    int v = patch[r][c];
+                    if (match_rot90  && v != patch[c][SG_PATCH-1-r])  match_rot90 = 0;
+                    if (match_rot180 && v != patch[SG_PATCH-1-r][SG_PATCH-1-c]) match_rot180 = 0;
+                    if (match_flipH  && v != patch[SG_PATCH-1-r][c])  match_flipH = 0;
+                    if (match_flipV  && v != patch[r][SG_PATCH-1-c])  match_flipV = 0;
+                    if (match_flipD  && v != patch[c][r])             match_flipD = 0;
+                    if (match_flipA  && v != patch[SG_PATCH-1-c][SG_PATCH-1-r]) match_flipA = 0;
+                }
+            }
+
+            /* Classify into symmetry group based on which symmetries hold.
+               rot90 implies rot180 (if 90° works, 180° must too).
+               D4 = all symmetries (rot90 + all reflections).
+               C4 = rot90 without reflections.
+               D2 = rot180 + at least 2 reflections (H+V or D+A).
+               C2 = rot180 only, no reflections.
+               D1x = single reflection axis only. */
+            int grp, ord;
+            int n_ref = match_flipH + match_flipV + match_flipD + match_flipA;
+
+            if (match_rot90 && n_ref >= 4) {
+                grp = 8; ord = 8;  /* D4: full dihedral */
+            } else if (match_rot90 && n_ref == 0) {
+                grp = 7; ord = 4;  /* C4: pure rotation */
+            } else if (match_rot180 && n_ref >= 2) {
+                grp = 6; ord = 4;  /* D2: half-turn + reflections */
+            } else if (match_rot180 && n_ref == 0) {
+                grp = 1; ord = 2;  /* C2: 180° rotation only */
+            } else if (match_flipD) {
+                grp = 4; ord = 2;  /* D1d: diagonal reflection */
+            } else if (match_flipA) {
+                grp = 5; ord = 2;  /* D1a: anti-diagonal reflection */
+            } else if (match_flipH) {
+                grp = 2; ord = 2;  /* D1h: horizontal reflection */
+            } else if (match_flipV) {
+                grp = 3; ord = 2;  /* D1v: vertical reflection */
+            } else {
+                grp = 0; ord = 1;  /* C1: no symmetry */
+            }
+
+            sg_group[y][x] = (unsigned char)grp;
+            sg_order[y][x] = (unsigned char)ord;
+            sg_group_counts[grp]++;
+            order_sum += ord;
+
+            /* Symmetry breaking/formation detection */
+            int prev_ord = sg_prev_order[y][x];
+            if (prev_ord > 0) { /* skip first frame */
+                if (ord < prev_ord) break_cnt++;
+                else if (ord > prev_ord) form_cnt++;
+            }
+        }
+    }
+
+    int total = H * W;
+    sg_mean_order = (float)(order_sum / total);
+    sg_break_count = break_cnt;
+    sg_form_count = form_cnt;
+    /* Exponential smoothing of break rate */
+    float inst_rate = (float)break_cnt / total;
+    sg_break_rate = sg_break_rate * 0.85f + inst_rate * 0.15f;
+
+    /* Find dominant non-C1 group */
+    int max_cnt = 0;
+    sg_dominant_group = 0;
+    for (int g = 1; g < SG_NGROUPS; g++) {
+        if (sg_group_counts[g] > max_cnt) {
+            max_cnt = sg_group_counts[g];
+            sg_dominant_group = g;
+        }
+    }
+
+    /* Sparkline */
+    sg_hist[sg_hist_idx] = sg_mean_order;
+    sg_hist_idx = (sg_hist_idx + 1) % SG_HIST_LEN;
+    if (sg_hist_count < SG_HIST_LEN) sg_hist_count++;
+}
+
 /* ── Causal Emergence computation ──────────────────────────────────────────── */
 /* Color mapping: scale 0 (micro best) = cool blue,
    scale 1 (2x2) = green, scale 2 (4x4) = warm orange,
@@ -9457,6 +9652,7 @@ static void split_ensure_computed(int idx) {
         case 31: if (ew_stale && ew_count >= 16) ew_compute(); break;
         case 33: if (rd_stale) rd_compute(); break;
         case 34: if (xc_stale && xc_count >= 20) xc_compute(); break;
+        case 35: if (sg_stale) sg_compute(); break;
         default: break;
     }
 }
@@ -11241,6 +11437,47 @@ static int cell_color(int x, int y, RGB *out) {
             }
             out->r = r; out->g = g; out->b = b;
             return grid[y][x] ? 1 : 34; /* 34 = cross-corr ghost */
+        }
+        return 0;
+    }
+
+    /* Symmetry Group Detection overlay: discrete symmetry classification */
+    if (sg_mode) {
+        int grp = sg_group[y][x];
+        int ord = sg_order[y][x];
+        if (grid[y][x] || ord > 1) {
+            /* Color by symmetry order:
+               C1 (ord=1): dark charcoal — no symmetry
+               C2/D1 (ord=2): cool blue-cyan
+               D2/C4 (ord=4): green-yellow
+               D4/D8 (ord=8): bright gold-white */
+            unsigned char r, g, b;
+            if (ord <= 1) {
+                /* C1: dim charcoal with slight blue tint */
+                r = 25; g = 25; b = 40;
+            } else if (ord == 2) {
+                /* C2/D1: blue-cyan spectrum; vary by specific group */
+                if (grp == 1) { r = 30; g = 80; b = 180; }         /* C2: pure blue */
+                else if (grp == 2) { r = 40; g = 140; b = 200; }   /* D1h: cyan-blue */
+                else if (grp == 3) { r = 50; g = 160; b = 180; }   /* D1v: teal */
+                else if (grp == 4) { r = 60; g = 120; b = 220; }   /* D1d: blue-violet */
+                else { r = 70; g = 130; b = 210; }                  /* D1a: periwinkle */
+            } else if (ord == 4) {
+                /* D2/C4: warm green-gold */
+                if (grp == 7) { r = 200; g = 180; b = 40; }        /* C4: gold (pure rotation) */
+                else { r = 100; g = 200; b = 60; }                  /* D2: lime green */
+            } else {
+                /* D4 (ord=8): brilliant white-gold */
+                r = 255; g = 240; b = 180;
+            }
+            if (grid[y][x]) {
+                /* Brighten live cells */
+                r = (unsigned char)(r < 200 ? r + 55 : 255);
+                g = (unsigned char)(g < 200 ? g + 55 : 255);
+                b = (unsigned char)(b < 200 ? b + 55 : 255);
+            }
+            out->r = r; out->g = g; out->b = b;
+            return grid[y][x] ? 1 : 36; /* 36 = symmetry ghost */
         }
         return 0;
     }
@@ -16827,6 +17064,230 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", first);
     }
 
+    /* ── Symmetry Group Detection overlay panel ────────────────────────── */
+    if (sg_mode) {
+        int sg_pw = 50;  /* panel width */
+        int sg_col = term_cols - sg_pw - 2;
+        int sg_row = 3;
+        /* Stack below other panels */
+        if (entropy_mode)   sg_row += 8;
+        if (temp_mode)      sg_row += 9;
+        if (lyapunov_mode)  sg_row += 8;
+        if (fourier_mode)   sg_row += 18;
+        if (fractal_mode)   sg_row += 11;
+        if (wolfram_mode)   sg_row += 14;
+        if (flow_mode)      sg_row += 9;
+        if (attractor_mode) sg_row += 8;
+        if (cone_mode >= 1) sg_row += 8;
+        if (surp_mode)      sg_row += 8;
+        if (mi_mode)        sg_row += 12;
+        if (cplx_mode)      sg_row += 11;
+        if (topo_mode)      sg_row += 11;
+        if (rg_mode)        sg_row += 11;
+        if (kc_mode)        sg_row += 9;
+        if (corr_mode)      sg_row += 9;
+        if (eprod_mode)     sg_row += 9;
+        if (vort_mode)      sg_row += 9;
+        if (wave_mode)      sg_row += 9;
+        if (ergo_mode)      sg_row += 10;
+        if (coh_mode)       sg_row += 8;
+        if (ce_mode)        sg_row += 9;
+        if (ew_mode)        sg_row += 10;
+        if (hr_mode)        sg_row += 10;
+        if (rd_mode)        sg_row += 13;
+        if (xc_mode && xc_count >= 20) sg_row += 28;
+        if (fi_mode && fi_count >= 16)  sg_row += 12;
+        if (sg_col < 1) sg_col = 1;
+
+        const char *sgbdr = "\033[38;2;200;220;80;48;2;10;12;6m";  /* gold-green border */
+        const char *sgbg  = "\033[48;2;10;12;6m";
+        const char *sgrst = "\033[0m";
+
+        static const char *sg_group_names[SG_NGROUPS] = {
+            "C1", "C2", "D1h", "D1v", "D1d", "D1a", "D2", "C4", "D4"
+        };
+        static const int sg_group_order[SG_NGROUPS] = {
+            1, 2, 2, 2, 2, 2, 4, 4, 8
+        };
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 \xe2\x97\x88 Symmetry Groups ",
+                     sg_row, sg_col, sgbdr);
+        for (int i = 22; i < sg_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", sgrst);
+
+        /* Row 1: Mean symmetry order + dominant classification */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     sg_row + 1, sg_col, sgbdr, sgbg);
+        {
+            const char *state_str;
+            const char *state_clr;
+            if (sg_mean_order < 1.3f) {
+                state_str = "ASYMMETRIC";
+                state_clr = "\033[38;2;100;100;120m";
+            } else if (sg_mean_order < 2.0f) {
+                state_str = "LOW SYMM";
+                state_clr = "\033[38;2;60;130;200m";
+            } else if (sg_mean_order < 3.5f) {
+                state_str = "MODERATE";
+                state_clr = "\033[38;2;100;200;80m";
+            } else {
+                state_str = "HIGH SYMM";
+                state_clr = "\033[38;2;255;240;120m";
+            }
+            int n = sprintf(p, " \033[38;2;200;220;120m\xc5\x8c=%.2f %s%s \033[38;2;120;130;80m[^G]exit",
+                            sg_mean_order, state_clr, state_str);
+            p += n;
+            int used = 36;
+            for (int i = used; i < sg_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", sgbdr, sgrst);
+
+        /* Row 2: Dominant group + breaking rate */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     sg_row + 2, sg_col, sgbdr, sgbg);
+        {
+            int n = sprintf(p, " \033[38;2;160;180;100mDom:%-3s  "
+                               "\033[38;2;255;100;80m\xe2\x86\x93%.1f%%  "
+                               "\033[38;2;80;255;120m\xe2\x86\x91%.1f%%",
+                            sg_group_names[sg_dominant_group],
+                            sg_break_rate * 100.0f,
+                            (float)sg_form_count / (H * W) * 100.0f);
+            p += n;
+            int used = 36;
+            for (int i = used; i < sg_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", sgbdr, sgrst);
+
+        /* Row 3: Separator */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     sg_row + 3, sg_col, sgbdr, sgbg);
+        p += sprintf(p, " \033[38;2;80;90;50m");
+        for (int i = 1; i < sg_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", sgbdr, sgrst);
+
+        /* Rows 4-6: Group distribution bars */
+        /* Show groups in order: C1, C2, D1h, D1v, D1d, D1a, D2, C4, D4 */
+        {
+            int total = H * W;
+            int max_cnt = 1;
+            for (int g = 0; g < SG_NGROUPS; g++)
+                if (sg_group_counts[g] > max_cnt) max_cnt = sg_group_counts[g];
+
+            /* 3 rows, 3 groups per row */
+            for (int row = 0; row < 3; row++) {
+                p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s ",
+                             sg_row + 4 + row, sg_col, sgbdr, sgbg);
+                for (int col = 0; col < 3; col++) {
+                    int g = row * 3 + col;
+                    if (g >= SG_NGROUPS) {
+                        p += sprintf(p, "               ");
+                        continue;
+                    }
+                    float frac = (float)sg_group_counts[g] / total;
+                    int bar_len = (int)((float)sg_group_counts[g] / max_cnt * 5);
+                    if (bar_len < 0) bar_len = 0;
+                    if (bar_len > 5) bar_len = 5;
+                    /* Color by group order */
+                    int cr, cg, cb;
+                    int go = sg_group_order[g];
+                    if (go <= 1) { cr=100; cg=100; cb=120; }
+                    else if (go == 2) { cr=60; cg=140; cb=220; }
+                    else if (go == 4) { cr=140; cg=200; cb=60; }
+                    else { cr=255; cg=240; cb=120; }
+                    p += sprintf(p, "\033[38;2;%d;%d;%dm%-3s", cr, cg, cb,
+                                 sg_group_names[g]);
+                    for (int b = 0; b < bar_len; b++)
+                        p += sprintf(p, "\xe2\x96\x88");
+                    for (int b = bar_len; b < 5; b++)
+                        p += sprintf(p, "\xe2\x96\x91");
+                    p += sprintf(p, " %2.0f%% ", frac * 100);
+                }
+                int used = 1 + 3 * 15;
+                for (int i = used; i < sg_pw - 1; i++) *p++ = ' ';
+                p += sprintf(p, "%s\xe2\x94\x82%s", sgbdr, sgrst);
+            }
+        }
+
+        /* Row 7: Color legend gradient */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     sg_row + 7, sg_col, sgbdr, sgbg);
+        {
+            p += sprintf(p, " ");
+            /* Gradient: dark charcoal → blue → green → gold → white */
+            int grad_colors[][3] = {
+                {25,25,40}, {40,100,200}, {80,180,60}, {200,200,50}, {255,240,180}
+            };
+            int ngrad = 5;
+            int bar_w = 30;
+            for (int i = 0; i < bar_w; i++) {
+                float t = (float)i / (bar_w - 1) * (ngrad - 1);
+                int seg = (int)t;
+                if (seg >= ngrad - 1) seg = ngrad - 2;
+                float f = t - seg;
+                int r2 = (int)(grad_colors[seg][0] * (1-f) + grad_colors[seg+1][0] * f);
+                int g2 = (int)(grad_colors[seg][1] * (1-f) + grad_colors[seg+1][1] * f);
+                int b2 = (int)(grad_colors[seg][2] * (1-f) + grad_colors[seg+1][2] * f);
+                p += sprintf(p, "\033[48;2;%d;%d;%dm ", r2, g2, b2);
+            }
+            p += sprintf(p, "%s", sgbg);
+            int used = 1 + bar_w;
+            for (int i = used; i < sg_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", sgbdr, sgrst);
+
+        /* Row 8: Scale labels */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     sg_row + 8, sg_col, sgbdr, sgbg);
+        {
+            int n = sprintf(p, " \033[38;2;100;100;120mC1"
+                               "      \033[38;2;60;140;220mC2/D1"
+                               "    \033[38;2;140;200;60mD2/C4"
+                               "     \033[38;2;255;240;120mD4");
+            p += n;
+            int used = 33;
+            for (int i = used; i < sg_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", sgbdr, sgrst);
+
+        /* Row 9: Sparkline of mean symmetry order */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     sg_row + 9, sg_col, sgbdr, sgbg);
+        p += sprintf(p, " \033[38;2;120;140;80m\xc5\x8c(t): ");
+        {
+            const char *spark_chars[] = {"\xe2\x96\x81","\xe2\x96\x82","\xe2\x96\x83",
+                                         "\xe2\x96\x84","\xe2\x96\x85","\xe2\x96\x86",
+                                         "\xe2\x96\x87","\xe2\x96\x88"};
+            int nsp = sg_hist_count < 32 ? sg_hist_count : 32;
+            for (int s = 0; s < nsp; s++) {
+                int si = (sg_hist_idx - nsp + s + SG_HIST_LEN) % SG_HIST_LEN;
+                float v = (sg_hist[si] - 1.0f) / 7.0f; /* normalize [1,8] → [0,1] */
+                if (v < 0.0f) v = 0.0f;
+                if (v > 1.0f) v = 1.0f;
+                int bi = (int)(v * 7.99f);
+                if (bi > 7) bi = 7;
+                /* Color: low = dim, high = bright gold */
+                int sr = (int)(80 + 175 * v);
+                int sg2 = (int)(80 + 160 * v);
+                int sb = (int)(60 + 60 * v);
+                if (sr > 255) sr = 255; if (sg2 > 255) sg2 = 255;
+                p += sprintf(p, "\033[38;2;%d;%d;%dm%s", sr, sg2, sb, spark_chars[bi]);
+            }
+            for (int i = nsp; i < 32; i++) p += sprintf(p, " ");
+            int used = 7 + 32;
+            for (int i = used; i < sg_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", sgbdr, sgrst);
+
+        /* Bottom border */
+        int sg_bottom = sg_row + 10;
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", sg_bottom, sg_col, sgbdr);
+        for (int i = 0; i < sg_pw; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", sgrst);
+    }
+
     /* ── Percolation Analysis overlay panel ─────────────────────────────── */
     if (perc_mode) {
         int pc_w = 46;
@@ -20133,6 +20594,19 @@ int main(int argc, char **argv) {
                 }
             }
         }
+        else if (key == 7) { /* Ctrl-G: Symmetry Group Detection */
+            if (!ecosystem_mode) {
+                sg_mode = !sg_mode;
+                if (sg_mode) {
+                    sg_reset();
+                    flash_set("Symmetry Groups: discrete symmetry classification [^G]exit");
+                    printf("\033[2J"); fflush(stdout);
+                } else {
+                    flash_set("Symmetry Groups off");
+                    printf("\033[2J"); fflush(stdout);
+                }
+            }
+        }
         else if (key == '?') {
             if (probe_mode > 0) {
                 probe_mode = 0; /* toggle off */
@@ -20861,6 +21335,13 @@ int main(int argc, char **argv) {
             fi_record();
             if (fi_stale && fi_count >= 16) {
                 fi_compute();
+            }
+        }
+
+        /* Symmetry Group Detection: compute every 4 generations */
+        if (sg_mode && running && (generation % 4 == 0)) {
+            if (sg_stale) {
+                sg_compute();
             }
         }
 

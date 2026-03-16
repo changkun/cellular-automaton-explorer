@@ -1,8 +1,30 @@
 # Changelog
 
 Development history organized by round. Each round adds one or two major
-features. The project grew from ~790 lines (Round 1) to ~18,700 lines
-(Round 64).
+features. The project grew from ~790 lines (Round 1) to ~21,300 lines
+(Round 69).
+
+## Round 69 — Symmetry Group Detection Overlay
+
+Opens an entirely new analytical domain: **discrete group theory and
+spontaneous symmetry breaking**. Press `Ctrl-G` to classify every cell's
+5×5 neighborhood into its discrete symmetry group by testing all rotational
+(90°, 180°) and reflective (horizontal, vertical, diagonal, anti-diagonal)
+invariances of the local patch. Groups detected: C1 (identity only), C2
+(180° rotation), D1h/D1v/D1d/D1a (single reflection axes), D2 (half-turn
++ reflections), C4 (pure 4-fold rotation), and D4 (full dihedral — all 8
+symmetries of the square). Color coding by symmetry order: dark charcoal
+(C1, asymmetric) → cool blue-cyan spectrum (C2/D1, 2-fold) → warm
+green-gold (D2/C4, 4-fold) → brilliant white-gold (D4, 8-fold). Tracks
+symmetry-breaking and symmetry-forming events frame-over-frame, with
+exponentially smoothed breaking rate. Sidebar panel shows mean symmetry
+order with classification, dominant non-trivial group, breaking/forming
+rates, 9-group distribution histogram with colored bars, color legend
+gradient, and sparkline history. Full split-screen support as overlay #36.
+Connects to deep physics — spontaneous symmetry breaking underlies crystal
+formation, phase transitions, and the Higgs mechanism. Complements Fisher
+Information (parameter sensitivity) by revealing *what structural order
+exists* on each side of phase boundaries. 36th analysis overlay. +280 lines.
 
 ## Round 64 — Early Warning Signals Overlay
 

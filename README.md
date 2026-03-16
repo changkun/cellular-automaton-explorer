@@ -88,7 +88,7 @@ Load an RLE pattern file:
 | Category | Features |
 |----------|----------|
 | **Simulation** | 10 rule presets, live mutation, multi-rule zones, emitters/absorbers, wormhole portals, dual-species ecosystems, temperature field |
-| **Analysis** | Shannon entropy, Lyapunov exponents, 2D FFT, fractal dimension, frequency detection, Wolfram classification, transfer entropy, phase-space attractors, causal light cones, prediction surprise, mutual information, composite complexity, topological features, renormalization group, Kolmogorov complexity, spatial correlation length, anomaly detector |
+| **Analysis** | Shannon entropy, Lyapunov exponents, 2D FFT, fractal dimension, frequency detection, Wolfram classification, transfer entropy, phase-space attractors, causal light cones, prediction surprise, mutual information, composite complexity, topological features, renormalization group, Kolmogorov complexity, spatial correlation length, anomaly detector, metric correlation matrix |
 | **Interaction** | Mouse drawing, zoom/pan, kaleidoscope symmetry, pattern stamps, genetic rule search, time-travel replay |
 | **Visualization** | 24-bit true-color heatmaps, ghost trails, signal tracer, population sparkline, minimap, auto-demo mode |
 | **I/O** | Binary save/load, RLE import/export, PPM screenshots, timeline animation export |
@@ -176,6 +176,7 @@ Load an RLE pattern file:
 | `&` | Spatial correlation length (two-point correlation ξ) |
 | `?` | Cell probe inspector (all metrics for clicked cell) |
 | `8` | Anomaly detector (statistical watchdog for all 16 metrics) |
+| `'` | Metric correlation matrix (16×16 Pearson heatmap, 128-frame window) |
 
 #### File I/O
 
@@ -481,6 +482,15 @@ Toggle: `?`. Click any cell to see all 18+ metrics at once in a unified panel:
 entropy, temperature, Lyapunov, Fourier, fractal, surprisal, mutual info,
 Kolmogorov, correlation, complexity, frequency, flow, RG, topology, entropy
 production, wave amplitude, vorticity.
+
+### Metric Correlation Matrix
+
+Toggle: `'`. Computes pairwise Pearson correlations between all 16 scalar metrics
+over a 128-frame sliding window. Displayed as a 16×16 heatmap: red = positively
+correlated, white = uncorrelated, blue = anti-correlated. Sidebar lists the top 3
+strongest correlations and top 3 strongest anti-correlations. Reveals hidden
+relationships between metrics (e.g., does entropy track Lyapunov? does population
+predict complexity?) without manually comparing overlays.
 
 ## Visualization
 

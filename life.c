@@ -827,7 +827,7 @@ static void pp_reset(void) {
    uncorrelated, red = strongly correlated.  Sidebar lists strongest and
    weakest pairs.  Toggle with '\'' (single-quote) key. */
 
-#define CM_WINDOW  64    /* sliding window length */
+#define CM_WINDOW  128   /* sliding window length */
 #define CM_N       PP_N_METRICS   /* 16 metrics */
 
 static int   cm_mode = 0;           /* 0=off, 1=on */
@@ -14346,82 +14346,89 @@ static void render(int running, int speed_ms, int draw_mode) {
         for (int i = 1; i < cm_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
         p += sprintf(p, "%s\xe2\x94\x82%s", cbdr, crst);
 
-        /* Find strongest positive (off-diagonal) and strongest negative pairs */
-        float best_pos = -2.0f, best_neg = 2.0f;
-        int bp_i = 0, bp_j = 1, bn_i = 0, bn_j = 1;
+        /* Find top 3 strongest positive and top 3 strongest negative pairs */
+        #define CM_TOP 3
+        float top_pos_val[CM_TOP], top_neg_val[CM_TOP];
+        int   top_pos_i[CM_TOP], top_pos_j[CM_TOP];
+        int   top_neg_i[CM_TOP], top_neg_j[CM_TOP];
+        for (int k = 0; k < CM_TOP; k++) {
+            top_pos_val[k] = -2.0f; top_pos_i[k] = 0; top_pos_j[k] = 1;
+            top_neg_val[k] =  2.0f; top_neg_i[k] = 0; top_neg_j[k] = 1;
+        }
         for (int i = 0; i < CM_N; i++) {
             for (int j = i + 1; j < CM_N; j++) {
-                if (cm_corr[i][j] > best_pos) {
-                    best_pos = cm_corr[i][j]; bp_i = i; bp_j = j;
+                float r = cm_corr[i][j];
+                /* Insert into top positive list */
+                for (int k = 0; k < CM_TOP; k++) {
+                    if (r > top_pos_val[k]) {
+                        for (int m = CM_TOP - 1; m > k; m--) {
+                            top_pos_val[m] = top_pos_val[m-1];
+                            top_pos_i[m] = top_pos_i[m-1];
+                            top_pos_j[m] = top_pos_j[m-1];
+                        }
+                        top_pos_val[k] = r; top_pos_i[k] = i; top_pos_j[k] = j;
+                        break;
+                    }
                 }
-                if (cm_corr[i][j] < best_neg) {
-                    best_neg = cm_corr[i][j]; bn_i = i; bn_j = j;
+                /* Insert into top negative list */
+                for (int k = 0; k < CM_TOP; k++) {
+                    if (r < top_neg_val[k]) {
+                        for (int m = CM_TOP - 1; m > k; m--) {
+                            top_neg_val[m] = top_neg_val[m-1];
+                            top_neg_i[m] = top_neg_i[m-1];
+                            top_neg_j[m] = top_neg_j[m-1];
+                        }
+                        top_neg_val[k] = r; top_neg_i[k] = i; top_neg_j[k] = j;
+                        break;
+                    }
                 }
             }
         }
 
-        /* Find most independent pair (closest to 0) */
-        float best_ind = 2.0f;
-        int bi_i = 0, bi_j = 1;
-        for (int i = 0; i < CM_N; i++) {
-            for (int j = i + 1; j < CM_N; j++) {
-                float a = cm_corr[i][j] < 0 ? -cm_corr[i][j] : cm_corr[i][j];
-                if (a < best_ind) {
-                    best_ind = a; bi_i = i; bi_j = j;
-                }
+        /* Rows: Top 3 strongest positive correlations */
+        int cm_summary_row = cm_row + 4 + CM_N;
+        for (int k = 0; k < CM_TOP; k++) {
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                         cm_summary_row + k, cm_col, cbdr, cbg);
+            {
+                const char *prefix = (k == 0) ? "\xe2\x96\xb2 Correlated:" : "             ";
+                int n = sprintf(p, " \033[38;2;255;100;100m%s "
+                                   "\033[38;2;255;200;200m%s\xc3\x97%s \033[38;2;255;120;120m%+.3f",
+                                prefix, pp_metric_table[top_pos_i[k]].name,
+                                pp_metric_table[top_pos_j[k]].name, top_pos_val[k]);
+                p += n;
+                int used = 14 + (int)strlen(pp_metric_table[top_pos_i[k]].name) + 1
+                         + (int)strlen(pp_metric_table[top_pos_j[k]].name) + 8;
+                for (int i = used; i < cm_pw - 1; i++) *p++ = ' ';
             }
+            p += sprintf(p, "%s\xe2\x94\x82%s", cbdr, crst);
         }
 
-        /* Row: Strongest positive */
-        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
-                     cm_row + 4 + CM_N, cm_col, cbdr, cbg);
-        {
-            int n = sprintf(p, " \033[38;2;255;100;100m\xe2\x96\xb2 Most correlated: "
-                               "\033[38;2;255;200;200m%s\xc3\x97%s \033[38;2;255;120;120m%.3f",
-                            pp_metric_table[bp_i].name, pp_metric_table[bp_j].name, best_pos);
-            p += n;
-            /* Estimate visible chars */
-            int used = 20 + (int)strlen(pp_metric_table[bp_i].name) + 1
-                     + (int)strlen(pp_metric_table[bp_j].name) + 7;
-            for (int i = used; i < cm_pw - 1; i++) *p++ = ' ';
+        /* Rows: Top 3 strongest anti-correlations */
+        for (int k = 0; k < CM_TOP; k++) {
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                         cm_summary_row + CM_TOP + k, cm_col, cbdr, cbg);
+            {
+                const char *prefix = (k == 0) ? "\xe2\x96\xbc Anti-corr:  " : "             ";
+                int n = sprintf(p, " \033[38;2;100;100;255m%s "
+                                   "\033[38;2;200;200;255m%s\xc3\x97%s \033[38;2;120;120;255m%+.3f",
+                                prefix, pp_metric_table[top_neg_i[k]].name,
+                                pp_metric_table[top_neg_j[k]].name, top_neg_val[k]);
+                p += n;
+                int used = 14 + (int)strlen(pp_metric_table[top_neg_i[k]].name) + 1
+                         + (int)strlen(pp_metric_table[top_neg_j[k]].name) + 8;
+                for (int i = used; i < cm_pw - 1; i++) *p++ = ' ';
+            }
+            p += sprintf(p, "%s\xe2\x94\x82%s", cbdr, crst);
         }
-        p += sprintf(p, "%s\xe2\x94\x82%s", cbdr, crst);
-
-        /* Row: Strongest negative */
-        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
-                     cm_row + 5 + CM_N, cm_col, cbdr, cbg);
-        {
-            int n = sprintf(p, " \033[38;2;100;100;255m\xe2\x96\xbc Anti-correlated: "
-                               "\033[38;2;200;200;255m%s\xc3\x97%s \033[38;2;120;120;255m%.3f",
-                            pp_metric_table[bn_i].name, pp_metric_table[bn_j].name, best_neg);
-            p += n;
-            int used = 20 + (int)strlen(pp_metric_table[bn_i].name) + 1
-                     + (int)strlen(pp_metric_table[bn_j].name) + 7;
-            for (int i = used; i < cm_pw - 1; i++) *p++ = ' ';
-        }
-        p += sprintf(p, "%s\xe2\x94\x82%s", cbdr, crst);
-
-        /* Row: Most independent */
-        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
-                     cm_row + 6 + CM_N, cm_col, cbdr, cbg);
-        {
-            int n = sprintf(p, " \033[38;2;200;200;200m\xe2\x97\x87 Independent:     "
-                               "\033[38;2;220;220;220m%s\xc3\x97%s \033[38;2;160;160;160m%.3f",
-                            pp_metric_table[bi_i].name, pp_metric_table[bi_j].name,
-                            cm_corr[bi_i][bi_j]);
-            p += n;
-            int used = 20 + (int)strlen(pp_metric_table[bi_i].name) + 1
-                     + (int)strlen(pp_metric_table[bi_j].name) + 7;
-            for (int i = used; i < cm_pw - 1; i++) *p++ = ' ';
-        }
-        p += sprintf(p, "%s\xe2\x94\x82%s", cbdr, crst);
 
         /* Bottom border */
         p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94",
-                     cm_row + 7 + CM_N, cm_col, cbdr);
+                     cm_summary_row + CM_TOP * 2, cm_col, cbdr);
         for (int i = 0; i < cm_pw; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
         *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
         p += sprintf(p, "%s", crst);
+        #undef CM_TOP
     }
 
     /* ── Recurrence Plot sidebar panel ─────────────────────────────────── */
@@ -14455,7 +14462,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (pb_mode)        rp_row_p += 14;
         if (gd_mode >= 2)   rp_row_p += 8;
         if (pp_mode)        rp_row_p += 18;
-        if (cm_mode && cm_count >= 4) rp_row_p += 8 + CM_N;
+        if (cm_mode && cm_count >= 4) rp_row_p += 11 + CM_N;
         if (rp_col < 1) rp_col = 1;
 
         const char *rpbdr = "\033[38;2;180;60;220;48;2;12;6;18m";
@@ -14654,7 +14661,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (pb_mode)        sa_row_p += 14;
         if (gd_mode >= 2)   sa_row_p += 8;
         if (pp_mode)        sa_row_p += 18;
-        if (cm_mode && cm_count >= 4) sa_row_p += 8 + CM_N;
+        if (cm_mode && cm_count >= 4) sa_row_p += 11 + CM_N;
         if (rp_mode && rp_count >= 4) sa_row_p += 10 + (rp_count < RP_DISP ? (rp_count+1)/2 : (RP_DISP+1)/2);
         if (pt_mode)        sa_row_p += 10;
         if (sa_col < 1) sa_col = 1;
@@ -14878,7 +14885,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (pb_mode)        pt_row_p += 14;
         if (gd_mode >= 2)   pt_row_p += 8;
         if (pp_mode)        pt_row_p += 18;
-        if (cm_mode && cm_count >= 4) pt_row_p += 8 + CM_N;
+        if (cm_mode && cm_count >= 4) pt_row_p += 11 + CM_N;
         if (rp_mode && rp_count >= 4) pt_row_p += 10 + (rp_count < RP_DISP ? (rp_count+1)/2 : (RP_DISP+1)/2);
         if (sa_mode && sa_hist_count > 2) pt_row_p += 10 + 16; /* SA_CH=16 */
         if (pt_col < 1) pt_col = 1;

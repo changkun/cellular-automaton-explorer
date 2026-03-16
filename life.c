@@ -1386,6 +1386,61 @@ static void rd_reset(void) {
     memset(rd_grid, 0, sizeof(float) * MAX_H * MAX_W);
 }
 
+/* ── Fisher Information Field ──────────────────────────────────────────────── */
+/* Measures how sharply the local probability distribution changes with respect
+   to a control parameter (density).  Near phase transitions, Fisher information
+   diverges — it's the information-geometric dual of correlation length divergence.
+   Per-cell Fisher info via finite-difference on neighborhood distributions over
+   the timeline buffer.  Sidebar: global Fisher trace sparkline, Cramér-Rao
+   duality panel, critical boundary fraction.
+   Toggle with '1' key. */
+
+#define FI_WINDOW  128   /* sliding window for metric time series */
+#define FI_N       PP_N_METRICS   /* 16 metrics */
+#define FI_HIST_LEN 64   /* sparkline history */
+
+static int   fi_mode = 0;           /* 0=off, 1=on */
+static float fi_buf[FI_WINDOW][FI_N]; /* ring buffer of metric snapshots */
+static int   fi_head = 0;
+static int   fi_count = 0;
+static int   fi_stale = 1;
+
+/* Per-cell Fisher information [0, ~∞) clamped to [0,1] for rendering */
+static float fi_grid[MAX_H][MAX_W];
+
+/* Global aggregates */
+static float fi_global = 0.0f;       /* mean Fisher info across grid */
+static float fi_max_cell = 0.0f;     /* peak per-cell Fisher info */
+static float fi_boundary_frac = 0.0f;/* fraction of cells above critical threshold */
+static float fi_entropy_curv = 0.0f; /* entropy curvature (Cramér-Rao dual) */
+
+/* Per-metric Fisher information */
+static float fi_metric[FI_N];        /* Fisher info per metric stream */
+static int   fi_peak_metric = 0;     /* metric with highest Fisher info */
+
+/* Sparkline history */
+static float fi_hist[FI_HIST_LEN];
+static int   fi_hist_idx = 0;
+static int   fi_hist_count = 0;
+
+static void fi_record(void);
+static void fi_compute(void);
+static void fi_reset(void) {
+    fi_head = 0;
+    fi_count = 0;
+    fi_stale = 1;
+    fi_global = 0.0f;
+    fi_max_cell = 0.0f;
+    fi_boundary_frac = 0.0f;
+    fi_entropy_curv = 0.0f;
+    fi_peak_metric = 0;
+    fi_hist_idx = 0;
+    fi_hist_count = 0;
+    memset(fi_grid, 0, sizeof(float) * MAX_H * MAX_W);
+    memset(fi_metric, 0, sizeof(fi_metric));
+    memset(fi_hist, 0, sizeof(fi_hist));
+}
+
 /* ── Cross-Correlation Matrix ──────────────────────────────────────────────── */
 /* Computes pairwise time-lagged cross-correlation across all 16 metric streams
    at lags -8 to +8.  For each pair, identifies the optimal lag (peak |r|),
@@ -1511,6 +1566,7 @@ static void split_set_overlay(int idx) {
     ew_mode = 0;
     hr_mode = 0;
     xc_mode = 0;
+    fi_mode = 0;
 
     switch (idx) {
         case  0: break;
@@ -1955,6 +2011,15 @@ static void hr_record(void) {
     hr_head = (hr_head + 1) % HR_WINDOW;
     if (hr_count < HR_WINDOW) hr_count++;
     hr_stale = 1;
+}
+
+/* ── Fisher Information Field: fi_record ────────────────────────────────────── */
+static void fi_record(void) {
+    for (int i = 0; i < FI_N; i++)
+        fi_buf[fi_head][i] = pp_read_metric(i);
+    fi_head = (fi_head + 1) % FI_WINDOW;
+    if (fi_count < FI_WINDOW) fi_count++;
+    fi_stale = 1;
 }
 
 /* ── Cross-Correlation Matrix: xc_record ───────────────────────────────────── */
@@ -2933,6 +2998,7 @@ static void grid_step(void) {
     coh_stale = 1;
     ce_stale = 1;
     ew_stale = 1;
+    fi_stale = 1;
 
     /* Always record frames for surprise field (cheap memcpy) */
     surp_record_frame();
@@ -3808,6 +3874,7 @@ static void demo_reset_overlays(void) {
     ew_mode = 0;
     hr_mode = 0;
     xc_mode = 0;
+    fi_mode = 0;
     fourier_mode = 0;
     fractal_mode = 0;
     wolfram_mode = 0;
@@ -7916,6 +7983,189 @@ static void xc_compute(void) {
     }
 }
 
+/* ── Fisher Information Field computation ──────────────────────────────────── */
+static void fi_compute(void) {
+    if (fi_count < 16) { fi_stale = 0; return; }
+    fi_stale = 0;
+    int n = fi_count;
+
+    /* ── Part 1: Per-metric Fisher information ──────────────────────────── */
+    /* Fisher info I(θ) ≈ E[(d/dθ log p(x|θ))²]
+       We approximate using finite differences on the empirical distribution:
+       For each metric, estimate how the distribution shifts per unit time.
+       I ≈ Σ (Δp_i / Δθ)² / p_i  where p_i are histogram bin probabilities. */
+    {
+        float global_fi_sum = 0.0f;
+        float peak_fi = 0.0f;
+        int peak_m = 0;
+
+        for (int m = 0; m < FI_N; m++) {
+            /* Extract two halves of the time series */
+            int half = n / 2;
+            if (half < 4) { fi_metric[m] = 0.0f; continue; }
+
+            /* Compute min/max for binning */
+            float vmin = 1e30f, vmax = -1e30f;
+            for (int k = 0; k < n; k++) {
+                int idx = (fi_head - n + k + FI_WINDOW) % FI_WINDOW;
+                float v = fi_buf[idx][m];
+                if (v < vmin) vmin = v;
+                if (v > vmax) vmax = v;
+            }
+            float range = vmax - vmin;
+            if (range < 1e-12f) { fi_metric[m] = 0.0f; continue; }
+
+            /* Histogram with 16 bins for each half */
+            #define FI_NBINS 16
+            float hist1[FI_NBINS] = {0}, hist2[FI_NBINS] = {0};
+            for (int k = 0; k < half; k++) {
+                int idx = (fi_head - n + k + FI_WINDOW) % FI_WINDOW;
+                int bin = (int)((fi_buf[idx][m] - vmin) / range * (FI_NBINS - 1));
+                if (bin < 0) bin = 0; if (bin >= FI_NBINS) bin = FI_NBINS - 1;
+                hist1[bin] += 1.0f;
+            }
+            for (int k = half; k < n; k++) {
+                int idx = (fi_head - n + k + FI_WINDOW) % FI_WINDOW;
+                int bin = (int)((fi_buf[idx][m] - vmin) / range * (FI_NBINS - 1));
+                if (bin < 0) bin = 0; if (bin >= FI_NBINS) bin = FI_NBINS - 1;
+                hist2[bin] += 1.0f;
+            }
+            /* Normalize to probabilities */
+            for (int b = 0; b < FI_NBINS; b++) {
+                hist1[b] /= half;
+                hist2[b] /= (n - half);
+            }
+
+            /* Fisher information: sum of (dp/dθ)² / p */
+            float fi_val = 0.0f;
+            for (int b = 0; b < FI_NBINS; b++) {
+                float p_avg = (hist1[b] + hist2[b]) * 0.5f;
+                if (p_avg < 1e-8f) continue;
+                float dp = hist2[b] - hist1[b];
+                fi_val += (dp * dp) / p_avg;
+            }
+            fi_metric[m] = fi_val;
+            global_fi_sum += fi_val;
+            if (fi_val > peak_fi) {
+                peak_fi = fi_val;
+                peak_m = m;
+            }
+            #undef FI_NBINS
+        }
+        fi_peak_metric = peak_m;
+
+        /* Global metric-level Fisher info (average across metrics) */
+        float fi_metric_avg = global_fi_sum / FI_N;
+        (void)fi_metric_avg;
+    }
+
+    /* ── Part 2: Per-cell Fisher information from timeline ──────────────── */
+    /* For each cell, compute Fisher info from local density changes.
+       Use 5x5 neighborhood density as the observable, finite-difference
+       between consecutive frames as the parameter shift. */
+    {
+        int frames_avail = tl_len < 64 ? tl_len : 64;
+        if (frames_avail < 8) {
+            memset(fi_grid, 0, sizeof(float) * H * W);
+            fi_global = 0.0f;
+            fi_max_cell = 0.0f;
+            fi_boundary_frac = 0.0f;
+            fi_entropy_curv = 0.0f;
+            return;
+        }
+
+        double fi_sum = 0.0;
+        float fi_max = 0.0f;
+        int boundary_count = 0;
+        double entropy_curv_sum = 0.0;
+
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                /* Compute local density time series (5x5 neighborhood) */
+                float density[64];
+                for (int f = 0; f < frames_avail; f++) {
+                    int fi2 = (tl_head - 1 - f + TL_MAX) % TL_MAX;
+                    int cnt = 0, total = 0;
+                    for (int dy = -2; dy <= 2; dy++) {
+                        for (int dx = -2; dx <= 2; dx++) {
+                            int ny = y + dy, nx = x + dx;
+                            if (ny >= 0 && ny < H && nx >= 0 && nx < W) {
+                                if (timeline[fi2].grid[ny][nx] > 0) cnt++;
+                                total++;
+                            }
+                        }
+                    }
+                    density[frames_avail - 1 - f] = (total > 0) ? (float)cnt / total : 0.0f;
+                }
+
+                /* Fisher info from density series:
+                   I ≈ Σ_t (d log p / dρ)² ≈ Σ_t (Δρ_t / σ_ρ)² / N
+                   Simplified: variance of density changes normalized by mean density.
+                   This captures sensitivity to perturbation. */
+                float mean_d = 0.0f;
+                for (int f = 0; f < frames_avail; f++) mean_d += density[f];
+                mean_d /= frames_avail;
+
+                /* Compute differences (finite-difference derivative) */
+                float diff_var = 0.0f;
+                int ndiffs = 0;
+                for (int f = 1; f < frames_avail; f++) {
+                    float dd = density[f] - density[f-1];
+                    diff_var += dd * dd;
+                    ndiffs++;
+                }
+                if (ndiffs > 0) diff_var /= ndiffs;
+
+                /* Fisher information: sensitivity = diff_var / (mean_density * (1 - mean_density) + ε)
+                   This diverges near ρ = 0 or ρ = 1 (edges of state space) and
+                   peaks near critical density where fluctuations are maximal */
+                float denom = mean_d * (1.0f - mean_d);
+                if (denom < 0.001f) denom = 0.001f;
+                float fi_cell = diff_var / denom;
+
+                /* Also include a second-order term: curvature of density trajectory */
+                float curv_sum = 0.0f;
+                for (int f = 2; f < frames_avail; f++) {
+                    float c = density[f] - 2.0f * density[f-1] + density[f-2];
+                    curv_sum += c * c;
+                }
+                if (frames_avail > 2) curv_sum /= (frames_avail - 2);
+                fi_cell += curv_sum * 2.0f;
+
+                /* Clamp to [0, 1] for visualization (log-scale compression) */
+                float fi_vis = 1.0f - 1.0f / (1.0f + fi_cell * 5.0f);
+
+                fi_grid[y][x] = fi_vis;
+                fi_sum += fi_vis;
+                if (fi_vis > fi_max) fi_max = fi_vis;
+
+                /* Critical boundary: cells with Fisher info > 0.6 */
+                if (fi_vis > 0.6f) boundary_count++;
+
+                /* Entropy curvature: -d²S/dρ² where S = -p log p - (1-p) log(1-p) */
+                if (mean_d > 0.01f && mean_d < 0.99f) {
+                    /* d²S/dρ² = -1/(p(1-p)) */
+                    float s_curv = 1.0f / (mean_d * (1.0f - mean_d));
+                    entropy_curv_sum += s_curv;
+                }
+            }
+        }
+
+        int total_cells = H * W;
+        fi_global = (float)(fi_sum / total_cells);
+        fi_max_cell = fi_max;
+        fi_boundary_frac = (float)boundary_count / total_cells;
+        fi_entropy_curv = (total_cells > 0) ? (float)(entropy_curv_sum / total_cells) : 0.0f;
+        /* Normalize entropy curvature to [0,1] range */
+        fi_entropy_curv = 1.0f - 1.0f / (1.0f + fi_entropy_curv * 0.1f);
+    }
+
+    /* Sparkline */
+    fi_hist[fi_hist_idx] = fi_global;
+    fi_hist_idx = (fi_hist_idx + 1) % FI_HIST_LEN;
+    if (fi_hist_count < FI_HIST_LEN) fi_hist_count++;
+}
+
 /* ── Causal Emergence computation ──────────────────────────────────────────── */
 /* Color mapping: scale 0 (micro best) = cool blue,
    scale 1 (2x2) = green, scale 2 (4x4) = warm orange,
@@ -10995,6 +11245,56 @@ static int cell_color(int x, int y, RGB *out) {
         return 0;
     }
 
+    /* Fisher Information Field overlay: sensitivity to perturbation */
+    if (fi_mode) {
+        float v = fi_grid[y][x];
+        if (grid[y][x] || v > 0.03f) {
+            /* Low Fisher = deep blue/black (stable), mid = violet/magenta (sensitive),
+               high = white-gold glow (critical boundary / knife edge) */
+            unsigned char r, g, b;
+            if (v < 0.15f) {
+                /* Very low: deep indigo-black */
+                float t = v / 0.15f;
+                r = (unsigned char)(5 + 20 * t);
+                g = (unsigned char)(5 + 10 * t);
+                b = (unsigned char)(20 + 60 * t);
+            } else if (v < 0.35f) {
+                /* Low-medium: indigo to violet */
+                float t = (v - 0.15f) / 0.2f;
+                r = (unsigned char)(25 + 80 * t);
+                g = (unsigned char)(15 + 15 * t);
+                b = (unsigned char)(80 + 80 * t);
+            } else if (v < 0.55f) {
+                /* Medium: violet to magenta-pink */
+                float t = (v - 0.35f) / 0.2f;
+                r = (unsigned char)(105 + 100 * t);
+                g = (unsigned char)(30 + 40 * t);
+                b = (unsigned char)(160 + 40 * t);
+            } else if (v < 0.75f) {
+                /* High: magenta to warm gold */
+                float t = (v - 0.55f) / 0.2f;
+                r = (unsigned char)(205 + 50 * t);
+                g = (unsigned char)(70 + 130 * t);
+                b = (unsigned char)(200 - 140 * t);
+            } else {
+                /* Critical: gold to white-hot glow */
+                float t = (v - 0.75f) / 0.25f;
+                if (t > 1.0f) t = 1.0f;
+                r = 255;
+                g = (unsigned char)(200 + 55 * t);
+                b = (unsigned char)(60 + 195 * t);
+            }
+            if (grid[y][x]) {
+                r = (unsigned char)(r < 200 ? r + 55 : 255);
+                g = (unsigned char)(g < 200 ? g + 55 : 255);
+                b = (unsigned char)(b < 200 ? b + 55 : 255);
+            }
+            out->r = r; out->g = g; out->b = b;
+            return grid[y][x] ? 1 : 35; /* 35 = fisher ghost */
+        }
+        return 0;
+    }
+
     /* Percolation analysis overlay: cluster connectivity */
     if (perc_mode) {
         unsigned short lbl = perc_label[y][x];
@@ -11448,6 +11748,14 @@ static void render(int running, int speed_ms, int draw_mode) {
                  xc_count, XC_WINDOW);
     }
 
+    /* Fisher information indicator */
+    char fi_str[96] = "";
+    if (fi_mode) {
+        snprintf(fi_str, sizeof(fi_str),
+                 " \033[38;2;220;120;255m\xe2\x97\x88" "FI:%.3f\033[0m",
+                 fi_global);
+    }
+
     /* Power spectrum indicator */
     char ps_str[96] = "";
     if (ps_mode) {
@@ -11658,9 +11966,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, gd_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, corr_str, eprod_str, wave_str, pp_str, cm_str, xc_str, ps_str, rp_str, sa_str, pt_str, ad_str, ce_str, split_str, kymo_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
+                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, gd_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, corr_str, eprod_str, wave_str, pp_str, cm_str, xc_str, fi_str, ps_str, rp_str, sa_str, pt_str, ad_str, ce_str, split_str, kymo_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -16256,6 +16564,269 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", xcrst);
     }
 
+    /* ── Fisher Information Field overlay panel ────────────────────────── */
+    if (fi_mode && fi_count >= 16) {
+        int fi_pw = 50;  /* panel width */
+        int fi_col = term_cols - fi_pw - 2;
+        int fi_row = 3;
+        /* Stack below other panels */
+        if (entropy_mode)   fi_row += 8;
+        if (temp_mode)      fi_row += 9;
+        if (lyapunov_mode)  fi_row += 8;
+        if (fourier_mode)   fi_row += 18;
+        if (fractal_mode)   fi_row += 11;
+        if (wolfram_mode)   fi_row += 14;
+        if (flow_mode)      fi_row += 9;
+        if (attractor_mode) fi_row += 8;
+        if (cone_mode >= 1) fi_row += 8;
+        if (surp_mode)      fi_row += 8;
+        if (mi_mode)        fi_row += 12;
+        if (cplx_mode)      fi_row += 11;
+        if (topo_mode)      fi_row += 11;
+        if (rg_mode)        fi_row += 11;
+        if (kc_mode)        fi_row += 9;
+        if (corr_mode)      fi_row += 9;
+        if (eprod_mode)     fi_row += 9;
+        if (vort_mode)      fi_row += 9;
+        if (wave_mode)      fi_row += 9;
+        if (ergo_mode)      fi_row += 10;
+        if (coh_mode)       fi_row += 8;
+        if (ce_mode)        fi_row += 9;
+        if (ew_mode)        fi_row += 10;
+        if (hr_mode)        fi_row += 10;
+        if (rd_mode)        fi_row += 13;
+        if (xc_mode && xc_count >= 20) fi_row += 28;
+        if (fi_col < 1) fi_col = 1;
+
+        const char *fibdr = "\033[38;2;200;100;255;48;2;12;6;16m";  /* violet border */
+        const char *fibg  = "\033[48;2;12;6;16m";
+        const char *first = "\033[0m"; /* fi reset */
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 \xe2\x97\x88 Fisher Information ",
+                     fi_row, fi_col, fibdr);
+        for (int i = 24; i < fi_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", first);
+
+        /* Row 1: Global Fisher info + classification */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     fi_row + 1, fi_col, fibdr, fibg);
+        {
+            const char *state_str;
+            const char *state_clr;
+            if (fi_global < 0.2f) {
+                state_str = "STABLE";
+                state_clr = "\033[38;2;60;80;200m";
+            } else if (fi_global < 0.4f) {
+                state_str = "MODERATE";
+                state_clr = "\033[38;2;140;60;200m";
+            } else if (fi_global < 0.6f) {
+                state_str = "SENSITIVE";
+                state_clr = "\033[38;2;200;80;200m";
+            } else {
+                state_str = "CRITICAL";
+                state_clr = "\033[38;2;255;220;100m";
+            }
+            int n = sprintf(p, " %sI=%.4f %s%s \033[38;2;120;80;160m[1]exit",
+                            "\033[38;2;220;160;255m", fi_global, state_clr, state_str);
+            p += n;
+            int used = 36;
+            for (int i = used; i < fi_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", fibdr, first);
+
+        /* Row 2: Peak cell + boundary fraction */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     fi_row + 2, fi_col, fibdr, fibg);
+        {
+            int n = sprintf(p, " \033[38;2;180;120;220mPeak:%.3f  \033[38;2;255;180;60mBoundary:%.1f%%",
+                            fi_max_cell, fi_boundary_frac * 100.0f);
+            p += n;
+            int used = 34;
+            for (int i = used; i < fi_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", fibdr, first);
+
+        /* Row 3: Cramér-Rao duality: Fisher info vs entropy curvature */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     fi_row + 3, fi_col, fibdr, fibg);
+        {
+            /* Cramér-Rao: Var(θ̂) ≥ 1/I(θ) — display duality */
+            float cr_bound = (fi_global > 0.01f) ? 1.0f / (fi_global * 50.0f) : 99.9f;
+            if (cr_bound > 99.9f) cr_bound = 99.9f;
+            int n = sprintf(p, " \033[38;2;100;180;255mCR bound:\xe2\x89\xa5%.3f  "
+                               "\033[38;2;255;140;200m-d\xc2\xb2S/d\xcf\x81\xc2\xb2:%.3f",
+                            cr_bound, fi_entropy_curv);
+            p += n;
+            int used = 37;
+            for (int i = used; i < fi_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", fibdr, first);
+
+        /* Row 4: Separator */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     fi_row + 4, fi_col, fibdr, fibg);
+        p += sprintf(p, " \033[38;2;80;50;120m");
+        for (int i = 1; i < fi_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", fibdr, first);
+
+        /* Row 5: Top-4 metrics by Fisher info */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     fi_row + 5, fi_col, fibdr, fibg);
+        {
+            /* Find top 4 metrics */
+            int top_idx[4] = {0, 1, 2, 3};
+            float top_val[4];
+            for (int i = 0; i < 4; i++) top_val[i] = fi_metric[i];
+            for (int i = 4; i < FI_N; i++) {
+                int min_k = 0;
+                for (int k = 1; k < 4; k++) if (top_val[k] < top_val[min_k]) min_k = k;
+                if (fi_metric[i] > top_val[min_k]) {
+                    top_val[min_k] = fi_metric[i];
+                    top_idx[min_k] = i;
+                }
+            }
+            /* Sort descending */
+            for (int i = 0; i < 3; i++) {
+                for (int j = i + 1; j < 4; j++) {
+                    if (top_val[j] > top_val[i]) {
+                        float tv = top_val[i]; top_val[i] = top_val[j]; top_val[j] = tv;
+                        int ti = top_idx[i]; top_idx[i] = top_idx[j]; top_idx[j] = ti;
+                    }
+                }
+            }
+            float max_fi = top_val[0] > 0.01f ? top_val[0] : 1.0f;
+            int n = sprintf(p, " \033[38;2;160;120;200mSensitive metrics:");
+            p += n;
+            int used = 19;
+            for (int i = used; i < fi_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", fibdr, first);
+
+        /* Row 6: Metric bars */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     fi_row + 6, fi_col, fibdr, fibg);
+        {
+            int top_idx[4] = {0, 1, 2, 3};
+            float top_val[4];
+            for (int i = 0; i < 4; i++) top_val[i] = fi_metric[i];
+            for (int i = 4; i < FI_N; i++) {
+                int min_k = 0;
+                for (int k = 1; k < 4; k++) if (top_val[k] < top_val[min_k]) min_k = k;
+                if (fi_metric[i] > top_val[min_k]) {
+                    top_val[min_k] = fi_metric[i];
+                    top_idx[min_k] = i;
+                }
+            }
+            for (int i = 0; i < 3; i++) {
+                for (int j = i + 1; j < 4; j++) {
+                    if (top_val[j] > top_val[i]) {
+                        float tv = top_val[i]; top_val[i] = top_val[j]; top_val[j] = tv;
+                        int ti = top_idx[i]; top_idx[i] = top_idx[j]; top_idx[j] = ti;
+                    }
+                }
+            }
+            float max_fi = top_val[0] > 0.01f ? top_val[0] : 1.0f;
+            p += sprintf(p, " ");
+            for (int i = 0; i < 4 && i < FI_N; i++) {
+                float frac = top_val[i] / max_fi;
+                int bar_len = (int)(frac * 6);
+                if (bar_len < 1 && top_val[i] > 0.001f) bar_len = 1;
+                /* Color: intensity by value */
+                int mr = (int)(120 + 135 * frac);
+                int mg = (int)(40 + 60 * frac);
+                int mb = (int)(180 + 75 * frac);
+                if (mr > 255) mr = 255; if (mb > 255) mb = 255;
+                p += sprintf(p, "\033[38;2;%d;%d;%dm%-5.5s", mr, mg, mb,
+                             pp_metric_table[top_idx[i]].name);
+                for (int b = 0; b < bar_len; b++)
+                    p += sprintf(p, "\xe2\x96\x88");
+                for (int b = bar_len; b < 6; b++)
+                    p += sprintf(p, "\xe2\x96\x91");
+            }
+            int used = 1 + 4 * 11;
+            for (int i = used; i < fi_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", fibdr, first);
+
+        /* Row 7: Color legend */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     fi_row + 7, fi_col, fibdr, fibg);
+        {
+            /* Gradient: deep blue → violet → magenta → gold → white */
+            p += sprintf(p, " ");
+            int grad_colors[][3] = {
+                {5,5,20}, {25,15,80}, {105,30,160}, {205,70,200}, {255,200,60}, {255,255,255}
+            };
+            int ngrad = 6;
+            int bar_w = 30;
+            for (int i = 0; i < bar_w; i++) {
+                float t = (float)i / (bar_w - 1) * (ngrad - 1);
+                int seg = (int)t;
+                if (seg >= ngrad - 1) seg = ngrad - 2;
+                float f = t - seg;
+                int r2 = (int)(grad_colors[seg][0] * (1-f) + grad_colors[seg+1][0] * f);
+                int g2 = (int)(grad_colors[seg][1] * (1-f) + grad_colors[seg+1][1] * f);
+                int b2 = (int)(grad_colors[seg][2] * (1-f) + grad_colors[seg+1][2] * f);
+                p += sprintf(p, "\033[48;2;%d;%d;%dm ", r2, g2, b2);
+            }
+            p += sprintf(p, "%s", fibg);
+            int used = 1 + bar_w;
+            for (int i = used; i < fi_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", fibdr, first);
+
+        /* Row 8: Scale labels */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     fi_row + 8, fi_col, fibdr, fibg);
+        {
+            int n = sprintf(p, " \033[38;2;60;60;140mstable"
+                               "     \033[38;2;160;80;200msensitive"
+                               "    \033[38;2;255;220;100mcritical");
+            p += n;
+            int used = 35;
+            for (int i = used; i < fi_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", fibdr, first);
+
+        /* Row 9: Sparkline of global Fisher info */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     fi_row + 9, fi_col, fibdr, fibg);
+        p += sprintf(p, " \033[38;2;120;80;160mI(t): ");
+        {
+            const char *spark_chars[] = {"\xe2\x96\x81","\xe2\x96\x82","\xe2\x96\x83",
+                                         "\xe2\x96\x84","\xe2\x96\x85","\xe2\x96\x86",
+                                         "\xe2\x96\x87","\xe2\x96\x88"};
+            int nsp = fi_hist_count < 32 ? fi_hist_count : 32;
+            for (int s = 0; s < nsp; s++) {
+                int si = (fi_hist_idx - nsp + s + FI_HIST_LEN) % FI_HIST_LEN;
+                float v = fi_hist[si];
+                if (v < 0.0f) v = 0.0f;
+                if (v > 1.0f) v = 1.0f;
+                int bi = (int)(v * 7.99f);
+                if (bi > 7) bi = 7;
+                /* Color: low = dim violet, high = bright gold */
+                int sr = (int)(80 + 175 * v);
+                int sg = (int)(40 + 180 * v);
+                int sb = (int)(180 - 80 * v);
+                if (sr > 255) sr = 255; if (sg > 255) sg = 255;
+                p += sprintf(p, "\033[38;2;%d;%d;%dm%s", sr, sg, sb, spark_chars[bi]);
+            }
+            for (int i = nsp; i < 32; i++) p += sprintf(p, " ");
+            int used = 7 + 32;
+            for (int i = used; i < fi_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", fibdr, first);
+
+        /* Bottom border */
+        int fi_bottom = fi_row + 10;
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", fi_bottom, fi_col, fibdr);
+        for (int i = 0; i < fi_pw; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", first);
+    }
+
     /* ── Percolation Analysis overlay panel ─────────────────────────────── */
     if (perc_mode) {
         int pc_w = 46;
@@ -16287,6 +16858,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (hr_mode)        pc_row += 10;
         if (rd_mode)        pc_row += 13;
         if (xc_mode && xc_count >= 20) pc_row += 28;
+        if (fi_mode && fi_count >= 16) pc_row += 11;
         if (pc_col < 1) pc_col = 1;
 
         const char *pcbdr = "\033[38;2;255;200;40;48;2;14;12;6m";
@@ -19535,6 +20107,19 @@ int main(int argc, char **argv) {
                 }
             }
         }
+        else if (key == '1') {
+            if (!ecosystem_mode) {
+                fi_mode = !fi_mode;
+                if (fi_mode) {
+                    fi_reset();
+                    flash_set("Fisher Information: phase boundary sensitivity [1]exit");
+                    printf("\033[2J"); fflush(stdout);
+                } else {
+                    flash_set("Fisher Information off");
+                    printf("\033[2J"); fflush(stdout);
+                }
+            }
+        }
         else if (key == '2') {
             if (!ecosystem_mode) {
                 xc_mode = !xc_mode;
@@ -20268,6 +20853,14 @@ int main(int argc, char **argv) {
             xc_record();
             if (xc_stale && xc_count >= 20) {
                 xc_compute();
+            }
+        }
+
+        /* Fisher Information Field: record and compute every 2 generations */
+        if (fi_mode && running && (generation % 2 == 0)) {
+            fi_record();
+            if (fi_stale && fi_count >= 16) {
+                fi_compute();
             }
         }
 

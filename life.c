@@ -142,6 +142,9 @@
  *   Ctrl-V      Toggle interface roughness analyzer (KPZ universality detection)
  *                 Boundary cells colored by local height deviation
  *                 Cyan=smooth, amber=moderate, red=rough; sidebar shows α,β,d_f
+ *   Ctrl-W      Toggle multifractal singularity spectrum (Hölder exponents)
+ *                 Local scaling α(x,y) by box-counting at radii 1,2,4,8
+ *                 Blue=smooth, green=moderate, yellow=transition, red=singular
  *   Ctrl-E      Export current grid as RLE file (auto-numbered export_NNN.rle)
  *   Arrow keys  Pan viewport across the full 400×200 grid
  *   0           Re-center viewport on grid center
@@ -1064,7 +1067,7 @@ static int   probe_y = -1;            /* selected cell y */
    Toggle with '\\' key. TAB cycles the right panel, '`' cycles the left. */
 
 /* Overlay table: ordered list of analysis overlays for cycling */
-#define N_SPLIT_OVERLAYS 42
+#define N_SPLIT_OVERLAYS 44
 typedef struct {
     const char *name;   /* short display name */
     char key;           /* toggle key character */
@@ -1113,6 +1116,8 @@ static const SplitOverlayInfo split_overlay_table[N_SPLIT_OVERLAYS] = {
     { "SpectGap",     'T'-64 },  /* 39: Ctrl-T */
     { "Suscept",      'U'-64 },  /* 40: Ctrl-U */
     { "Roughness",    'V'-64 },  /* 41: Ctrl-V */
+    { "Recurrence",   'Y'-64 },  /* 42: Ctrl-Y */
+    { "MultiFrac",    'W'-64 },  /* 43: Ctrl-W */
 };
 
 static int split_mode = 0;         /* 0=off, 1=on */
@@ -2001,6 +2006,49 @@ static void pr_reset(void) {
     memset(pr_hist_frac, 0, sizeof(pr_hist_frac));
 }
 
+/* ── Multifractal Singularity Spectrum ────────────────────────────────────── */
+/* Per-cell local Hölder exponent α(x,y) via box-counting at radii 1,2,4,8.
+   Measures how density scales locally — different α values coexist in a
+   multifractal.  Δα = α_max - α_min captures scaling heterogeneity.
+   Heatmap: blue(smooth,high α) → green → yellow → red → white(singular,low α).
+   Sidebar: α_min, α_max, Δα, D₀/D₁/D₂, classification. */
+#define MFS_NSCALES 4     /* radii: 1, 2, 4, 8 */
+#define MFS_HIST_LEN 64
+#define MFS_NBINS 32      /* bins for f(α) spectrum */
+
+static int   mfs_mode = 0;
+static int   mfs_stale = 1;
+static float mfs_cell[MAX_H][MAX_W];   /* normalized α for rendering [0,1] */
+static float mfs_alpha[MAX_H][MAX_W];  /* raw Hölder exponent per cell */
+static float mfs_alpha_min;            /* global min α (most singular) */
+static float mfs_alpha_max;            /* global max α (smoothest) */
+static float mfs_delta_alpha;          /* multifractal width Δα */
+static float mfs_alpha_0;             /* most probable α (peak of f(α)) */
+static float mfs_D0, mfs_D1, mfs_D2; /* generalized dimensions */
+static float mfs_hist_da[MFS_HIST_LEN]; /* sparkline: Δα history */
+static float mfs_hist_a0[MFS_HIST_LEN]; /* sparkline: α₀ history */
+static int   mfs_hist_idx;
+static int   mfs_hist_count;
+static const char *mfs_class_str;     /* classification label */
+static const char *mfs_class_clr;     /* ANSI color */
+
+static void mfs_reset(void) {
+    mfs_stale = 1;
+    mfs_alpha_min = 999.0f;
+    mfs_alpha_max = 0.0f;
+    mfs_delta_alpha = 0.0f;
+    mfs_alpha_0 = 0.0f;
+    mfs_D0 = 0.0f; mfs_D1 = 0.0f; mfs_D2 = 0.0f;
+    mfs_hist_idx = 0;
+    mfs_hist_count = 0;
+    mfs_class_str = "WAITING";
+    mfs_class_clr = "\033[38;2;128;128;128m";
+    memset(mfs_cell, 0, sizeof(mfs_cell));
+    memset(mfs_alpha, 0, sizeof(mfs_alpha));
+    memset(mfs_hist_da, 0, sizeof(mfs_hist_da));
+    memset(mfs_hist_a0, 0, sizeof(mfs_hist_a0));
+}
+
 /* ── Cross-Correlation Matrix ──────────────────────────────────────────────── */
 /* Computes pairwise time-lagged cross-correlation across all 16 metric streams
    at lags -8 to +8.  For each pair, identifies the optimal lag (peak |r|),
@@ -2134,6 +2182,8 @@ static void split_set_overlay(int idx) {
     sg2_mode = 0;
     su_mode = 0;
     ir_mode = 0;
+    pr_mode = 0;
+    mfs_mode = 0;
 
     switch (idx) {
         case  0: break;
@@ -2178,6 +2228,8 @@ static void split_set_overlay(int idx) {
         case 39: sg2_mode = 1; break;
         case 40: su_mode = 1; break;
         case 41: ir_mode = 1; break;
+        case 42: pr_mode = 1; break;
+        case 43: mfs_mode = 1; break;
     }
 }
 
@@ -2224,6 +2276,7 @@ static int split_detect_current(void) {
     if (su_mode) return 40;
     if (ir_mode) return 41;
     if (pr_mode) return 42;
+    if (mfs_mode) return 43;
     return 0;
 }
 
@@ -3589,6 +3642,7 @@ static void grid_step(void) {
     su_stale = 1;
     ir_stale = 1;
     pr_stale = 1;
+    mfs_stale = 1;
 
     /* Always record frames for surprise field (cheap memcpy) */
     surp_record_frame();
@@ -9924,6 +9978,234 @@ static void pr_compute(void) {
     if (pr_hist_count < PR_HIST_LEN) pr_hist_count++;
 }
 
+/* ── Multifractal Singularity Spectrum computation ─────────────────────────── */
+static void mfs_compute(void) {
+    mfs_stale = 0;
+
+    /* Radii for box-counting: 1, 2, 4, 8 */
+    static const int radii[MFS_NSCALES] = {1, 2, 4, 8};
+
+    /* Total live cells for normalization */
+    int total_alive = 0;
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++)
+            if (grid[y][x]) total_alive++;
+
+    if (total_alive < 4) {
+        /* Not enough structure for meaningful analysis */
+        mfs_class_str = "EMPTY";
+        mfs_class_clr = "\033[38;2;80;80;80m";
+        mfs_delta_alpha = 0.0f;
+        memset(mfs_cell, 0, sizeof(mfs_cell));
+        return;
+    }
+
+    float inv_total = 1.0f / (float)total_alive;
+
+    /* Step 1: Compute local Hölder exponent per cell via log(μ)/log(r) regression */
+    float a_min = 999.0f, a_max = -999.0f;
+    int n_valid = 0;
+    float a_sum = 0.0f;
+
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            /* Only compute for cells near activity */
+            int has_any = 0;
+            for (int dy = -8; dy <= 8 && !has_any; dy++)
+                for (int dx = -8; dx <= 8 && !has_any; dx++) {
+                    int ny = y + dy, nx = x + dx;
+                    if (ny >= 0 && ny < H && nx >= 0 && nx < W && grid[ny][nx])
+                        has_any = 1;
+                }
+
+            if (!has_any) {
+                mfs_alpha[y][x] = -1.0f; /* sentinel: no data */
+                mfs_cell[y][x] = 0.0f;
+                continue;
+            }
+
+            /* Measure density in boxes of each radius */
+            float sum_xy = 0.0f, sum_xx = 0.0f, sum_x = 0.0f, sum_y2 = 0.0f;
+            int n_pts = 0;
+
+            for (int s = 0; s < MFS_NSCALES; s++) {
+                int r = radii[s];
+                int count = 0;
+                int area = 0;
+
+                for (int dy = -r; dy <= r; dy++) {
+                    for (int dx = -r; dx <= r; dx++) {
+                        int ny = y + dy, nx = x + dx;
+                        if (ny >= 0 && ny < H && nx >= 0 && nx < W) {
+                            area++;
+                            if (grid[ny][nx]) count++;
+                        }
+                    }
+                }
+
+                if (count > 0 && area > 0) {
+                    float mu = (float)count * inv_total; /* measure (fraction of total mass) */
+                    float log_mu = logf(mu);
+                    float log_r = logf((float)r);
+                    sum_xy += log_r * log_mu;
+                    sum_xx += log_r * log_r;
+                    sum_x += log_r;
+                    sum_y2 += log_mu;
+                    n_pts++;
+                }
+            }
+
+            /* Linear regression: α = d(log μ) / d(log r) */
+            if (n_pts >= 2) {
+                float denom = (float)n_pts * sum_xx - sum_x * sum_x;
+                float alpha;
+                if (fabsf(denom) > 1e-10f)
+                    alpha = ((float)n_pts * sum_xy - sum_x * sum_y2) / denom;
+                else
+                    alpha = 1.0f;
+
+                /* Clamp to reasonable range */
+                if (alpha < 0.0f) alpha = 0.0f;
+                if (alpha > 4.0f) alpha = 4.0f;
+
+                mfs_alpha[y][x] = alpha;
+                a_sum += alpha;
+                n_valid++;
+
+                if (alpha < a_min) a_min = alpha;
+                if (alpha > a_max) a_max = alpha;
+            } else {
+                mfs_alpha[y][x] = -1.0f;
+                mfs_cell[y][x] = 0.0f;
+            }
+        }
+    }
+
+    if (n_valid < 2) {
+        mfs_class_str = "SPARSE";
+        mfs_class_clr = "\033[38;2;80;80;80m";
+        mfs_delta_alpha = 0.0f;
+        return;
+    }
+
+    mfs_alpha_min = a_min;
+    mfs_alpha_max = a_max;
+    mfs_delta_alpha = a_max - a_min;
+    mfs_alpha_0 = a_sum / (float)n_valid;
+
+    /* Step 2: Build f(α) spectrum — histogram of α values */
+    int bins[MFS_NBINS];
+    memset(bins, 0, sizeof(bins));
+    float bin_width = (mfs_delta_alpha > 0.001f) ? mfs_delta_alpha / (float)MFS_NBINS : 1.0f;
+
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            if (mfs_alpha[y][x] < 0.0f) continue;
+            int b = (int)((mfs_alpha[y][x] - a_min) / bin_width);
+            if (b < 0) b = 0;
+            if (b >= MFS_NBINS) b = MFS_NBINS - 1;
+            bins[b]++;
+        }
+    }
+
+    /* Find peak bin for α₀ */
+    int peak_bin = 0, peak_count = 0;
+    for (int b = 0; b < MFS_NBINS; b++) {
+        if (bins[b] > peak_count) {
+            peak_count = bins[b];
+            peak_bin = b;
+        }
+    }
+    mfs_alpha_0 = a_min + ((float)peak_bin + 0.5f) * bin_width;
+
+    /* Step 3: Estimate generalized dimensions D_q for q=0,1,2 */
+    /* D_0 = box-counting dimension (fraction of boxes occupied) */
+    {
+        int box_r = 4;
+        int n_boxes_x = (W + box_r - 1) / box_r;
+        int n_boxes_y = (H + box_r - 1) / box_r;
+        int occupied = 0;
+        float sum_p_logp = 0.0f;
+        float sum_p2 = 0.0f;
+
+        for (int by = 0; by < n_boxes_y; by++) {
+            for (int bx = 0; bx < n_boxes_x; bx++) {
+                int count = 0;
+                for (int dy = 0; dy < box_r && by * box_r + dy < H; dy++)
+                    for (int dx = 0; dx < box_r && bx * box_r + dx < W; dx++)
+                        if (grid[by * box_r + dy][bx * box_r + dx]) count++;
+                if (count > 0) {
+                    occupied++;
+                    float p = (float)count * inv_total;
+                    if (p > 0.0f) {
+                        sum_p_logp += p * logf(p);
+                        sum_p2 += p * p;
+                    }
+                }
+            }
+        }
+
+        float log_r = logf((float)box_r);
+        float log_inv_r = logf(1.0f / (float)box_r);
+        if (fabsf(log_inv_r) > 1e-6f) {
+            mfs_D0 = logf((float)occupied) / (-log_inv_r);
+        } else {
+            mfs_D0 = 2.0f;
+        }
+
+        /* D_1 = information dimension */
+        if (fabsf(log_r) > 1e-6f && occupied > 0)
+            mfs_D1 = sum_p_logp / log_r;
+        else
+            mfs_D1 = mfs_D0;
+
+        /* D_2 = correlation dimension */
+        if (fabsf(log_r) > 1e-6f && sum_p2 > 0.0f)
+            mfs_D2 = logf(sum_p2) / log_r;
+        else
+            mfs_D2 = mfs_D1;
+    }
+
+    /* Step 4: Normalize per-cell α for rendering — invert so singular=hot */
+    float range = mfs_delta_alpha;
+    if (range < 0.001f) range = 1.0f;
+
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            if (mfs_alpha[y][x] < 0.0f) {
+                mfs_cell[y][x] = 0.0f;
+            } else {
+                /* Invert: low α (singular) → high value (hot), high α (smooth) → low value (cool) */
+                float v = 1.0f - (mfs_alpha[y][x] - a_min) / range;
+                if (v < 0.0f) v = 0.0f;
+                if (v > 1.0f) v = 1.0f;
+                mfs_cell[y][x] = v;
+            }
+        }
+    }
+
+    /* Classification by multifractal width */
+    if (mfs_delta_alpha < 0.1f) {
+        mfs_class_str = "MONOFRACTAL";
+        mfs_class_clr = "\033[38;2;80;180;255m";
+    } else if (mfs_delta_alpha < 0.5f) {
+        mfs_class_str = "WEAK MULTI";
+        mfs_class_clr = "\033[38;2;80;220;140m";
+    } else if (mfs_delta_alpha < 1.0f) {
+        mfs_class_str = "STRONG MULTI";
+        mfs_class_clr = "\033[38;2;240;200;60m";
+    } else {
+        mfs_class_str = "TURBULENT";
+        mfs_class_clr = "\033[38;2;255;80;40m";
+    }
+
+    /* Sparkline history */
+    mfs_hist_da[mfs_hist_idx] = mfs_delta_alpha;
+    mfs_hist_a0[mfs_hist_idx] = mfs_alpha_0;
+    mfs_hist_idx = (mfs_hist_idx + 1) % MFS_HIST_LEN;
+    if (mfs_hist_count < MFS_HIST_LEN) mfs_hist_count++;
+}
+
 /* ── Causal Emergence computation ──────────────────────────────────────────── */
 /* Color mapping: scale 0 (micro best) = cool blue,
    scale 1 (2x2) = green, scale 2 (4x4) = warm orange,
@@ -11223,6 +11505,7 @@ static void split_ensure_computed(int idx) {
         case 40: if (su_stale) su_compute(); break;
         case 41: if (ir_stale) ir_compute(); break;
         case 42: if (pr_stale) pr_compute(); break;
+        case 43: if (mfs_stale) mfs_compute(); break;
         default: break;
     }
 }
@@ -13385,6 +13668,55 @@ static int cell_color(int x, int y, RGB *out) {
             }
             out->r = r; out->g = g; out->b = b;
             return grid[y][x] ? 1 : 43; /* 43 = recurrence ghost */
+        }
+        return 0;
+    }
+
+    /* Multifractal Singularity Spectrum overlay */
+    if (mfs_mode) {
+        float v = mfs_cell[y][x];
+        if (grid[y][x] || v > 0.02f) {
+            /* Blue (smooth/high α) → green → yellow → red → white (singular/low α) */
+            unsigned char r, g, b;
+            if (v < 0.2f) {
+                /* Smooth: deep blue → cyan */
+                float t = v / 0.2f;
+                r = (unsigned char)(10 + 15 * t);
+                g = (unsigned char)(20 + 100 * t);
+                b = (unsigned char)(100 + 155 * t);
+            } else if (v < 0.4f) {
+                /* Moderate: cyan → green */
+                float t = (v - 0.2f) / 0.2f;
+                r = (unsigned char)(25 + 30 * t);
+                g = (unsigned char)(120 + 100 * t);
+                b = (unsigned char)(255 - 130 * t);
+            } else if (v < 0.6f) {
+                /* Transition: green → yellow */
+                float t = (v - 0.4f) / 0.2f;
+                r = (unsigned char)(55 + 185 * t);
+                g = (unsigned char)(220 - 10 * t);
+                b = (unsigned char)(125 - 95 * t);
+            } else if (v < 0.8f) {
+                /* Singular: yellow → red-orange */
+                float t = (v - 0.6f) / 0.2f;
+                r = (unsigned char)(240 + 15 * t);
+                g = (unsigned char)(210 - 150 * t);
+                b = (unsigned char)(30 - 10 * t);
+            } else {
+                /* Most singular: red → white-hot */
+                float t = (v - 0.8f) / 0.2f;
+                if (t > 1.0f) t = 1.0f;
+                r = 255;
+                g = (unsigned char)(60 + 195 * t);
+                b = (unsigned char)(20 + 235 * t);
+            }
+            if (grid[y][x]) {
+                r = (unsigned char)(r < 200 ? r + 55 : 255);
+                g = (unsigned char)(g < 200 ? g + 55 : 255);
+                b = (unsigned char)(b < 200 ? b + 55 : 255);
+            }
+            out->r = r; out->g = g; out->b = b;
+            return grid[y][x] ? 1 : 44; /* 44 = multifractal ghost */
         }
         return 0;
     }
@@ -20492,6 +20824,171 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", prrst);
     }
 
+    /* ── Multifractal Singularity Spectrum overlay panel ──────────────────── */
+    if (mfs_mode) {
+        int mfs_pw = 50;
+        int mfs_col = term_cols - mfs_pw - 2;
+        int mfs_row = 3;
+        /* Stack below other panels */
+        if (entropy_mode)   mfs_row += 8;
+        if (temp_mode)      mfs_row += 9;
+        if (lyapunov_mode)  mfs_row += 8;
+        if (fourier_mode)   mfs_row += 18;
+        if (fractal_mode)   mfs_row += 11;
+        if (wolfram_mode)   mfs_row += 14;
+        if (flow_mode)      mfs_row += 9;
+        if (attractor_mode) mfs_row += 8;
+        if (cone_mode >= 1) mfs_row += 8;
+        if (surp_mode)      mfs_row += 8;
+        if (mi_mode)        mfs_row += 12;
+        if (cplx_mode)      mfs_row += 11;
+        if (topo_mode)      mfs_row += 11;
+        if (rg_mode)        mfs_row += 11;
+        if (kc_mode)        mfs_row += 9;
+        if (corr_mode)      mfs_row += 9;
+        if (eprod_mode)     mfs_row += 9;
+        if (vort_mode)      mfs_row += 9;
+        if (wave_mode)      mfs_row += 9;
+        if (ergo_mode)      mfs_row += 10;
+        if (coh_mode)       mfs_row += 8;
+        if (ce_mode)        mfs_row += 9;
+        if (ew_mode)        mfs_row += 10;
+        if (hr_mode)        mfs_row += 10;
+        if (rd_mode)        mfs_row += 13;
+        if (xc_mode && xc_count >= 20) mfs_row += 28;
+        if (fi_mode && fi_count >= 16)  mfs_row += 12;
+        if (sg_mode)        mfs_row += 12;
+        if (td_mode)        mfs_row += 10;
+        if (mf_mode)        mfs_row += 10;
+        if (ri_mode)        mfs_row += 10;
+        if (sg2_mode)       mfs_row += 9;
+        if (su_mode)        mfs_row += 9;
+        if (ir_mode)        mfs_row += 10;
+        if (pr_mode)        mfs_row += 9;
+        if (mfs_col < 1) mfs_col = 1;
+
+        const char *mfbdr = "\033[38;2;220;160;60;48;2;16;12;6m";  /* gold border */
+        const char *mfbg  = "\033[48;2;16;12;6m";
+        const char *mfrst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 \xce\xb1 Multifractal Spectrum ",
+                     mfs_row, mfs_col, mfbdr);
+        for (int i = 25; i < mfs_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", mfrst);
+
+        /* Row 1: Δα + classification */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     mfs_row + 1, mfs_col, mfbdr, mfbg);
+        {
+            int n = sprintf(p, " \033[38;2;200;180;100m\xce\x94\xce\xb1=%.3f %s%s",
+                            mfs_delta_alpha, mfs_class_clr, mfs_class_str);
+            p += n;
+            int used = 30;
+            for (int i = used; i < mfs_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", mfbdr, mfrst);
+
+        /* Row 2: α range */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     mfs_row + 2, mfs_col, mfbdr, mfbg);
+        {
+            int n = sprintf(p, " \033[38;2;160;140;80m\xce\xb1\xe2\x82\x98\xe2\x82\x99=%.2f"
+                               " \xce\xb1\xe2\x82\x98\xe2\x82\x90\xe2\x82\x93=%.2f"
+                               " \xce\xb1\xe2\x82\x80=%.2f",
+                            mfs_alpha_min, mfs_alpha_max, mfs_alpha_0);
+            p += n;
+            int used = 35;
+            for (int i = used; i < mfs_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", mfbdr, mfrst);
+
+        /* Row 3: Generalized dimensions */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     mfs_row + 3, mfs_col, mfbdr, mfbg);
+        {
+            int n = sprintf(p, " \033[38;2;130;110;70mD\xe2\x82\x80=%.2f"
+                               " D\xe2\x82\x81=%.2f D\xe2\x82\x82=%.2f",
+                            mfs_D0, mfs_D1, mfs_D2);
+            p += n;
+            int used = 28;
+            for (int i = used; i < mfs_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", mfbdr, mfrst);
+
+        /* Row 4: Separator */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     mfs_row + 4, mfs_col, mfbdr, mfbg);
+        p += sprintf(p, " \033[38;2;30;24;10m");
+        for (int i = 1; i < mfs_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", mfbdr, mfrst);
+
+        /* Row 5: Color scale legend */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     mfs_row + 5, mfs_col, mfbdr, mfbg);
+        {
+            int n = sprintf(p, " \033[38;2;10;20;100m\xe2\x96\x88"
+                               "\033[38;2;25;120;255m\xe2\x96\x88"
+                               "\033[38;2;55;220;125m\xe2\x96\x88"
+                               "\033[38;2;240;210;30m\xe2\x96\x88"
+                               "\033[38;2;255;60;20m\xe2\x96\x88"
+                               "\033[38;2;255;255;255m\xe2\x96\x88"
+                               "\033[38;2;160;140;80m smooth\xe2\x86\x90 \xe2\x86\x92" "singular [^W]");
+            p += n;
+            int used = 38;
+            for (int i = used; i < mfs_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", mfbdr, mfrst);
+
+        /* Rows 6-7: Sparklines — Δα and α₀ */
+        for (int sp = 0; sp < 2; sp++) {
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                         mfs_row + 6 + sp, mfs_col, mfbdr, mfbg);
+            const char *spark_blocks[] = {"\xe2\x96\x81","\xe2\x96\x82","\xe2\x96\x83",
+                                          "\xe2\x96\x84","\xe2\x96\x85","\xe2\x96\x86",
+                                          "\xe2\x96\x87","\xe2\x96\x88"};
+            float *hist = (sp == 0) ? mfs_hist_da : mfs_hist_a0;
+            const char *label = (sp == 0) ? "\xce\x94\xce\xb1" : "\xce\xb1\xe2\x82\x80";
+            const char *clr = (sp == 0) ? "\033[38;2;220;180;60m" : "\033[38;2;120;180;200m";
+            int n = sprintf(p, " \033[38;2;60;50;20m%-3s%s", label, clr);
+            p += n;
+            int spark_w = mfs_pw - 7;
+
+            float sp_max = 0.01f;
+            for (int i = 0; i < mfs_hist_count; i++) {
+                int idx2 = (mfs_hist_idx - mfs_hist_count + i + MFS_HIST_LEN) % MFS_HIST_LEN;
+                float hv = hist[idx2];
+                if (hv > sp_max) sp_max = hv;
+            }
+
+            for (int i = 0; i < spark_w && i < MFS_HIST_LEN; i++) {
+                int idx2 = (mfs_hist_idx - mfs_hist_count + i + MFS_HIST_LEN) % MFS_HIST_LEN;
+                if (i >= mfs_hist_count) {
+                    *p++ = ' ';
+                } else {
+                    float v = hist[idx2] / sp_max;
+                    if (v < 0.0f) v = 0.0f;
+                    if (v > 1.0f) v = 1.0f;
+                    int bi = (int)(v * 7.0f);
+                    if (bi > 7) bi = 7;
+                    const char *blk = spark_blocks[bi];
+                    while (*blk) *p++ = *blk++;
+                }
+            }
+            int used = spark_w + 5;
+            for (int i = used; i < mfs_pw - 1; i++) *p++ = ' ';
+            p += sprintf(p, "%s\xe2\x94\x82%s", mfbdr, mfrst);
+        }
+
+        /* Bottom border */
+        int mfs_bottom = mfs_row + 8;
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", mfs_bottom, mfs_col, mfbdr);
+        for (int i = 0; i < mfs_pw; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", mfrst);
+    }
+
     /* ── Percolation Analysis overlay panel ─────────────────────────────── */
     if (perc_mode) {
         int pc_w = 46;
@@ -20528,6 +21025,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (su_mode)        pc_row += 9;
         if (ir_mode)        pc_row += 10;
         if (pr_mode)        pc_row += 9;
+        if (mfs_mode)       pc_row += 9;
         if (pc_col < 1) pc_col = 1;
 
         const char *pcbdr = "\033[38;2;255;200;40;48;2;14;12;6m";
@@ -23902,6 +24400,19 @@ int main(int argc, char **argv) {
                     printf("\033[2J"); fflush(stdout);
                 } else {
                     flash_set("Recurrence off");
+                    printf("\033[2J"); fflush(stdout);
+                }
+            }
+        }
+        else if (key == 23) { /* Ctrl-W: Multifractal Singularity Spectrum */
+            if (!ecosystem_mode) {
+                mfs_mode = !mfs_mode;
+                if (mfs_mode) {
+                    mfs_reset();
+                    flash_set("Multifractal Spectrum: local H\xc3\xb6lder exponent \xce\xb1(x,y) [^W]exit");
+                    printf("\033[2J"); fflush(stdout);
+                } else {
+                    flash_set("MultiFractal off");
                     printf("\033[2J"); fflush(stdout);
                 }
             }

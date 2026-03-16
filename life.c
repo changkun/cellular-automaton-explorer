@@ -97,6 +97,9 @@
  *   /           Toggle 3D strange attractor (rotating metric trajectory)
  *                 [</>] cycle X metric, [{/}] cycle Z metric
  *                 Arrow keys rotate camera, [R] toggle auto-rotate
+ *   7           Toggle particle tracker (velocity field from component matching)
+ *                 Tracks connected components across frames, computes velocities
+ *                 Blue=still, green=slow, yellow=medium, red=fast
  *   K           Toggle spacetime kymograph (1D slice through time)
  *                 Y-axis=time (scrolling up), X-axis=space (scan row)
  *                 Arrow Up/Down to move scan row; gliders appear as diagonals
@@ -986,7 +989,7 @@ static int   probe_y = -1;            /* selected cell y */
    Toggle with '\\' key. TAB cycles the right panel, '`' cycles the left. */
 
 /* Overlay table: ordered list of analysis overlays for cycling */
-#define N_SPLIT_OVERLAYS 27
+#define N_SPLIT_OVERLAYS 28
 typedef struct {
     const char *name;   /* short display name */
     char key;           /* toggle key character */
@@ -1020,6 +1023,7 @@ static const SplitOverlayInfo split_overlay_table[N_SPLIT_OVERLAYS] = {
     { "CorrMatrix",   '\'' },  /* 24 */
     { "Geodesic",     '"'  },  /* 25 */
     { "Recurrence",   'o'  },  /* 26 */
+    { "Particles",    '7'  },  /* 27 */
 };
 
 static int split_mode = 0;         /* 0=off, 1=on */
@@ -1068,6 +1072,62 @@ static char demo_caption[256] = "";
 static int census_mode = 0;    /* 0=off, 1=on */
 static int census_stale = 1;   /* 1=needs recomputation */
 
+/* ── Particle Tracker ────────────────────────────────────────────────────── */
+/* Tracks connected components across frames, matches them by centroid overlap,
+   computes velocity vectors for moving structures (gliders, spaceships).
+   Renders directional arrows colored by speed: blue=still, green=slow,
+   yellow=medium, red=fast.  Displays motion statistics in sidebar panel.
+   Toggle with '7' key. */
+
+#define PT_MAX_PARTICLES 512   /* max tracked components */
+#define PT_HIST_LEN      8     /* frames of velocity history for smoothing */
+
+typedef struct {
+    float cx, cy;           /* centroid position */
+    int   size;             /* number of cells */
+    float vx, vy;           /* velocity (cells/generation) */
+    float speed;            /* |v| magnitude */
+    int   age;              /* frames tracked */
+    int   alive;            /* 1=matched this frame */
+    unsigned short label;   /* component label in current frame */
+} PTParticle;
+
+static int   pt_mode = 0;           /* 0=off, 1=on */
+static int   pt_stale = 1;          /* 1=needs recomputation */
+static PTParticle pt_particles[PT_MAX_PARTICLES];
+static int   pt_n_particles = 0;    /* active count */
+
+/* Per-cell velocity field for rendering */
+static float pt_vx[MAX_H][MAX_W];   /* x-velocity at each cell */
+static float pt_vy[MAX_H][MAX_W];   /* y-velocity at each cell */
+static float pt_speed[MAX_H][MAX_W]; /* speed at each cell */
+static unsigned short pt_plabel[MAX_H][MAX_W]; /* particle label per cell */
+
+/* Previous frame component data for matching */
+static float pt_prev_cx[PT_MAX_PARTICLES];
+static float pt_prev_cy[PT_MAX_PARTICLES];
+static int   pt_prev_size[PT_MAX_PARTICLES];
+static int   pt_prev_n = 0;
+static unsigned short pt_prev_label[MAX_H][MAX_W]; /* previous frame labels */
+
+/* Statistics */
+static int   pt_n_moving = 0;       /* particles with speed > threshold */
+static int   pt_n_still = 0;        /* particles with speed ~ 0 */
+static float pt_max_speed = 0.0f;   /* fastest particle */
+static float pt_mean_speed = 0.0f;  /* mean speed of moving particles */
+static int   pt_n_collisions = 0;   /* merge/split events this frame */
+static float pt_dom_angle = 0.0f;   /* dominant direction (radians) */
+static int   pt_total_tracked = 0;  /* total tracked across all time */
+
+/* History sparklines */
+#define PT_SPARK_LEN 64
+static int   pt_spark_moving[PT_SPARK_LEN];
+static float pt_spark_speed[PT_SPARK_LEN];
+static int   pt_spark_idx = 0;
+static int   pt_spark_count = 0;
+
+static void  pt_compute(void);
+
 /* ── Split-screen function implementations (need census_mode to be declared) ── */
 static void split_set_overlay(int idx) {
     /* Disable all analysis overlays */
@@ -1078,6 +1138,7 @@ static void split_set_overlay(int idx) {
     wave_mode = 0; vort_mode = 0; ergo_mode = 0; census_mode = 0;
     perc_mode = 0; ising_mode = 0; pb_mode = 0; cm_mode = 0; gd_mode = 0;
     rp_mode = 0;
+    pt_mode = 0;
 
     switch (idx) {
         case  0: break;
@@ -1107,6 +1168,7 @@ static void split_set_overlay(int idx) {
         case 24: cm_mode = 1; break;
         case 25: gd_mode = 2; break;
         case 26: rp_mode = 1; break;
+        case 27: pt_mode = 1; break;
     }
 }
 
@@ -1137,6 +1199,7 @@ static int split_detect_current(void) {
     if (cm_mode) return 24;
     if (gd_mode) return 25;
     if (rp_mode) return 26;
+    if (pt_mode) return 27;
     return 0;
 }
 
@@ -2285,12 +2348,185 @@ static void grid_step(void) {
     pb_stale = 1;
     ising_stale = 1;
     gd_stale = 1;
+    pt_stale = 1;
 
     /* Always record frames for surprise field (cheap memcpy) */
     surp_record_frame();
 
     /* Record kymograph scan line */
     kymo_record();
+}
+
+/* ── Particle Tracker compute ────────────────────────────────────────────── */
+static void pt_compute(void) {
+    /* Step 1: Label connected components (8-connected BFS) */
+    static unsigned short pt_label[MAX_H][MAX_W];
+    static float pt_cx_arr[PT_MAX_PARTICLES];
+    static float pt_cy_arr[PT_MAX_PARTICLES];
+    static int   pt_sz_arr[PT_MAX_PARTICLES];
+    static int   pt_qx[MAX_W * MAX_H / 4];
+    static int   pt_qy[MAX_W * MAX_H / 4];
+
+    memset(pt_label, 0, sizeof(unsigned short) * H * MAX_W);
+    memset(pt_vx, 0, sizeof(float) * H * MAX_W);
+    memset(pt_vy, 0, sizeof(float) * H * MAX_W);
+    memset(pt_speed, 0, sizeof(float) * H * MAX_W);
+    memset(pt_plabel, 0, sizeof(unsigned short) * H * MAX_W);
+
+    int n_comp = 0;
+    int qmax = (MAX_W * MAX_H) / 4;
+
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            if (grid[y][x] > 0 && pt_label[y][x] == 0) {
+                if (n_comp >= PT_MAX_PARTICLES) goto pt_done_label;
+                n_comp++;
+                unsigned short lbl = (unsigned short)n_comp;
+                int qh = 0, qt = 0;
+                pt_qx[qt] = x; pt_qy[qt] = y; qt++;
+                pt_label[y][x] = lbl;
+                double sx = 0, sy = 0;
+                int sz = 0;
+                while (qh < qt) {
+                    int cx2 = pt_qx[qh], cy2 = pt_qy[qh]; qh++;
+                    sx += cx2; sy += cy2; sz++;
+                    /* 8-connected neighbors */
+                    for (int dy = -1; dy <= 1; dy++) {
+                        for (int dx = -1; dx <= 1; dx++) {
+                            if (dx == 0 && dy == 0) continue;
+                            int nx = cx2 + dx, ny = cy2 + dy;
+                            if (nx >= 0 && nx < W && ny >= 0 && ny < H &&
+                                grid[ny][nx] > 0 && pt_label[ny][nx] == 0) {
+                                pt_label[ny][nx] = lbl;
+                                if (qt < qmax) {
+                                    pt_qx[qt] = nx; pt_qy[qt] = ny; qt++;
+                                }
+                            }
+                        }
+                    }
+                }
+                pt_cx_arr[n_comp - 1] = (float)(sx / sz);
+                pt_cy_arr[n_comp - 1] = (float)(sy / sz);
+                pt_sz_arr[n_comp - 1] = sz;
+            }
+        }
+    }
+pt_done_label:;
+
+    /* Step 2: Match current components to previous frame by nearest centroid */
+    int n_matched = 0, n_new = 0, n_lost = 0;
+    static int matched_prev[PT_MAX_PARTICLES]; /* which prev comp matched to this */
+    memset(matched_prev, -1, sizeof(int) * PT_MAX_PARTICLES);
+    static int prev_used[PT_MAX_PARTICLES];
+    memset(prev_used, 0, sizeof(int) * PT_MAX_PARTICLES);
+
+    float velocities_x[PT_MAX_PARTICLES];
+    float velocities_y[PT_MAX_PARTICLES];
+    float speeds[PT_MAX_PARTICLES];
+    memset(velocities_x, 0, sizeof(float) * PT_MAX_PARTICLES);
+    memset(velocities_y, 0, sizeof(float) * PT_MAX_PARTICLES);
+    memset(speeds, 0, sizeof(float) * PT_MAX_PARTICLES);
+
+    if (pt_prev_n > 0) {
+        /* For each current component, find nearest previous component */
+        for (int i = 0; i < n_comp; i++) {
+            float best_dist = 1e9f;
+            int best_j = -1;
+            float max_match_dist = 8.0f; /* max centroid displacement to match */
+            /* Also require size similarity */
+            for (int j = 0; j < pt_prev_n; j++) {
+                if (prev_used[j]) continue;
+                float dx = pt_cx_arr[i] - pt_prev_cx[j];
+                float dy = pt_cy_arr[i] - pt_prev_cy[j];
+                float d = sqrtf(dx * dx + dy * dy);
+                /* Size ratio penalty */
+                float sr = (float)pt_sz_arr[i] / (pt_prev_size[j] > 0 ? pt_prev_size[j] : 1);
+                if (sr > 3.0f || sr < 0.33f) continue; /* too different in size */
+                float cost = d + fabsf(sr - 1.0f) * 2.0f;
+                if (cost < best_dist && d < max_match_dist) {
+                    best_dist = cost;
+                    best_j = j;
+                }
+            }
+            if (best_j >= 0) {
+                matched_prev[i] = best_j;
+                prev_used[best_j] = 1;
+                float dx = pt_cx_arr[i] - pt_prev_cx[best_j];
+                float dy = pt_cy_arr[i] - pt_prev_cy[best_j];
+                velocities_x[i] = dx;
+                velocities_y[i] = dy;
+                speeds[i] = sqrtf(dx * dx + dy * dy);
+                n_matched++;
+            } else {
+                n_new++;
+            }
+        }
+        /* Count lost (unmatched previous) */
+        for (int j = 0; j < pt_prev_n; j++) {
+            if (!prev_used[j]) n_lost++;
+        }
+    } else {
+        n_new = n_comp;
+    }
+
+    /* Step 3: Paint velocity field onto grid cells */
+    for (int i = 0; i < n_comp; i++) {
+        unsigned short lbl = (unsigned short)(i + 1);
+        float vxi = velocities_x[i];
+        float vyi = velocities_y[i];
+        float spd = speeds[i];
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                if (pt_label[y][x] == lbl) {
+                    pt_vx[y][x] = vxi;
+                    pt_vy[y][x] = vyi;
+                    pt_speed[y][x] = spd;
+                    pt_plabel[y][x] = lbl;
+                }
+            }
+        }
+    }
+
+    /* Step 4: Compute statistics */
+    pt_n_moving = 0;
+    pt_n_still = 0;
+    pt_max_speed = 0.0f;
+    float sum_speed = 0.0f;
+    pt_n_collisions = n_lost > n_new ? n_new : n_lost; /* rough collision estimate */
+    float angle_sx = 0.0f, angle_sy = 0.0f;
+
+    for (int i = 0; i < n_comp; i++) {
+        if (speeds[i] > 0.3f) {
+            pt_n_moving++;
+            sum_speed += speeds[i];
+            if (speeds[i] > pt_max_speed) pt_max_speed = speeds[i];
+            angle_sx += velocities_x[i];
+            angle_sy += velocities_y[i];
+        } else {
+            pt_n_still++;
+        }
+    }
+    pt_mean_speed = pt_n_moving > 0 ? sum_speed / pt_n_moving : 0.0f;
+    pt_dom_angle = atan2f(angle_sy, angle_sx);
+    pt_n_particles = n_comp;
+    pt_total_tracked += n_new;
+
+    /* Record sparkline history */
+    pt_spark_moving[pt_spark_idx] = pt_n_moving;
+    pt_spark_speed[pt_spark_idx] = pt_max_speed;
+    pt_spark_idx = (pt_spark_idx + 1) % PT_SPARK_LEN;
+    if (pt_spark_count < PT_SPARK_LEN) pt_spark_count++;
+
+    /* Save current frame as previous for next iteration */
+    pt_prev_n = n_comp;
+    for (int i = 0; i < n_comp; i++) {
+        pt_prev_cx[i] = pt_cx_arr[i];
+        pt_prev_cy[i] = pt_cy_arr[i];
+        pt_prev_size[i] = pt_sz_arr[i];
+    }
+    memcpy(pt_prev_label, pt_label, sizeof(unsigned short) * H * MAX_W);
+
+    pt_stale = 0;
 }
 
 /* ── Census scan implementation ───────────────────────────────────────────── */
@@ -3048,6 +3284,7 @@ static void demo_setup_scene(int idx) {
             case '|': perc_mode = 1; perc_compute(); break;
             case ';': ising_mode = 1; ising_compute(); break;
             case ':': pb_mode = 1; pb_compute(); break;
+            case '7': pt_mode = 1; pt_compute(); break;
             case 'h': heatmap_mode = 1; break;
             case 'g': show_graph = 1; break;
         }
@@ -7332,6 +7569,7 @@ static void split_ensure_computed(int idx) {
         case 24: if (cm_stale && cm_count >= 4) cm_compute(); break;
         case 25: if (gd_stale && gd_seed_x >= 0) gd_compute(); break;
         case 26: if (rp_stale && rp_count >= 4) rp_compute(); break;
+        case 27: if (pt_stale) pt_compute(); break;
         default: break;
     }
 }
@@ -8928,6 +9166,55 @@ static int cell_color(int x, int y, RGB *out) {
         return 0;
     }
 
+    /* Particle tracker overlay: velocity field from component tracking */
+    if (pt_mode) {
+        float spd = pt_speed[y][x];
+        if (spd > 0.01f || grid[y][x]) {
+            /* Color by speed: blue=still -> cyan=slow -> green=medium -> yellow=fast -> red=very fast */
+            float norm = pt_max_speed > 0.1f ? spd / pt_max_speed : 0.0f;
+            if (norm > 1.0f) norm = 1.0f;
+            unsigned char r, g, b;
+            if (norm < 0.25f) {
+                /* Blue to cyan */
+                float t = norm * 4.0f;
+                r = 30; g = (unsigned char)(80 + 175 * t); b = (unsigned char)(220 - 40 * t);
+            } else if (norm < 0.5f) {
+                /* Cyan to green */
+                float t = (norm - 0.25f) * 4.0f;
+                r = 30; g = 255; b = (unsigned char)(180 * (1.0f - t));
+            } else if (norm < 0.75f) {
+                /* Green to yellow */
+                float t = (norm - 0.5f) * 4.0f;
+                r = (unsigned char)(255 * t); g = 255; b = 30;
+            } else {
+                /* Yellow to red */
+                float t = (norm - 0.75f) * 4.0f;
+                r = 255; g = (unsigned char)(255 * (1.0f - t)); b = 30;
+            }
+            /* Add directional arrows for cells with velocity */
+            if (spd > 0.3f) {
+                /* Render arrow character based on direction */
+                float vx2 = pt_vx[y][x], vy2 = pt_vy[y][x];
+                float angle = atan2f(vy2, vx2);
+                /* Brighten based on alignment with dominant direction */
+                float align = cosf(angle - pt_dom_angle);
+                if (align > 0.5f) {
+                    r = (unsigned char)(r < 200 ? r + 55 : 255);
+                    g = (unsigned char)(g < 200 ? g + 55 : 255);
+                }
+            }
+            if (grid[y][x]) {
+                /* Brighten live cells */
+                r = (unsigned char)(r < 200 ? r + 55 : 255);
+                g = (unsigned char)(g < 200 ? g + 55 : 255);
+                b = (unsigned char)(b < 200 ? b + 55 : 255);
+            }
+            out->r = r; out->g = g; out->b = b;
+            return grid[y][x] ? 1 : 30; /* 30 = particle tracker ghost */
+        }
+        return 0;
+    }
+
     /* Topological persistence barcode overlay */
     if (pb_mode) {
         float age = pb_cell_age[y][x];
@@ -9332,6 +9619,14 @@ static void render(int running, int speed_ms, int draw_mode) {
                  pp_metric_table[sa_z_metric].name);
     }
 
+    /* Particle tracker indicator */
+    char pt_str[96] = "";
+    if (pt_mode) {
+        snprintf(pt_str, sizeof(pt_str),
+                 " \033[38;2;80;200;160m\xe2\x97\x86" "PT:%d/%d\033[0m",
+                 pt_n_moving, pt_n_particles);
+    }
+
     /* Split-screen indicator */
     char split_str[128] = "";
     if (split_mode) {
@@ -9478,9 +9773,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, gd_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, corr_str, eprod_str, wave_str, pp_str, cm_str, rp_str, sa_str, split_str, kymo_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
+                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, gd_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, corr_str, eprod_str, wave_str, pp_str, cm_str, rp_str, sa_str, pt_str, split_str, kymo_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -14187,6 +14482,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (pp_mode)        sa_row_p += 18;
         if (cm_mode && cm_count >= 4) sa_row_p += 8 + CM_N;
         if (rp_mode && rp_count >= 4) sa_row_p += 10 + (rp_count < RP_DISP ? (rp_count+1)/2 : (RP_DISP+1)/2);
+        if (pt_mode)        sa_row_p += 10;
         if (sa_col < 1) sa_col = 1;
 
         /* Braille canvas: 36 chars wide × 16 chars tall = 72×64 dots */
@@ -14375,6 +14671,146 @@ static void render(int running, int speed_ms, int draw_mode) {
         #undef SA_CH
         #undef SA_DW
         #undef SA_DH
+    }
+
+    /* ── Particle Tracker sidebar panel ──────────────────────────────────── */
+    if (pt_mode) {
+        int pt_pw = 38;  /* panel width */
+        int pt_col = term_cols - pt_pw - 2;
+        int pt_row_p = 3;
+        /* Stack below other panels */
+        if (entropy_mode)   pt_row_p += 8;
+        if (temp_mode)      pt_row_p += 9;
+        if (lyapunov_mode)  pt_row_p += 8;
+        if (fourier_mode)   pt_row_p += 18;
+        if (fractal_mode)   pt_row_p += 11;
+        if (wolfram_mode)   pt_row_p += 14;
+        if (flow_mode)      pt_row_p += 9;
+        if (attractor_mode) pt_row_p += 8;
+        if (cone_mode)      pt_row_p += 12;
+        if (surp_mode)      pt_row_p += 8;
+        if (mi_mode)        pt_row_p += 8;
+        if (cplx_mode)      pt_row_p += 8;
+        if (topo_mode)      pt_row_p += 10;
+        if (rg_mode)        pt_row_p += 12;
+        if (kc_mode)        pt_row_p += 11;
+        if (corr_mode)      pt_row_p += 10;
+        if (eprod_mode)     pt_row_p += 8;
+        if (vort_mode)      pt_row_p += 8;
+        if (wave_mode)      pt_row_p += 8;
+        if (ergo_mode)      pt_row_p += 10;
+        if (perc_mode)      pt_row_p += 10;
+        if (ising_mode)     pt_row_p += 10;
+        if (pb_mode)        pt_row_p += 14;
+        if (gd_mode >= 2)   pt_row_p += 8;
+        if (pp_mode)        pt_row_p += 18;
+        if (cm_mode && cm_count >= 4) pt_row_p += 8 + CM_N;
+        if (rp_mode && rp_count >= 4) pt_row_p += 10 + (rp_count < RP_DISP ? (rp_count+1)/2 : (RP_DISP+1)/2);
+        if (sa_mode && sa_hist_count > 2) pt_row_p += 10 + 16; /* SA_CH=16 */
+        if (pt_col < 1) pt_col = 1;
+
+        const char *ptbdr = "\033[38;2;80;200;160;48;2;8;16;12m";
+        const char *ptbg  = "\033[48;2;8;16;12m";
+        const char *ptrst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 Particle Tracker ",
+                     pt_row_p, pt_col, ptbdr);
+        for (int i = 20; i < pt_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", ptrst);
+
+        /* Row 1: Total components & moving count */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s", pt_row_p + 1, pt_col, ptbdr, ptbg);
+        {
+            int nn = sprintf(p, " \033[38;2;80;200;160mComponents: \033[38;2;200;220;255m%d"
+                             "  \033[38;2;100;255;100mMoving: %d", pt_n_particles, pt_n_moving);
+            p += nn;
+            int used = 14 + 6 + 10; /* rough estimate */
+            for (int i = used; i < pt_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", ptbdr, ptrst);
+
+        /* Row 2: Still count & collision events */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s", pt_row_p + 2, pt_col, ptbdr, ptbg);
+        {
+            int nn = sprintf(p, " \033[38;2;100;140;220mStill: %d  \033[38;2;255;180;60mCollisions: %d",
+                             pt_n_still, pt_n_collisions);
+            p += nn;
+            int used = 12 + 14;
+            for (int i = used; i < pt_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", ptbdr, ptrst);
+
+        /* Row 3: Max speed & mean speed */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s", pt_row_p + 3, pt_col, ptbdr, ptbg);
+        {
+            int nn = sprintf(p, " \033[38;2;255;100;100mMax spd: %.2f  \033[38;2;200;200;100mMean: %.2f",
+                             pt_max_speed, pt_mean_speed);
+            p += nn;
+            int used = 16 + 12;
+            for (int i = used; i < pt_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", ptbdr, ptrst);
+
+        /* Row 4: Dominant direction */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s", pt_row_p + 4, pt_col, ptbdr, ptbg);
+        {
+            float deg = pt_dom_angle * 180.0f / 3.14159265f;
+            const char *arrow;
+            if (deg > -22.5f && deg <= 22.5f) arrow = "\xe2\x86\x92";       /* right */
+            else if (deg > 22.5f && deg <= 67.5f) arrow = "\xe2\x86\x98";   /* down-right */
+            else if (deg > 67.5f && deg <= 112.5f) arrow = "\xe2\x86\x93";  /* down */
+            else if (deg > 112.5f || deg <= -157.5f) arrow = "\xe2\x86\x90";/* left */
+            else if (deg > -157.5f && deg <= -112.5f) arrow = "\xe2\x86\x99";/* down-left */
+            else if (deg > -112.5f && deg <= -67.5f) arrow = "\xe2\x86\x91"; /* up */
+            else if (deg > -67.5f && deg <= -22.5f) arrow = "\xe2\x86\x97";  /* up-right */
+            else arrow = "\xe2\x86\x96";                                      /* up-left */
+            int nn = sprintf(p, " \033[38;2;160;220;180mDirection: %s %.1f\xc2\xb0  \033[38;2;120;120;120mTotal: %d",
+                             arrow, deg, pt_total_tracked);
+            p += nn;
+            int used = 24;
+            for (int i = used; i < pt_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", ptbdr, ptrst);
+
+        /* Row 5-7: Sparkline of moving count over time */
+        for (int srow = 0; srow < 3; srow++) {
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s", pt_row_p + 5 + srow, pt_col, ptbdr, ptbg);
+            if (srow == 0) {
+                int nn = sprintf(p, " \033[38;2;100;160;140mMoving \xe2\x96\x81\xe2\x96\x82\xe2\x96\x83 ");
+                p += nn;
+                /* Draw sparkline */
+                int spark_w = pt_pw - 14;
+                if (spark_w > PT_SPARK_LEN) spark_w = PT_SPARK_LEN;
+                int max_mov = 1;
+                for (int si = 0; si < pt_spark_count; si++) {
+                    if (pt_spark_moving[si] > max_mov) max_mov = pt_spark_moving[si];
+                }
+                for (int si = 0; si < spark_w; si++) {
+                    int idx = (pt_spark_idx - pt_spark_count + si + PT_SPARK_LEN) % PT_SPARK_LEN;
+                    if (si >= pt_spark_count) { *p++ = ' '; continue; }
+                    int val = pt_spark_moving[idx];
+                    int level = max_mov > 0 ? (val * 7 / max_mov) : 0;
+                    if (level > 7) level = 7;
+                    const char *blocks[] = {" ", "\xe2\x96\x81", "\xe2\x96\x82", "\xe2\x96\x83",
+                                            "\xe2\x96\x84", "\xe2\x96\x85", "\xe2\x96\x86", "\xe2\x96\x87"};
+                    int nb = sprintf(p, "\033[38;2;80;200;160m%s", blocks[level]);
+                    p += nb;
+                }
+                for (int i = spark_w + 12; i < pt_pw - 1; i++) *p++ = ' ';
+            } else {
+                for (int i = 1; i < pt_pw - 1; i++) *p++ = ' ';
+            }
+            p += sprintf(p, "%s\xe2\x94\x82%s", ptbdr, ptrst);
+        }
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94",
+                     pt_row_p + 8, pt_col, ptbdr);
+        for (int i = 0; i < pt_pw; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", ptrst);
     }
 
     /* ── Cell Probe Inspector overlay panel ──────────────────────────────── */
@@ -15560,6 +15996,17 @@ int main(int argc, char **argv) {
                 printf("\033[2J"); fflush(stdout);
             }
         }
+        else if (key == '7') {
+            pt_mode = !pt_mode;
+            if (pt_mode) {
+                pt_compute();
+                flash_set("Particle Tracker: velocity field [7]exit");
+                printf("\033[2J"); fflush(stdout);
+            } else {
+                flash_set("Particle Tracker off");
+                printf("\033[2J"); fflush(stdout);
+            }
+        }
         else if (key == '\\') {
             split_mode = !split_mode;
             if (split_mode) {
@@ -16191,6 +16638,11 @@ int main(int argc, char **argv) {
         /* Auto-refresh wave mechanics every generation (continuous propagation) */
         if (wave_mode && wave_stale) {
             wave_compute();
+        }
+
+        /* Auto-refresh particle tracker every 2 generations */
+        if (pt_mode && pt_stale && (generation % 2 == 0 || !running)) {
+            pt_compute();
         }
 
         /* Phase portrait: record metric pair every 2 generations */

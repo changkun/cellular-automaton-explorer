@@ -111,6 +111,9 @@
  *   3           Toggle early warning overlay (critical slowing down detector)
  *                 Monitors 16 metrics for rising autocorrelation & variance
  *                 Green=stable, yellow=caution, red=imminent transition
+ *   4           Toggle Hurst exponent overlay (long-range memory detection)
+ *                 R/S analysis on 16 metrics + per-cell density history
+ *                 Cyan=persistent (trending), gray=Brownian, orange=anti-persistent
  *   K           Toggle spacetime kymograph (1D slice through time)
  *                 Y-axis=time (scrolling up), X-axis=space (scan row)
  *                 Arrow Up/Down to move scan row; gliders appear as diagonals
@@ -1044,7 +1047,7 @@ static int   probe_y = -1;            /* selected cell y */
    Toggle with '\\' key. TAB cycles the right panel, '`' cycles the left. */
 
 /* Overlay table: ordered list of analysis overlays for cycling */
-#define N_SPLIT_OVERLAYS 32
+#define N_SPLIT_OVERLAYS 33
 typedef struct {
     const char *name;   /* short display name */
     char key;           /* toggle key character */
@@ -1083,6 +1086,7 @@ static const SplitOverlayInfo split_overlay_table[N_SPLIT_OVERLAYS] = {
     { "CausalEmrg",   ')'  },  /* 29 */
     { "PowerSpec",     '6'  },  /* 30 */
     { "EarlyWarn",    '3'  },  /* 31 */
+    { "HurstExp",     '4'  },  /* 32 */
 };
 
 static int split_mode = 0;         /* 0=off, 1=on */
@@ -1290,6 +1294,47 @@ static void ew_reset(void) {
     memset(ew_grid, 0, sizeof(float) * MAX_H * MAX_W);
 }
 
+/* ── Hurst Exponent / Long-Range Memory ────────────────────────────────────── */
+/* Measures long-range dependence via Rescaled Range (R/S) analysis on both
+   the 16 global metric streams and per-cell density history from the timeline.
+   H > 0.5 = persistent (trending), H = 0.5 = Brownian (no memory),
+   H < 0.5 = anti-persistent (mean-reverting).
+   Toggle with '4' key. */
+
+#define HR_WINDOW  128   /* sliding window for R/S analysis */
+#define HR_N       PP_N_METRICS
+#define HR_HIST_LEN 64   /* sparkline history of global H */
+
+static int   hr_mode = 0;           /* 0=off, 1=on */
+static float hr_buf[HR_WINDOW][HR_N]; /* ring buffer of metric snapshots */
+static int   hr_head = 0;
+static int   hr_count = 0;
+static float hr_hurst[HR_N];        /* Hurst exponent per metric [0,1] */
+static float hr_global_h = 0.5f;    /* mean H across all metrics */
+static int   hr_top_metric = 0;     /* metric with highest |H - 0.5| */
+static float hr_hist[HR_HIST_LEN];  /* sparkline of global H */
+static int   hr_hist_idx = 0;
+static int   hr_hist_count = 0;
+static int   hr_stale = 1;
+
+/* Per-cell Hurst grid: from timeline cell state history */
+static float hr_grid[MAX_H][MAX_W];
+
+static void hr_record(void);
+static void hr_compute(void);
+static void hr_reset(void) {
+    hr_head = 0;
+    hr_count = 0;
+    hr_hist_idx = 0;
+    hr_hist_count = 0;
+    hr_global_h = 0.5f;
+    hr_top_metric = 0;
+    hr_stale = 1;
+    for (int i = 0; i < HR_N; i++)
+        hr_hurst[i] = 0.5f;
+    memset(hr_grid, 0, sizeof(float) * MAX_H * MAX_W);
+}
+
 /* ── Anomaly Detector ─────────────────────────────────────────────────────── */
 /* Real-time watchdog that monitors all 16 scalar metrics for statistical
    anomalies.  Maintains running mean and variance (Welford's algorithm) over
@@ -1356,6 +1401,7 @@ static void split_set_overlay(int idx) {
     coh_mode = 0;
     ce_mode = 0;
     ew_mode = 0;
+    hr_mode = 0;
 
     switch (idx) {
         case  0: break;
@@ -1390,6 +1436,7 @@ static void split_set_overlay(int idx) {
         case 29: ce_mode = 1; break;
         case 30: ps_mode = 1; break;
         case 31: ew_mode = 1; break;
+        case 32: hr_mode = 1; break;
     }
 }
 
@@ -1425,6 +1472,7 @@ static int split_detect_current(void) {
     if (ce_mode) return 29;
     if (ps_mode) return 30;
     if (ew_mode) return 31;
+    if (hr_mode) return 32;
     return 0;
 }
 
@@ -1785,6 +1833,15 @@ static void ew_record(void) {
     ew_head = (ew_head + 1) % EW_WINDOW;
     if (ew_count < EW_WINDOW) ew_count++;
     ew_stale = 1;
+}
+
+/* ── Hurst Exponent: hr_record (hr_compute defined later after timeline) ──── */
+static void hr_record(void) {
+    for (int i = 0; i < HR_N; i++)
+        hr_buf[hr_head][i] = pp_read_metric(i);
+    hr_head = (hr_head + 1) % HR_WINDOW;
+    if (hr_count < HR_WINDOW) hr_count++;
+    hr_stale = 1;
 }
 
 /* ── Metric Correlation Matrix implementations ────────────────────────────── */
@@ -3627,6 +3684,7 @@ static void demo_reset_overlays(void) {
     coh_mode = 0;
     ce_mode = 0;
     ew_mode = 0;
+    hr_mode = 0;
     fourier_mode = 0;
     fractal_mode = 0;
     wolfram_mode = 0;
@@ -7318,6 +7376,171 @@ static void ew_compute(void) {
     }
 }
 
+/* ── Hurst Exponent computation ────────────────────────────────────────────── */
+/* Rescaled Range (R/S) analysis: for a time series of length n,
+   compute R/S at multiple sub-window sizes, then estimate H from
+   the log-log slope: R/S ~ n^H.
+   We use window sizes 8, 16, 32, 64 and do linear regression on
+   log(n) vs log(R/S) to get H. */
+
+static float hr_rs_single(float *series, int n) {
+    /* Compute R/S statistic for a single series of length n */
+    if (n < 4) return 0.0f;
+    /* Mean */
+    double sum = 0.0;
+    for (int i = 0; i < n; i++) sum += series[i];
+    double mean = sum / n;
+    /* Cumulative deviations and range */
+    double cum = 0.0, mn = 0.0, mx = 0.0;
+    for (int i = 0; i < n; i++) {
+        cum += (series[i] - mean);
+        if (cum < mn) mn = cum;
+        if (cum > mx) mx = cum;
+    }
+    double R = mx - mn;
+    /* Standard deviation */
+    double var = 0.0;
+    for (int i = 0; i < n; i++) {
+        double d = series[i] - mean;
+        var += d * d;
+    }
+    var /= n;
+    double S = sqrt(var);
+    if (S < 1e-12) return 0.0f;
+    return (float)(R / S);
+}
+
+static void hr_compute(void) {
+    if (hr_count < 32) return;
+    hr_stale = 0;
+    int n = hr_count;
+
+    /* Compute Hurst exponent for each of the 16 metrics */
+    for (int m = 0; m < HR_N; m++) {
+        /* Extract series */
+        float series[HR_WINDOW];
+        for (int k = 0; k < n; k++) {
+            int idx = (hr_head - n + k + HR_WINDOW) % HR_WINDOW;
+            series[k] = hr_buf[idx][m];
+        }
+
+        /* R/S at multiple scales */
+        int scales[] = {8, 16, 32, 64};
+        int nscales = 4;
+        float log_n[4], log_rs[4];
+        int valid = 0;
+
+        for (int si = 0; si < nscales; si++) {
+            int wlen = scales[si];
+            if (wlen > n) continue;
+            int nblocks = n / wlen;
+            if (nblocks < 1) continue;
+            double rs_sum = 0.0;
+            int rs_ct = 0;
+            for (int b = 0; b < nblocks; b++) {
+                float rs = hr_rs_single(series + b * wlen, wlen);
+                if (rs > 0.0f) { rs_sum += rs; rs_ct++; }
+            }
+            if (rs_ct > 0) {
+                log_n[valid] = logf((float)wlen);
+                log_rs[valid] = logf((float)(rs_sum / rs_ct));
+                valid++;
+            }
+        }
+
+        if (valid >= 2) {
+            double sx = 0, sy = 0, sxy = 0, sxx = 0;
+            for (int i = 0; i < valid; i++) {
+                sx += log_n[i]; sy += log_rs[i];
+                sxy += log_n[i] * log_rs[i];
+                sxx += log_n[i] * log_n[i];
+            }
+            double denom = valid * sxx - sx * sx;
+            float H = (fabs(denom) > 1e-12) ?
+                (float)((valid * sxy - sx * sy) / denom) : 0.5f;
+            if (H < 0.0f) H = 0.0f;
+            if (H > 1.0f) H = 1.0f;
+            hr_hurst[m] = H;
+        } else {
+            hr_hurst[m] = 0.5f;
+        }
+    }
+
+    /* Global H = mean across metrics; top = most deviant from 0.5 */
+    double hsum = 0.0;
+    float max_dev = 0.0f;
+    hr_top_metric = 0;
+    for (int m = 0; m < HR_N; m++) {
+        hsum += hr_hurst[m];
+        float dev = fabsf(hr_hurst[m] - 0.5f);
+        if (dev > max_dev) { max_dev = dev; hr_top_metric = m; }
+    }
+    hr_global_h = (float)(hsum / HR_N);
+
+    /* Record sparkline */
+    hr_hist[hr_hist_idx] = hr_global_h;
+    hr_hist_idx = (hr_hist_idx + 1) % HR_HIST_LEN;
+    if (hr_hist_count < HR_HIST_LEN) hr_hist_count++;
+
+    /* Per-cell Hurst from timeline: R/S on binary cell state history */
+    {
+        int frames_avail = tl_len < 64 ? tl_len : 64;
+        if (frames_avail >= 16) {
+            for (int y = 0; y < H; y++) {
+                for (int x = 0; x < W; x++) {
+                    /* Extract binary cell series from timeline */
+                    float cseries[64];
+                    for (int f = 0; f < frames_avail; f++) {
+                        int fi = (tl_head - 1 - f + TL_MAX) % TL_MAX;
+                        cseries[frames_avail - 1 - f] = timeline[fi].grid[y][x] > 0 ? 1.0f : 0.0f;
+                    }
+                    /* R/S at scales 4, 8, 16, 32 */
+                    int cscales[] = {4, 8, 16, 32};
+                    float clog_n[4], clog_rs[4];
+                    int cvalid = 0;
+                    for (int si = 0; si < 4; si++) {
+                        int wlen = cscales[si];
+                        if (wlen > frames_avail) continue;
+                        int nb = frames_avail / wlen;
+                        if (nb < 1) continue;
+                        double rs_s = 0.0; int rs_c = 0;
+                        for (int b = 0; b < nb; b++) {
+                            float rs = hr_rs_single(cseries + b * wlen, wlen);
+                            if (rs > 0.0f) { rs_s += rs; rs_c++; }
+                        }
+                        if (rs_c > 0) {
+                            clog_n[cvalid] = logf((float)wlen);
+                            clog_rs[cvalid] = logf((float)(rs_s / rs_c));
+                            cvalid++;
+                        }
+                    }
+                    if (cvalid >= 2) {
+                        double sx = 0, sy = 0, sxy = 0, sxx = 0;
+                        for (int i = 0; i < cvalid; i++) {
+                            sx += clog_n[i]; sy += clog_rs[i];
+                            sxy += clog_n[i] * clog_rs[i];
+                            sxx += clog_n[i] * clog_n[i];
+                        }
+                        double d = cvalid * sxx - sx * sx;
+                        float ch = (fabs(d) > 1e-12) ?
+                            (float)((cvalid * sxy - sx * sy) / d) : 0.5f;
+                        if (ch < 0.0f) ch = 0.0f;
+                        if (ch > 1.0f) ch = 1.0f;
+                        hr_grid[y][x] = ch;
+                    } else {
+                        hr_grid[y][x] = 0.5f;
+                    }
+                }
+            }
+        } else {
+            /* Fill with 0.5 (unknown/Brownian) */
+            for (int y = 0; y < H; y++)
+                for (int x = 0; x < W; x++)
+                    hr_grid[y][x] = 0.5f;
+        }
+    }
+}
+
 /* ── Causal Emergence computation ──────────────────────────────────────────── */
 /* Color mapping: scale 0 (micro best) = cool blue,
    scale 1 (2x2) = green, scale 2 (4x4) = warm orange,
@@ -10260,6 +10483,49 @@ static int cell_color(int x, int y, RGB *out) {
             }
             out->r = r; out->g = g; out->b = b;
             return grid[y][x] ? 1 : 31;
+        }
+        return 0;
+    }
+
+    /* Hurst exponent overlay: long-range memory */
+    if (hr_mode) {
+        float h = hr_grid[y][x];
+        if (grid[y][x] || (h < 0.45f || h > 0.55f)) {
+            /* H < 0.5: anti-persistent (orange-red), H = 0.5: gray, H > 0.5: persistent (cyan-blue) */
+            unsigned char r, g, b;
+            if (h < 0.3f) {
+                /* Strong anti-persistent: bright orange-red */
+                float t = h / 0.3f;
+                r = (unsigned char)(255 - 40 * t);
+                g = (unsigned char)(60 + 40 * t);
+                b = (unsigned char)(20 + 10 * t);
+            } else if (h < 0.5f) {
+                /* Mild anti-persistent: orange to gray */
+                float t = (h - 0.3f) / 0.2f;
+                r = (unsigned char)(215 - 135 * t);
+                g = (unsigned char)(100 + 20 * t);
+                b = (unsigned char)(30 + 50 * t);
+            } else if (h < 0.7f) {
+                /* Mild persistent: gray to cyan */
+                float t = (h - 0.5f) / 0.2f;
+                r = (unsigned char)(80 - 50 * t);
+                g = (unsigned char)(120 + 80 * t);
+                b = (unsigned char)(80 + 100 * t);
+            } else {
+                /* Strong persistent: cyan to bright blue */
+                float t = (h - 0.7f) / 0.3f;
+                if (t > 1.0f) t = 1.0f;
+                r = (unsigned char)(30 + 20 * t);
+                g = (unsigned char)(200 - 60 * t);
+                b = (unsigned char)(180 + 75 * t);
+            }
+            if (grid[y][x]) {
+                r = (unsigned char)(r < 200 ? r + 55 : 255);
+                g = (unsigned char)(g < 200 ? g + 55 : 255);
+                b = (unsigned char)(b < 200 ? b + 55 : 255);
+            }
+            out->r = r; out->g = g; out->b = b;
+            return grid[y][x] ? 1 : 32; /* 32 = hurst ghost */
         }
         return 0;
     }
@@ -14805,6 +15071,231 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", ewrst);
     }
 
+    /* ── Hurst Exponent overlay panel ──────────────────────────────────── */
+    if (hr_mode) {
+        int hr_w = 50;
+        int hr_col = term_cols - hr_w - 2;
+        int hr_row = 3;
+        if (entropy_mode)   hr_row += 8;
+        if (temp_mode)      hr_row += 9;
+        if (lyapunov_mode)  hr_row += 8;
+        if (fourier_mode)   hr_row += 18;
+        if (fractal_mode)   hr_row += 11;
+        if (wolfram_mode)   hr_row += 14;
+        if (flow_mode)      hr_row += 9;
+        if (attractor_mode) hr_row += 8;
+        if (cone_mode >= 1) hr_row += 8;
+        if (surp_mode)      hr_row += 8;
+        if (mi_mode)        hr_row += 12;
+        if (cplx_mode)      hr_row += 11;
+        if (topo_mode)      hr_row += 11;
+        if (rg_mode)        hr_row += 11;
+        if (kc_mode)        hr_row += 9;
+        if (corr_mode)      hr_row += 9;
+        if (eprod_mode)     hr_row += 9;
+        if (vort_mode)      hr_row += 9;
+        if (wave_mode)      hr_row += 9;
+        if (ergo_mode)      hr_row += 10;
+        if (coh_mode)       hr_row += 8;
+        if (ce_mode)        hr_row += 9;
+        if (ew_mode)        hr_row += 10;
+        if (hr_mode)        hr_row += 10;
+        if (hr_col < 1) hr_col = 1;
+
+        const char *hrbdr = "\033[38;2;60;160;200;48;2;4;10;14m";  /* teal border */
+        const char *hrbg  = "\033[48;2;4;10;14m";
+        const char *hrrst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 H Hurst Exponent ",
+                     hr_row, hr_col, hrbdr);
+        for (int i = 20; i < hr_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", hrrst);
+
+        /* Row 1: Global H with classification */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     hr_row + 1, hr_col, hrbdr, hrbg);
+        p += sprintf(p, " \033[38;2;100;180;220mH\xcc\x84=");
+        if (hr_global_h > 0.6f)
+            p += sprintf(p, "\033[1;38;2;40;200;255m%.3f", hr_global_h);
+        else if (hr_global_h < 0.4f)
+            p += sprintf(p, "\033[1;38;2;255;140;40m%.3f", hr_global_h);
+        else
+            p += sprintf(p, "\033[38;2;140;140;140m%.3f", hr_global_h);
+        p += sprintf(p, "\033[0m%s\033[38;2;80;140;160m  samples:%d/%d  ",
+                     hrbg, hr_count, HR_WINDOW);
+        /* Classification */
+        if (hr_global_h > 0.65f)
+            p += sprintf(p, "\033[1;38;2;40;200;255mPERSISTENT");
+        else if (hr_global_h > 0.55f)
+            p += sprintf(p, "\033[38;2;100;200;200mtrending");
+        else if (hr_global_h >= 0.45f)
+            p += sprintf(p, "\033[38;2;140;140;140mBROWNIAN");
+        else if (hr_global_h >= 0.35f)
+            p += sprintf(p, "\033[38;2;220;160;60mreverting");
+        else
+            p += sprintf(p, "\033[1;38;2;255;120;30mANTI-PERSIST");
+        p += sprintf(p, "%s", hrbg);
+        { int used = 44; for (int i = used; i < hr_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", hrbdr, hrrst);
+
+        /* Row 2: Most deviant metric */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     hr_row + 2, hr_col, hrbdr, hrbg);
+        p += sprintf(p, " \033[38;2;80;140;160mPeak: ");
+        if (hr_count >= 32) {
+            p += sprintf(p, "\033[38;2;140;200;220m%-8s", pp_metric_table[hr_top_metric].name);
+            p += sprintf(p, "\033[38;2;80;140;160m H=");
+            float th = hr_hurst[hr_top_metric];
+            if (th > 0.6f)
+                p += sprintf(p, "\033[1;38;2;40;200;255m%.3f", th);
+            else if (th < 0.4f)
+                p += sprintf(p, "\033[1;38;2;255;140;40m%.3f", th);
+            else
+                p += sprintf(p, "\033[38;2;140;140;140m%.3f", th);
+            p += sprintf(p, "\033[38;2;80;140;160m |H-0.5|=");
+            p += sprintf(p, "\033[38;2;180;200;220m%.3f", fabsf(th - 0.5f));
+        } else {
+            p += sprintf(p, "\033[38;2;60;80;90m(collecting data...)      ");
+        }
+        p += sprintf(p, "%s", hrbg);
+        { int used = 42; for (int i = used; i < hr_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", hrbdr, hrrst);
+
+        /* Row 3: Bar chart — all 16 metrics H values */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     hr_row + 3, hr_col, hrbdr, hrbg);
+        p += sprintf(p, " ");
+        if (hr_count >= 32) {
+            /* Show top 4 most deviant from 0.5 */
+            int top4[4] = {0, 1, 2, 3};
+            for (int m = 0; m < HR_N; m++) {
+                float dev = fabsf(hr_hurst[m] - 0.5f);
+                for (int t = 0; t < 4; t++) {
+                    if (dev > fabsf(hr_hurst[top4[t]] - 0.5f)) {
+                        for (int u = 3; u > t; u--) top4[u] = top4[u-1];
+                        top4[t] = m;
+                        break;
+                    }
+                }
+            }
+            for (int t = 0; t < 4; t++) {
+                int m = top4[t];
+                float h = hr_hurst[m];
+                /* Bar shows distance from 0.5, direction shown by color */
+                float dev = fabsf(h - 0.5f) * 2.0f; /* scale to [0,1] */
+                int bar = (int)(dev * 6.0f + 0.5f);
+                if (bar > 6) bar = 6;
+                unsigned char br, bg2, bb;
+                if (h > 0.6f) { br = 40; bg2 = 180; bb = 240; }       /* persistent: cyan */
+                else if (h < 0.4f) { br = 240; bg2 = 140; bb = 40; }  /* anti-persist: orange */
+                else { br = 120; bg2 = 120; bb = 120; }               /* Brownian: gray */
+                p += sprintf(p, "\033[38;2;80;140;160m%.3s:", pp_metric_table[m].name);
+                p += sprintf(p, "\033[38;2;%d;%d;%dm", br, bg2, bb);
+                for (int i = 0; i < bar; i++) p += sprintf(p, "\xe2\x96\x88");
+                p += sprintf(p, "%s", hrbg);
+                for (int i = bar; i < 6; i++) *p++ = ' ';
+                if (t < 3) *p++ = ' ';
+            }
+        } else {
+            p += sprintf(p, "\033[38;2;60;80;90m(need 32+ samples)");
+        }
+        p += sprintf(p, "%s", hrbg);
+        { int used = 45; for (int i = used; i < hr_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", hrbdr, hrrst);
+
+        /* Row 4: Color gradient legend */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     hr_row + 4, hr_col, hrbdr, hrbg);
+        p += sprintf(p, " ");
+        for (int i = 0; i < 40; i++) {
+            float h = (float)i / 39.0f;  /* 0 to 1 */
+            unsigned char lr, lg, lb;
+            if (h < 0.3f) {
+                float t = h / 0.3f;
+                lr = (unsigned char)(255 - 40 * t); lg = (unsigned char)(60 + 40 * t); lb = (unsigned char)(20 + 10 * t);
+            } else if (h < 0.5f) {
+                float t = (h - 0.3f) / 0.2f;
+                lr = (unsigned char)(215 - 135 * t); lg = (unsigned char)(100 + 20 * t); lb = (unsigned char)(30 + 50 * t);
+            } else if (h < 0.7f) {
+                float t = (h - 0.5f) / 0.2f;
+                lr = (unsigned char)(80 - 50 * t); lg = (unsigned char)(120 + 80 * t); lb = (unsigned char)(80 + 100 * t);
+            } else {
+                float t = (h - 0.7f) / 0.3f; if (t > 1.0f) t = 1.0f;
+                lr = (unsigned char)(30 + 20 * t); lg = (unsigned char)(200 - 60 * t); lb = (unsigned char)(180 + 75 * t);
+            }
+            p += sprintf(p, "\033[38;2;%d;%d;%dm\xe2\x96\x88", lr, lg, lb);
+        }
+        p += sprintf(p, "%s", hrbg);
+        { int used = 41; for (int i = used; i < hr_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", hrbdr, hrrst);
+
+        /* Row 5: Scale labels for legend */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     hr_row + 5, hr_col, hrbdr, hrbg);
+        p += sprintf(p, " \033[38;2;240;120;30manti-persist");
+        { for (int i = 0; i < 6; i++) *p++ = ' '; }
+        p += sprintf(p, "\033[38;2;120;120;120mH=0.5");
+        { for (int i = 0; i < 6; i++) *p++ = ' '; }
+        p += sprintf(p, "\033[38;2;40;180;240mpersistent");
+        p += sprintf(p, "%s", hrbg);
+        { int used = 39; for (int i = used; i < hr_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", hrbdr, hrrst);
+
+        /* Row 6: Sparkline of global H over time */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     hr_row + 6, hr_col, hrbdr, hrbg);
+        p += sprintf(p, " \033[38;2;80;140;160mhist:");
+        {
+            const char *spark_chars[] = {"\xe2\x96\x81","\xe2\x96\x82","\xe2\x96\x83",
+                                         "\xe2\x96\x84","\xe2\x96\x85","\xe2\x96\x86",
+                                         "\xe2\x96\x87","\xe2\x96\x88"};
+            int slen = hr_hist_count < 36 ? hr_hist_count : 36;
+            for (int i = 0; i < slen; i++) {
+                int idx = (hr_hist_idx - slen + i + HR_HIST_LEN) % HR_HIST_LEN;
+                float v = hr_hist[idx];
+                if (v < 0.0f) v = 0.0f;
+                if (v > 1.0f) v = 1.0f;
+                int si = (int)(v * 7.99f);
+                if (si > 7) si = 7;
+                unsigned char sr, sg2, sb;
+                if (v > 0.6f) { sr = 40; sg2 = (unsigned char)(160 + 80 * v); sb = (unsigned char)(200 + 55 * v); }
+                else if (v < 0.4f) { sr = (unsigned char)(200 + 55 * v); sg2 = (unsigned char)(120 + 40 * v); sb = 40; }
+                else { sr = 120; sg2 = 120; sb = 120; }
+                p += sprintf(p, "\033[38;2;%d;%d;%dm%s", sr, sg2, sb, spark_chars[si]);
+            }
+        }
+        p += sprintf(p, "%s", hrbg);
+        { int used = 5 + (hr_hist_count < 36 ? hr_hist_count : 36);
+          for (int i = used; i < hr_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", hrbdr, hrrst);
+
+        /* Row 7: Memory interpretation */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     hr_row + 7, hr_col, hrbdr, hrbg);
+        p += sprintf(p, " \033[38;2;80;140;160mMemory: ");
+        if (hr_global_h > 0.65f)
+            p += sprintf(p, "\033[38;2;40;200;255mpast predicts future (long-range)");
+        else if (hr_global_h > 0.55f)
+            p += sprintf(p, "\033[38;2;100;200;200mweak trends carry forward");
+        else if (hr_global_h >= 0.45f)
+            p += sprintf(p, "\033[38;2;140;140;140mno memory structure detected");
+        else if (hr_global_h >= 0.35f)
+            p += sprintf(p, "\033[38;2;220;160;60mweak tendency to reverse");
+        else
+            p += sprintf(p, "\033[38;2;255;120;30mstrong mean reversion");
+        p += sprintf(p, "%s", hrbg);
+        { int used = 44; for (int i = used; i < hr_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", hrbdr, hrrst);
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", hr_row + 8, hr_col, hrbdr);
+        for (int i = 0; i < hr_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", hrrst);
+    }
+
     /* ── Percolation Analysis overlay panel ─────────────────────────────── */
     if (perc_mode) {
         int pc_w = 46;
@@ -14833,6 +15324,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (coh_mode)       pc_row += 8;
         if (ce_mode)        pc_row += 9;
         if (ew_mode)        pc_row += 10;
+        if (hr_mode)        pc_row += 10;
         if (pc_col < 1) pc_col = 1;
 
         const char *pcbdr = "\033[38;2;255;200;40;48;2;14;12;6m";
@@ -15012,6 +15504,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (coh_mode)       is_row += 8;
         if (ce_mode)        is_row += 9;
         if (ew_mode)        is_row += 10;
+        if (hr_mode)        is_row += 10;
         if (perc_mode)      is_row += 10;
         if (is_col < 1) is_col = 1;
 
@@ -15183,6 +15676,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (coh_mode)       pb_row += 8;
         if (ce_mode)        pb_row += 9;
         if (ew_mode)        pb_row += 10;
+        if (hr_mode)        pb_row += 10;
         if (perc_mode)      pb_row += 10;
         if (ising_mode)     pb_row += 10;
         if (pb_col < 1) pb_col = 1;
@@ -15397,6 +15891,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (coh_mode)       gd_row_p += 8;
         if (ce_mode)        gd_row_p += 9;
         if (ew_mode)        gd_row_p += 10;
+        if (hr_mode)        gd_row_p += 10;
         if (perc_mode)      gd_row_p += 10;
         if (ising_mode)     gd_row_p += 10;
         if (pb_mode)        gd_row_p += 14;
@@ -15533,6 +16028,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (coh_mode)      pp_row += 8;
         if (ce_mode)       pp_row += 9;
         if (ew_mode)       pp_row += 10;
+        if (hr_mode)       pp_row += 10;
         if (perc_mode)     pp_row += 10;
         if (ising_mode)    pp_row += 10;
         if (pb_mode)       pp_row += 14;
@@ -15755,6 +16251,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (coh_mode)      cm_row += 8;
         if (ce_mode)       cm_row += 9;
         if (ew_mode)       cm_row += 10;
+        if (hr_mode)       cm_row += 10;
         if (perc_mode)     cm_row += 10;
         if (ising_mode)    cm_row += 10;
         if (pb_mode)       cm_row += 14;
@@ -15961,6 +16458,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (coh_mode)       ps_row_p += 8;
         if (ce_mode)        ps_row_p += 9;
         if (ew_mode)        ps_row_p += 10;
+        if (hr_mode)        ps_row_p += 10;
         if (perc_mode)      ps_row_p += 10;
         if (ising_mode)     ps_row_p += 10;
         if (pb_mode)        ps_row_p += 14;
@@ -16202,6 +16700,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (coh_mode)       rp_row_p += 8;
         if (ce_mode)        rp_row_p += 9;
         if (ew_mode)        rp_row_p += 10;
+        if (hr_mode)        rp_row_p += 10;
         if (perc_mode)      rp_row_p += 10;
         if (ising_mode)     rp_row_p += 10;
         if (pb_mode)        rp_row_p += 14;
@@ -16405,6 +16904,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (coh_mode)       sa_row_p += 8;
         if (ce_mode)        sa_row_p += 9;
         if (ew_mode)        sa_row_p += 10;
+        if (hr_mode)        sa_row_p += 10;
         if (perc_mode)      sa_row_p += 10;
         if (ising_mode)     sa_row_p += 10;
         if (pb_mode)        sa_row_p += 14;
@@ -16633,6 +17133,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (coh_mode)       pt_row_p += 8;
         if (ce_mode)        pt_row_p += 9;
         if (ew_mode)        pt_row_p += 10;
+        if (hr_mode)        pt_row_p += 10;
         if (perc_mode)      pt_row_p += 10;
         if (ising_mode)     pt_row_p += 10;
         if (pb_mode)        pt_row_p += 14;
@@ -18025,6 +18526,19 @@ int main(int argc, char **argv) {
                 }
             }
         }
+        else if (key == '4') {
+            if (!ecosystem_mode) {
+                hr_mode = !hr_mode;
+                if (hr_mode) {
+                    hr_reset();
+                    flash_set("Hurst Exponent: long-range memory [4]exit");
+                    printf("\033[2J"); fflush(stdout);
+                } else {
+                    flash_set("Hurst Exponent off");
+                    printf("\033[2J"); fflush(stdout);
+                }
+            }
+        }
         else if (key == '?') {
             if (probe_mode > 0) {
                 probe_mode = 0; /* toggle off */
@@ -18723,6 +19237,14 @@ int main(int argc, char **argv) {
             ew_record();
             if (ew_stale && ew_count >= 16) {
                 ew_compute();
+            }
+        }
+
+        /* Hurst exponent: record all metrics every 2 generations */
+        if (hr_mode && running && (generation % 2 == 0)) {
+            hr_record();
+            if (hr_stale && hr_count >= 32) {
+                hr_compute();
             }
         }
 

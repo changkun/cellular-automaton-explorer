@@ -85,6 +85,9 @@
  *                 Green=ergodic (averages match), magenta=non-ergodic (frozen)
  *   |           Toggle percolation analysis (cluster connectivity)
  *                 Gold=largest cluster, spectrum=others; detects spanning clusters
+ *   K           Toggle spacetime kymograph (1D slice through time)
+ *                 Y-axis=time (scrolling up), X-axis=space (scan row)
+ *                 Arrow Up/Down to move scan row; gliders appear as diagonals
  *   )           Toggle split-screen dual overlay comparison
  *                 Shows two overlays side-by-side on the same simulation
  *                 TAB cycles right panel overlay, ` cycles left panel overlay
@@ -662,6 +665,29 @@ static float perc_hist_density[PERC_HIST_LEN]; /* density history */
 static int   perc_hist_idx = 0;
 static int   perc_hist_count = 0;
 
+/* ── Spacetime Kymograph ─────────────────────────────────────────────────── */
+/* Displays a 1D horizontal slice of the grid evolving over time as a 2D
+   spacetime diagram.  Y-axis = time (scrolling upward), X-axis = grid row.
+   Gliders appear as diagonal lines, oscillators as vertical stripes.
+   Toggle with 'K' key.  Arrow Up/Down moves the scan row. */
+
+#define KYMO_DEPTH 256   /* number of generations stored */
+
+/* Ring buffer: each entry is a snapshot of one grid row.
+   kymo_buf[t][x] stores cell age (0=dead, 1-255=alive age) */
+static unsigned char kymo_buf[KYMO_DEPTH][MAX_W];
+static int  kymo_head = 0;          /* write cursor (next slot to fill) */
+static int  kymo_count = 0;         /* total filled entries (≤ KYMO_DEPTH) */
+static int  kymo_mode = 0;          /* 0=off, 1=on */
+static int  kymo_scan_row = -1;     /* grid row being sampled (-1 = auto-center) */
+
+/* Population per-generation in the scan row for the sparkline */
+static int  kymo_row_pop[KYMO_DEPTH];
+
+/* Record the current scan row into the ring buffer.
+   Called every generation from update(). */
+static void kymo_record(void);
+
 /* ── Cell Probe Inspector ─────────────────────────────────────────────────── */
 /* Click-to-inspect tool: shows all analysis metrics for a single cell.
    Toggle with '?' key, then click any cell to display its full diagnostic. */
@@ -1009,6 +1035,21 @@ static unsigned short species_b_survival = 0x00C; /* S23 */
 static int re_col0, re_row0; /* top-left corner (1-based terminal coords) */
 #define RE_WIDTH 40
 #define RE_HEIGHT 6
+
+/* ── Kymograph record implementation (needs W, H) ────────────────────────── */
+static void kymo_record(void) {
+    if (!kymo_mode) return;
+    int row = kymo_scan_row;
+    if (row < 0 || row >= H) row = H / 2;
+    memcpy(kymo_buf[kymo_head], grid[row], (size_t)W);
+    /* Count population in this row */
+    int pop = 0;
+    for (int x = 0; x < W; x++)
+        if (grid[row][x]) pop++;
+    kymo_row_pop[kymo_head] = pop;
+    kymo_head = (kymo_head + 1) % KYMO_DEPTH;
+    if (kymo_count < KYMO_DEPTH) kymo_count++;
+}
 
 /* Forward declarations for emitter/absorber use */
 static void grid_set(int x, int y);
@@ -1708,6 +1749,9 @@ static void grid_step(void) {
 
     /* Always record frames for surprise field (cheap memcpy) */
     surp_record_frame();
+
+    /* Record kymograph scan line */
+    kymo_record();
 }
 
 /* ── Census scan implementation ───────────────────────────────────────────── */
@@ -2410,6 +2454,7 @@ static void demo_reset_overlays(void) {
     temp_mode = 0;
     ecosystem_mode = 0;
     split_mode = 0;
+    kymo_mode = 0;
 }
 
 static void demo_setup_scene(int idx) {
@@ -8252,6 +8297,15 @@ static void render(int running, int speed_ms, int draw_mode) {
                  split_overlay_table[split_right].name);
     }
 
+    /* Kymograph indicator */
+    char kymo_str[96] = "";
+    if (kymo_mode) {
+        int sr = kymo_scan_row;
+        if (sr < 0 || sr >= H) sr = H / 2;
+        snprintf(kymo_str, sizeof(kymo_str),
+                 " \033[38;2;60;180;240m\xe2\x97\x87KYMO:row%d\033[0m", sr);
+    }
+
     /* Probe mode indicator */
     char probe_str[96] = "";
     if (probe_mode == 1)
@@ -8380,9 +8434,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, corr_str, eprod_str, wave_str, split_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
+                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, corr_str, eprod_str, wave_str, split_str, kymo_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -8421,7 +8475,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, " \033[90m[SPC]play [s]step [r]rand [c]clr "
                          "[1-5]pre [d]draw [D]demo [k]sym [g]graph [y]dash [w]topo [h]heat [T]trace [f]freq [i]ent [L]lyap [u]fft "
                          "[X]temp [C]class [O]flow [9]cone [!]surp [@]mi [#]cplx [$]topo [=]dS/dt [/]rule [m]mut [b]edit [G]evolve [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
-                         "[S]stamp [v]census [?]probe [)]split [z/x]zoom [n]map [<>]time [t]tbar [P]snap C-p:seq "
+                         "[S]stamp [v]census [?]probe [)]split [K]kymo [z/x]zoom [n]map [<>]time [t]tbar [P]snap C-p:seq "
                          "C-s:save C-o:load C-e:rle [q]quit\033[0m\033[K\n");
     }
 
@@ -8505,6 +8559,173 @@ static void render(int running, int speed_ms, int draw_mode) {
             *p++ = ' '; *p++ = ' '; \
         } \
     } while (0)
+
+    /* ── Kymograph mode: spacetime diagram replaces grid ── */
+    if (kymo_mode && kymo_count > 0) {
+        /* Use half-block rendering: 2 time-steps per terminal row via ▀ character.
+           Each column = one grid X position.  Time flows upward (newest at bottom).
+           The visible width = min(view_w, W) columns (1 char per cell).
+           The visible depth = usable_rows * 2 time-steps. */
+        int kymo_vis_w = view_w;
+        if (kymo_vis_w > W) kymo_vis_w = W;
+        int kymo_vis_cols = kymo_vis_w;  /* 1 char per cell (half the width of normal mode) */
+        if (kymo_vis_cols > term_cols - 3) kymo_vis_cols = term_cols - 3; /* 3 for left gutter */
+        int kymo_vis_depth = usable_rows * 2; /* 2 time-steps per terminal row */
+        if (kymo_vis_depth > kymo_count) kymo_vis_depth = kymo_count;
+
+        /* Helper: get cell value from ring buffer. t=0 is newest, t=1 is one gen ago, etc. */
+        #define KYMO_GET(t, x) kymo_buf[((kymo_head - 1 - (t)) % KYMO_DEPTH + KYMO_DEPTH) % KYMO_DEPTH][(x)]
+
+        /* Helper: age value → RGB color (blue→cyan→green→yellow→red→white thermal gradient) */
+        #define KYMO_RGB(age, rr, gg, bb) do { \
+            if ((age) == 0) { rr = 6; gg = 4; bb = 12; } \
+            else { \
+                float _f = (age) / 255.0f; \
+                if (_f < 0.2f) { float _t = _f / 0.2f; rr = (int)(20 + 40*_t); gg = (int)(60 + 160*_t); bb = (int)(200 + 55*_t); } \
+                else if (_f < 0.4f) { float _t = (_f-0.2f)/0.2f; rr = (int)(60 - 30*_t); gg = (int)(220 + 35*_t); bb = (int)(255 - 120*_t); } \
+                else if (_f < 0.6f) { float _t = (_f-0.4f)/0.2f; rr = (int)(30 + 200*_t); gg = (int)(255 - 20*_t); bb = (int)(135 - 100*_t); } \
+                else if (_f < 0.8f) { float _t = (_f-0.6f)/0.2f; rr = (int)(230 + 25*_t); gg = (int)(235 - 135*_t); bb = (int)(35 - 30*_t); } \
+                else { float _t = (_f-0.8f)/0.2f; rr = 255; gg = (int)(100 + 155*_t); bb = (int)(5 + 250*_t); } \
+            } \
+        } while(0)
+
+        /* Render spacetime diagram using half-block characters */
+        int scan_row = kymo_scan_row;
+        if (scan_row < 0 || scan_row >= H) scan_row = H / 2;
+
+        for (int trow = 0; trow < usable_rows; trow++) {
+            /* Each terminal row packs two time-steps:
+               top = older (higher t index), bottom = newer (lower t index) */
+            int t_top = kymo_vis_depth - 1 - trow * 2;
+            int t_bot = t_top - 1;
+
+            /* Left gutter: time axis label every 10 rows */
+            if (trow % 10 == 0 && t_top >= 0) {
+                int gen_ago = t_top;
+                p += sprintf(p, "\033[38;2;80;80;100m%3d\033[0m", gen_ago);
+            } else {
+                p += sprintf(p, "   ");
+            }
+
+            for (int x = view_x; x < view_x + kymo_vis_cols && x < W; x++) {
+                int r_top = 6, g_top = 4, b_top = 12;
+                int r_bot = 6, g_bot = 4, b_bot = 12;
+
+                if (t_top >= 0 && t_top < kymo_count) {
+                    int age = KYMO_GET(t_top, x);
+                    KYMO_RGB(age, r_top, g_top, b_top);
+                }
+                if (t_bot >= 0 && t_bot < kymo_count) {
+                    int age = KYMO_GET(t_bot, x);
+                    KYMO_RGB(age, r_bot, g_bot, b_bot);
+                }
+
+                /* Use ▀ (upper half block) with fg=top, bg=bottom */
+                p += sprintf(p, "\033[38;2;%d;%d;%d;48;2;%d;%d;%dm\xe2\x96\x80",
+                             r_top, g_top, b_top, r_bot, g_bot, b_bot);
+            }
+            p += sprintf(p, "\033[0m\033[K\n");
+        }
+
+        #undef KYMO_GET
+        #undef KYMO_RGB
+
+        /* ── Kymograph info panel (bottom-right) ── */
+        {
+            int kp_w = 44;
+            int kp_col = term_cols - kp_w - 2;
+            int kp_row = 3;
+            if (kp_col < 1) kp_col = 1;
+
+            const char *kbdr = "\033[38;2;60;180;240;48;2;8;12;20m";
+            const char *kbg  = "\033[48;2;8;12;20m";
+            const char *krst = "\033[0m";
+
+            /* Top border */
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 \xe2\x97\x87 Kymograph ",
+                         kp_row, kp_col, kbdr);
+            for (int i = 16; i < kp_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+            *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+            p += sprintf(p, "%s", krst);
+
+            /* Row 1: Scan row info */
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                         kp_row + 1, kp_col, kbdr, kbg);
+            p += sprintf(p, " \033[38;2;60;180;240mScan row: \033[1;38;2;120;220;255m%d\033[0m%s",
+                         scan_row, kbg);
+            p += sprintf(p, " \033[38;2;80;100;140mof %d", H);
+            { int used = 28; for (int i = used; i < kp_w - 1; i++) *p++ = ' '; }
+            p += sprintf(p, "%s%s\xe2\x94\x82%s", kbg, kbdr, krst);
+
+            /* Row 2: Buffer depth */
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                         kp_row + 2, kp_col, kbdr, kbg);
+            p += sprintf(p, " \033[38;2;60;180;240mDepth: \033[38;2;180;200;220m%d\033[0m%s",
+                         kymo_count, kbg);
+            p += sprintf(p, "\033[38;2;80;100;140m/%d gens", KYMO_DEPTH);
+            { int used = 28; for (int i = used; i < kp_w - 1; i++) *p++ = ' '; }
+            p += sprintf(p, "%s%s\xe2\x94\x82%s", kbg, kbdr, krst);
+
+            /* Row 3: Row population sparkline */
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                         kp_row + 3, kp_col, kbdr, kbg);
+            p += sprintf(p, " \033[38;2;60;180;240mRow pop: ");
+            {
+                /* Draw a small sparkline of recent row populations */
+                static const char *spark_chars[] = {"\xe2\x96\x81", "\xe2\x96\x82", "\xe2\x96\x83",
+                                                     "\xe2\x96\x84", "\xe2\x96\x85", "\xe2\x96\x86",
+                                                     "\xe2\x96\x87", "\xe2\x96\x88"};
+                int spark_len = 24;
+                if (spark_len > kymo_count) spark_len = kymo_count;
+                int max_pop = 1;
+                for (int i = 0; i < spark_len; i++) {
+                    int idx = ((kymo_head - 1 - i) % KYMO_DEPTH + KYMO_DEPTH) % KYMO_DEPTH;
+                    if (kymo_row_pop[idx] > max_pop) max_pop = kymo_row_pop[idx];
+                }
+                for (int i = spark_len - 1; i >= 0; i--) {
+                    int idx = ((kymo_head - 1 - i) % KYMO_DEPTH + KYMO_DEPTH) % KYMO_DEPTH;
+                    int level = kymo_row_pop[idx] * 7 / max_pop;
+                    if (level > 7) level = 7;
+                    /* Color: blue→cyan based on density */
+                    int bright = 120 + level * 18;
+                    p += sprintf(p, "\033[38;2;%d;%d;%dm%s",
+                                 40, bright, 200 + level * 7, spark_chars[level]);
+                }
+            }
+            p += sprintf(p, "%s", kbg);
+            { int used = 10 + 24; for (int i = used; i < kp_w - 1; i++) *p++ = ' '; }
+            p += sprintf(p, "%s%s\xe2\x94\x82%s", kbg, kbdr, krst);
+
+            /* Row 4: Legend */
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                         kp_row + 4, kp_col, kbdr, kbg);
+            p += sprintf(p, " \033[38;2;80;100;140m\xe2\x86\x95" "row  X=space  Y=time\xe2\x86\x91");
+            { int used = 26; for (int i = used; i < kp_w - 1; i++) *p++ = ' '; }
+            p += sprintf(p, "%s%s\xe2\x94\x82%s", kbg, kbdr, krst);
+
+            /* Row 5: Key hints */
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                         kp_row + 5, kp_col, kbdr, kbg);
+            p += sprintf(p, " \033[38;2;80;100;140m[K]exit [\xe2\x86\x91\xe2\x86\x93]scan row [arrows]pan");
+            { int used = 36; for (int i = used; i < kp_w - 1; i++) *p++ = ' '; }
+            p += sprintf(p, "%s%s\xe2\x94\x82%s", kbg, kbdr, krst);
+
+            /* Bottom border */
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", kp_row + 6, kp_col, kbdr);
+            for (int i = 0; i < kp_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+            *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+            p += sprintf(p, "%s", krst);
+
+            /* ── Scan line indicator on grid ── */
+            /* Draw a faint dashed line at the scan row position in the left margin */
+            int scan_screen_y = scan_row - view_y + 3; /* +3 for status bars */
+            if (scan_screen_y >= 3 && scan_screen_y < term_rows) {
+                p += sprintf(p, "\033[%d;1H\033[38;2;60;180;240m\xe2\x96\xb6\033[0m", scan_screen_y);
+            }
+        }
+
+        goto kymo_skip_grid; /* skip normal grid rendering */
+    }
 
     if (zoom == 1) {
         /* ── Normal zoom: 2 chars per cell ── */
@@ -8758,6 +8979,8 @@ static void render(int running, int speed_ms, int draw_mode) {
             *p++ = '\033'; *p++ = '['; *p++ = 'K'; *p++ = '\n';
         }
     }
+
+    kymo_skip_grid: ; /* kymograph mode jumps here after custom rendering */
 
     /* Minimap overlay (only when zoomed) */
     render_minimap(&p);
@@ -12808,6 +13031,17 @@ int main(int argc, char **argv) {
                 perc_compute(); /* compute on toggle-on */
             }
         }
+        else if (key == 'K') {
+            kymo_mode = !kymo_mode;
+            if (kymo_mode) {
+                if (kymo_scan_row < 0) kymo_scan_row = H / 2;
+                flash_set("Kymograph: spacetime diagram [K]exit [\xe2\x86\x91\xe2\x86\x93]scan row");
+                printf("\033[2J"); fflush(stdout);
+            } else {
+                flash_set("Kymograph off");
+                printf("\033[2J"); fflush(stdout);
+            }
+        }
         else if (key == ')') {
             split_mode = !split_mode;
             if (split_mode) {
@@ -13006,8 +13240,21 @@ int main(int argc, char **argv) {
         else if (key == '0') {
             viewport_center();
         }
-        else if (key == KEY_UP) viewport_pan(0, -1);
-        else if (key == KEY_DOWN) viewport_pan(0, 1);
+        else if (key == KEY_UP) {
+            if (kymo_mode) {
+                kymo_scan_row--;
+                if (kymo_scan_row < 0) kymo_scan_row = H - 1;
+                /* Clear buffer when scan row changes for clean view */
+                kymo_count = 0; kymo_head = 0;
+            } else viewport_pan(0, -1);
+        }
+        else if (key == KEY_DOWN) {
+            if (kymo_mode) {
+                kymo_scan_row++;
+                if (kymo_scan_row >= H) kymo_scan_row = 0;
+                kymo_count = 0; kymo_head = 0;
+            } else viewport_pan(0, 1);
+        }
         else if (key == KEY_LEFT) viewport_pan(-1, 0);
         else if (key == KEY_RIGHT) viewport_pan(1, 0);
         else if (key == KEY_MOUSE) {

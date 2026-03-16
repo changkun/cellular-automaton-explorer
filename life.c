@@ -69,6 +69,9 @@
  *   ^           Toggle Kolmogorov complexity estimator (algorithmic complexity)
  *                 LZ77-style compression of local neighborhoods
  *                 Blue=compressible, gold=structured, red=incompressible
+ *   &           Toggle spatial correlation length (two-point correlation)
+ *                 Measures correlation length ξ and local correlation strength
+ *                 Violet=uncorrelated, cyan=moderate, white=strongly correlated
  *   D           Auto-demo mode — curated tour of pattern + overlay combos
  *                 Cycles through 10 scenes; press any key to exit and explore
  *   ?           Toggle cell probe inspector (click any cell for all metrics)
@@ -471,6 +474,34 @@ static float kc_hist_mean[KC_HIST_LEN];
 static float kc_hist_max[KC_HIST_LEN];
 static int   kc_hist_idx = 0;
 static int   kc_hist_count = 0;
+
+/* ── Spatial Correlation Length ────────────────────────────────────────────── */
+/* Two-point correlation function C(r) = <s(x)s(x+r)> - <s>² averaged over
+   all directions and positions.  Fit C(r) ~ exp(-r/ξ) to extract the
+   correlation length ξ (xi) — the characteristic spatial scale of order.
+   Short ξ = disordered (random soup), long ξ = ordered/critical (large
+   structures or phase transitions).  Per-cell heatmap shows local correlation
+   strength within a sampling window. */
+#define CORR_MAX_R    32    /* max distance to compute C(r) */
+#define CORR_LOCAL_R  8     /* radius for per-cell local correlation */
+#define CORR_HIST_LEN 64    /* sparkline history length */
+#define CORR_N_DIRS   4     /* sampling directions: E, SE, S, SW */
+
+static float corr_grid[MAX_H][MAX_W];    /* per-cell local correlation 0.0–1.0 */
+static int   corr_mode = 0;              /* 0=off, 1=on */
+static int   corr_stale = 1;             /* 1=needs recomputation */
+static float corr_xi = 0.0f;             /* global correlation length ξ */
+static float corr_xi_r2 = 0.0f;          /* R² of exponential fit */
+static float corr_c1 = 0.0f;             /* C(1) nearest-neighbor correlation */
+static float corr_global_mean = 0.0f;    /* mean local correlation */
+static float corr_global_max = 0.0f;     /* max local correlation */
+static float corr_density = 0.0f;        /* current live cell density <s> */
+static float corr_cr[CORR_MAX_R + 1];    /* global C(r) function */
+
+/* Sparkline history */
+static float corr_hist_xi[CORR_HIST_LEN];
+static int   corr_hist_idx = 0;
+static int   corr_hist_count = 0;
 
 /* ── Cell Probe Inspector ─────────────────────────────────────────────────── */
 /* Click-to-inspect tool: shows all analysis metrics for a single cell.
@@ -1396,6 +1427,7 @@ static void grid_step(void) {
     topo_stale = 1;
     rg_stale = 1;
     kc_stale = 1;
+    corr_stale = 1;
 
     /* Always record frames for surprise field (cheap memcpy) */
     surp_record_frame();
@@ -2056,6 +2088,7 @@ static void cplx_compute(void);
 static void topo_compute(void);
 static void rg_compute(void);
 static void kc_compute(void);
+static void corr_compute(void);
 
 static void demo_reset_overlays(void) {
     freq_mode = 0;
@@ -2069,6 +2102,7 @@ static void demo_reset_overlays(void) {
     topo_mode = 0;
     rg_mode = 0;
     kc_mode = 0;
+    corr_mode = 0;
     fourier_mode = 0;
     fractal_mode = 0;
     wolfram_mode = 0;
@@ -2125,6 +2159,7 @@ static void demo_setup_scene(int idx) {
             case '$': topo_mode = 1; topo_compute(); break;
             case '%': rg_mode = 1; rg_compute(); break;
             case '^': kc_mode = 1; kc_compute(); break;
+            case '&': corr_mode = 1; corr_compute(); break;
             case 'h': heatmap_mode = 1; break;
             case 'g': show_graph = 1; break;
         }
@@ -4768,6 +4803,188 @@ static RGB kc_to_rgb(float ratio) {
     }
 }
 
+/* ── Spatial Correlation Length computation ───────────────────────────────── */
+
+static void corr_compute(void) {
+    /* Step 1: compute global density <s> */
+    int total_alive = 0;
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++)
+            if (grid[y][x] > 0) total_alive++;
+
+    float density = (float)total_alive / (float)(W * H);
+    corr_density = density;
+
+    /* Step 2: compute C(r) = <s(x)*s(x+r)> - <s>^2 for r=0..CORR_MAX_R
+       Sample along 4 directions: E(1,0), SE(1,1), S(0,1), SW(-1,1) */
+    float density_sq = density * density;
+
+    for (int r = 0; r <= CORR_MAX_R; r++) {
+        double sum = 0.0;
+        long count = 0;
+
+        /* Direction vectors */
+        static const int dx[CORR_N_DIRS] = {1, 1, 0, -1};
+        static const int dy[CORR_N_DIRS] = {0, 1, 1,  1};
+
+        for (int d = 0; d < CORR_N_DIRS; d++) {
+            int rx = r * dx[d], ry = r * dy[d];
+            for (int y = 0; y < H; y++) {
+                for (int x = 0; x < W; x++) {
+                    int nx = x + rx, ny = y + ry;
+                    if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
+                    float s1 = grid[y][x] > 0 ? 1.0f : 0.0f;
+                    float s2 = grid[ny][nx] > 0 ? 1.0f : 0.0f;
+                    sum += s1 * s2;
+                    count++;
+                }
+            }
+        }
+
+        float c = count > 0 ? (float)(sum / count) - density_sq : 0.0f;
+        corr_cr[r] = c;
+    }
+
+    /* Normalize C(r) by C(0) */
+    float c0 = corr_cr[0] > 1e-8f ? corr_cr[0] : 1e-8f;
+    for (int r = 0; r <= CORR_MAX_R; r++)
+        corr_cr[r] /= c0;
+
+    corr_c1 = corr_cr[1];
+
+    /* Step 3: fit C(r) ~ exp(-r/ξ) via linear regression on ln(C(r)) vs r
+       for r >= 1 where C(r) > 0 */
+    {
+        double sx = 0, sy = 0, sxx = 0, sxy = 0;
+        int n = 0;
+        for (int r = 1; r <= CORR_MAX_R; r++) {
+            if (corr_cr[r] <= 0.01f) break;  /* stop when correlation vanishes */
+            double lr = (double)r;
+            double lc = log((double)corr_cr[r]);
+            sx += lr;
+            sy += lc;
+            sxx += lr * lr;
+            sxy += lr * lc;
+            n++;
+        }
+
+        if (n >= 2) {
+            double denom = n * sxx - sx * sx;
+            if (fabs(denom) > 1e-12) {
+                double slope = (n * sxy - sx * sy) / denom;
+                /* ξ = -1/slope (slope should be negative for decay) */
+                corr_xi = slope < -1e-6 ? (float)(-1.0 / slope) : (float)CORR_MAX_R;
+                if (corr_xi > CORR_MAX_R) corr_xi = (float)CORR_MAX_R;
+                if (corr_xi < 0) corr_xi = 0;
+
+                /* R² goodness of fit */
+                double mean_y = sy / n;
+                double ss_tot = 0, ss_res = 0;
+                double intercept = (sy - slope * sx) / n;
+                int k = 0;
+                for (int r = 1; r <= CORR_MAX_R && k < n; r++) {
+                    if (corr_cr[r] <= 0.01f) break;
+                    double lc = log((double)corr_cr[r]);
+                    double pred = intercept + slope * r;
+                    ss_tot += (lc - mean_y) * (lc - mean_y);
+                    ss_res += (lc - pred) * (lc - pred);
+                    k++;
+                }
+                corr_xi_r2 = ss_tot > 1e-12 ? (float)(1.0 - ss_res / ss_tot) : 0.0f;
+                if (corr_xi_r2 < 0) corr_xi_r2 = 0;
+            } else {
+                corr_xi = 0;
+                corr_xi_r2 = 0;
+            }
+        } else {
+            corr_xi = 0;
+            corr_xi_r2 = 0;
+        }
+    }
+
+    /* Step 4: per-cell local correlation — average correlation with neighbors at distance 1..CORR_LOCAL_R */
+    float max_local = 0.0f;
+    float sum_local = 0.0f;
+    int n_alive_cells = 0;
+
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            if (grid[y][x] == 0 && ghost[y][x] == 0) {
+                corr_grid[y][x] = 0.0f;
+                continue;
+            }
+
+            float s_center = grid[y][x] > 0 ? 1.0f : 0.0f;
+            double local_sum = 0.0;
+            int local_count = 0;
+
+            for (int r = 1; r <= CORR_LOCAL_R; r++) {
+                /* Sample 8 directions at distance r */
+                static const int ddx[8] = {1,1,0,-1,-1,-1,0,1};
+                static const int ddy[8] = {0,1,1,1,0,-1,-1,-1};
+                for (int d = 0; d < 8; d++) {
+                    int nx = x + r * ddx[d], ny = y + r * ddy[d];
+                    if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
+                    float s_nbr = grid[ny][nx] > 0 ? 1.0f : 0.0f;
+                    /* Correlation contribution: (s - mean)(s' - mean) / var */
+                    local_sum += (s_center - density) * (s_nbr - density);
+                    local_count++;
+                }
+            }
+
+            float local_c = local_count > 0 ? (float)(local_sum / local_count) / (c0 > 1e-8f ? c0 : 1e-8f) : 0.0f;
+            if (local_c < 0) local_c = 0;
+            if (local_c > 1) local_c = 1;
+            corr_grid[y][x] = local_c;
+
+            if (grid[y][x] > 0) {
+                sum_local += local_c;
+                n_alive_cells++;
+                if (local_c > max_local) max_local = local_c;
+            }
+        }
+    }
+
+    corr_global_mean = n_alive_cells > 0 ? sum_local / n_alive_cells : 0.0f;
+    corr_global_max = max_local;
+
+    /* Record sparkline history */
+    corr_hist_xi[corr_hist_idx] = corr_xi;
+    corr_hist_idx = (corr_hist_idx + 1) % CORR_HIST_LEN;
+    if (corr_hist_count < CORR_HIST_LEN) corr_hist_count++;
+
+    corr_stale = 0;
+}
+
+/* Correlation length color: violet (uncorrelated) → cyan (moderate) → white (strongly correlated) */
+static RGB corr_to_rgb(float c) {
+    if (c < 0.25f) {
+        /* Uncorrelated: deep violet → blue */
+        float t = c / 0.25f;
+        return (RGB){(unsigned char)(40 + 20 * t),
+                     (unsigned char)(20 + 60 * t),
+                     (unsigned char)(120 + 80 * t)};
+    } else if (c < 0.5f) {
+        /* Moderate: blue → cyan */
+        float t = (c - 0.25f) / 0.25f;
+        return (RGB){(unsigned char)(60 - 40 * t),
+                     (unsigned char)(80 + 140 * t),
+                     (unsigned char)(200 + 30 * t)};
+    } else if (c < 0.75f) {
+        /* Strong: cyan → green-white */
+        float t = (c - 0.5f) / 0.25f;
+        return (RGB){(unsigned char)(20 + 180 * t),
+                     (unsigned char)(220 + 30 * t),
+                     (unsigned char)(230 - 40 * t)};
+    } else {
+        /* Very strong: green-white → white-hot */
+        float t = (c - 0.75f) / 0.25f;
+        return (RGB){(unsigned char)(200 + 55 * t),
+                     (unsigned char)(250 + 5 * t),
+                     (unsigned char)(190 + 65 * t)};
+    }
+}
+
 /* ── Mutual Information Network computation ──────────────────────────────── */
 
 /* Draw a Bresenham line on mi_overlay, keeping max MI at each cell */
@@ -6593,6 +6810,21 @@ static int cell_color(int x, int y, RGB *out) {
         return 0;
     }
 
+    /* Spatial correlation length overlay: local correlation strength */
+    if (corr_mode) {
+        float c = corr_grid[y][x];
+        if (c > 0.005f || grid[y][x]) {
+            *out = corr_to_rgb(c);
+            if (grid[y][x]) {
+                out->r = (unsigned char)(out->r < 220 ? out->r + 35 : 255);
+                out->g = (unsigned char)(out->g < 220 ? out->g + 35 : 255);
+                out->b = (unsigned char)(out->b < 220 ? out->b + 35 : 255);
+            }
+            return grid[y][x] ? 1 : 23; /* 23 = corr ghost */
+        }
+        return 0;
+    }
+
     /* Renormalization group flow overlay: multi-scale structure */
     if (rg_mode) {
         if (grid[y][x]) {
@@ -6881,6 +7113,12 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(kc_str, sizeof(kc_str),
                  " \033[38;2;240;180;40m\xe2\x97\x86KC:%.2f\033[0m", kc_global_mean);
 
+    /* Spatial correlation length indicator */
+    char corr_str[96] = "";
+    if (corr_mode)
+        snprintf(corr_str, sizeof(corr_str),
+                 " \033[38;2;120;180;240m\xe2\x97\x86\xce\xbe=%.1f\033[0m", corr_xi);
+
     /* Probe mode indicator */
     char probe_str[96] = "";
     if (probe_mode == 1)
@@ -7010,9 +7248,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
+                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, corr_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -9429,10 +9667,147 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", krst);
     }
 
+    /* ── Spatial Correlation Length overlay panel ───────────────────────── */
+    if (corr_mode) {
+        int cp_w = 44;
+        int cp_col = term_cols - cp_w - 2;
+        /* Stack below other active panels */
+        int cp_row = 3;
+        if (entropy_mode)   cp_row += 8;
+        if (temp_mode)      cp_row += 9;
+        if (lyapunov_mode)  cp_row += 8;
+        if (fourier_mode)   cp_row += 18;
+        if (fractal_mode)   cp_row += 11;
+        if (wolfram_mode)   cp_row += 14;
+        if (flow_mode)      cp_row += 9;
+        if (attractor_mode) cp_row += 8;
+        if (cone_mode >= 1) cp_row += 8;
+        if (surp_mode)      cp_row += 8;
+        if (mi_mode)        cp_row += 12;
+        if (cplx_mode)      cp_row += 11;
+        if (topo_mode)      cp_row += 11;
+        if (rg_mode)        cp_row += 11;
+        if (kc_mode)        cp_row += 9;
+        if (cp_col < 1) cp_col = 1;
+
+        const char *cbdr = "\033[38;2;120;180;240;48;2;8;12;20m";
+        const char *cbg  = "\033[48;2;8;12;20m";
+        const char *crst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 Correlation \xce\xbe \xe2\x97\x86 ",
+                     cp_row, cp_col, cbdr);
+        for (int i = 21; i < cp_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", crst);
+
+        /* Row 1: Correlation length ξ */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     cp_row + 1, cp_col, cbdr, cbg);
+        p += sprintf(p, " \033[38;2;120;180;240m\xce\xbe = \033[1;38;2;");
+        if (corr_xi < 3.0f) p += sprintf(p, "80;60;200m");
+        else if (corr_xi < 10.0f) p += sprintf(p, "40;200;220m");
+        else p += sprintf(p, "240;250;255m");
+        p += sprintf(p, "%.2f", corr_xi);
+        p += sprintf(p, "\033[0;38;2;100;120;160m  R\xc2\xb2=");
+        p += sprintf(p, "\033[38;2;180;200;220m%.3f", corr_xi_r2);
+        p += sprintf(p, "%s", cbg);
+        { int used = 28; for (int i = used; i < cp_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", cbdr, crst);
+
+        /* Row 2: C(1) and density */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     cp_row + 2, cp_col, cbdr, cbg);
+        p += sprintf(p, " \033[38;2;100;140;180mC(1)=\033[38;2;180;220;255m%.4f",
+                     corr_c1);
+        p += sprintf(p, "  \033[38;2;100;140;180m\xcf\x81=\033[38;2;180;220;255m%.3f",
+                     corr_density);
+        p += sprintf(p, "%s", cbg);
+        { int used = 28; for (int i = used; i < cp_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", cbdr, crst);
+
+        /* Row 3: Phase interpretation */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     cp_row + 3, cp_col, cbdr, cbg);
+        {
+            const char *phase;
+            if (corr_xi < 2.0f) phase = "\033[38;2;80;60;200mdisordered";
+            else if (corr_xi < 5.0f) phase = "\033[38;2;40;200;220mshort-range";
+            else if (corr_xi < 15.0f) phase = "\033[38;2;200;240;255mnear-critical";
+            else phase = "\033[38;2;255;255;255mlong-range order";
+            p += sprintf(p, " \033[38;2;100;120;160mPhase: %s", phase);
+        }
+        p += sprintf(p, "%s", cbg);
+        { int used = 30; for (int i = used; i < cp_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", cbdr, crst);
+
+        /* Row 4: C(r) mini-graph (first 16 values as sparkline) */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     cp_row + 4, cp_col, cbdr, cbg);
+        p += sprintf(p, " \033[38;2;100;120;160mC(r) ");
+        {
+            const char *spark_chars[] = {"\xe2\x96\x81","\xe2\x96\x82","\xe2\x96\x83",
+                                         "\xe2\x96\x84","\xe2\x96\x85","\xe2\x96\x86",
+                                         "\xe2\x96\x87","\xe2\x96\x88"};
+            for (int r = 0; r < 24 && r <= CORR_MAX_R; r++) {
+                float c = corr_cr[r];
+                if (c < 0) c = 0;
+                if (c > 1) c = 1;
+                int lvl = (int)(c * 7.0f);
+                if (lvl > 7) lvl = 7;
+                /* Color: bright at short range, dim at long */
+                if (c > 0.5f) p += sprintf(p, "\033[38;2;200;240;255m%s", spark_chars[lvl]);
+                else if (c > 0.1f) p += sprintf(p, "\033[38;2;80;160;200m%s", spark_chars[lvl]);
+                else p += sprintf(p, "\033[38;2;40;60;100m%s", spark_chars[lvl]);
+            }
+        }
+        p += sprintf(p, "%s", cbg);
+        { int used = 5 + 24; for (int i = used; i < cp_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", cbdr, crst);
+
+        /* Row 5: ξ sparkline over time */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     cp_row + 5, cp_col, cbdr, cbg);
+        p += sprintf(p, " \033[38;2;100;120;160m\xce\xbe ");
+        if (corr_hist_count > 1) {
+            const char *spark_chars[] = {"\xe2\x96\x81","\xe2\x96\x82","\xe2\x96\x83",
+                                         "\xe2\x96\x84","\xe2\x96\x85","\xe2\x96\x86",
+                                         "\xe2\x96\x87","\xe2\x96\x88"};
+            int n = corr_hist_count < 30 ? corr_hist_count : 30;
+            for (int i = 0; i < n; i++) {
+                int idx = (corr_hist_idx - n + i + CORR_HIST_LEN) % CORR_HIST_LEN;
+                float xi = corr_hist_xi[idx] / (float)CORR_MAX_R;
+                if (xi > 1) xi = 1;
+                int lvl = (int)(xi * 7.0f);
+                if (lvl > 7) lvl = 7;
+                if (xi > 0.3f) p += sprintf(p, "\033[38;2;200;240;255m%s", spark_chars[lvl]);
+                else if (xi > 0.1f) p += sprintf(p, "\033[38;2;80;160;200m%s", spark_chars[lvl]);
+                else p += sprintf(p, "\033[38;2;60;40;160m%s", spark_chars[lvl]);
+            }
+        }
+        p += sprintf(p, "%s", cbg);
+        { int used = 3 + (corr_hist_count < 30 ? corr_hist_count : 30);
+          for (int i = used; i < cp_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", cbdr, crst);
+
+        /* Row 6: Toggle hint */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     cp_row + 6, cp_col, cbdr, cbg);
+        p += sprintf(p, " \033[38;2;80;100;140m[&]toggle  two-point correlation");
+        { int used = 36; for (int i = used; i < cp_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", cbdr, crst);
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", cp_row + 7, cp_col, cbdr);
+        for (int i = 0; i < cp_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", crst);
+    }
+
     /* ── Cell Probe Inspector overlay panel ──────────────────────────────── */
     if (probe_mode == 2 && probe_x >= 0 && probe_x < W && probe_y >= 0 && probe_y < H) {
         int pp_w = 48;
-        int pp_h = 28; /* total rows including borders */
+        int pp_h = 29; /* total rows including borders */
         /* Center panel vertically, place on left side to avoid overlay panel stacking on right */
         int pp_col = 2;
         int pp_row = 3;
@@ -9646,6 +10021,21 @@ static void render(int running, int speed_ms, int draw_mode) {
             p += sprintf(p, " %s%s%s", pdim, k > 0.7f ? "incompress" : k > 0.3f ? "structured" : "simple", prst);
             p += sprintf(p, "%s", pbg);
             PROBE_PAD(34);
+        }
+        PROBE_ROW_END();
+
+        /* Row 12b: Correlation */
+        PROBE_ROW_START();
+        {
+            float cr = corr_grid[py][px];
+            p += sprintf(p, " %sCorrelation:%s ", plbl, prst);
+            if (cr < 0.25f) p += sprintf(p, "\033[38;2;80;60;200m");
+            else if (cr < 0.5f) p += sprintf(p, "\033[38;2;40;200;220m");
+            else p += sprintf(p, "\033[38;2;220;240;255m");
+            p += sprintf(p, "%.4f", cr);
+            p += sprintf(p, " %s\xce\xbe=%.1f%s", pdim, corr_xi, prst);
+            p += sprintf(p, "%s", pbg);
+            PROBE_PAD(32);
         }
         PROBE_ROW_END();
 
@@ -10361,6 +10751,12 @@ int main(int argc, char **argv) {
                 kc_compute(); /* compute on toggle-on */
             }
         }
+        else if (key == '&') {
+            corr_mode = !corr_mode;
+            if (corr_mode) {
+                corr_compute(); /* compute on toggle-on */
+            }
+        }
         else if (key == '?') {
             if (probe_mode > 0) {
                 probe_mode = 0; /* toggle off */
@@ -10866,6 +11262,11 @@ int main(int argc, char **argv) {
         /* Auto-refresh Kolmogorov complexity every 4 generations */
         if (kc_mode && kc_stale && (generation % 4 == 0 || !running)) {
             kc_compute();
+        }
+
+        /* Auto-refresh spatial correlation every 4 generations */
+        if (corr_mode && corr_stale && (generation % 4 == 0 || !running)) {
+            corr_compute();
         }
 
         render(running, speed_ms, draw_mode);

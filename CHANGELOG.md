@@ -1,8 +1,17 @@
 # Changelog
 
 Development history organized by round. Each round adds one or two major
-features. The project grew from ~790 lines (Round 1) to ~10,800 lines
-(Round 42).
+features. The project grew from ~790 lines (Round 1) to ~11,200 lines
+(Round 43).
+
+## Round 43 — Spatial Correlation Length
+
+Two-point correlation function C(r) and correlation length ξ overlay.
+Measures how spatially correlated cell states are at different distances,
+extracting the characteristic scale of order. Per-cell heatmap from
+uncorrelated (violet) to strongly correlated (white). Stats panel shows ξ,
+C(1), R² fit quality, C(r) sparkline, and phase classification (disordered /
+short-range / near-critical / long-range). Toggle with `&`.
 
 ## Round 42 — Auto-Demo Mode
 

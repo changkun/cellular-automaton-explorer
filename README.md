@@ -41,6 +41,7 @@ your terminal.
   - [Topological Feature Map](#topological-feature-map)
   - [Renormalization Group Flow](#renormalization-group-flow)
   - [Kolmogorov Complexity](#kolmogorov-complexity)
+  - [Spatial Correlation Length](#spatial-correlation-length)
   - [Cell Probe Inspector](#cell-probe-inspector)
 - [Visualization](#visualization)
   - [Heatmap & Ghost Trails](#heatmap--ghost-trails)
@@ -83,7 +84,7 @@ Load an RLE pattern file:
 | Category | Features |
 |----------|----------|
 | **Simulation** | 10 rule presets, live mutation, multi-rule zones, emitters/absorbers, wormhole portals, dual-species ecosystems, temperature field |
-| **Analysis** | Shannon entropy, Lyapunov exponents, 2D FFT, fractal dimension, frequency detection, Wolfram classification, transfer entropy, phase-space attractors, causal light cones, prediction surprise, mutual information, composite complexity, topological features, renormalization group, Kolmogorov complexity |
+| **Analysis** | Shannon entropy, Lyapunov exponents, 2D FFT, fractal dimension, frequency detection, Wolfram classification, transfer entropy, phase-space attractors, causal light cones, prediction surprise, mutual information, composite complexity, topological features, renormalization group, Kolmogorov complexity, spatial correlation length |
 | **Interaction** | Mouse drawing, zoom/pan, kaleidoscope symmetry, pattern stamps, genetic rule search, time-travel replay |
 | **Visualization** | 24-bit true-color heatmaps, ghost trails, signal tracer, population sparkline, minimap, auto-demo mode |
 | **I/O** | Binary save/load, RLE import/export, PPM screenshots, timeline animation export |
@@ -168,6 +169,7 @@ Load an RLE pattern file:
 | `$` | Topological feature map (β₀ components, β₁ holes) |
 | `%` | Renormalization group flow |
 | `^` | Kolmogorov complexity (LZ77 compression) |
+| `&` | Spatial correlation length (two-point correlation ξ) |
 | `?` | Cell probe inspector (all metrics for clicked cell) |
 
 #### File I/O
@@ -429,11 +431,19 @@ Criticality score near 1.0 = scale-invariant = edge of chaos.
 Toggle: `^`. LZ77-style compression of local neighborhoods. Blue =
 compressible (ordered), gold = structured, red = incompressible (random).
 
+### Spatial Correlation Length
+
+Toggle: `&`. Two-point correlation function C(r) reveals the characteristic
+spatial scale ξ (xi) of order. Short ξ = disordered (random), long ξ =
+near-critical (large-scale structure). Per-cell heatmap: violet = uncorrelated,
+cyan = moderate, white = strongly correlated. Panel shows ξ, C(r) sparkline,
+and phase classification.
+
 ### Cell Probe Inspector
 
-Toggle: `?`. Click any cell to see all 14+ metrics at once in a unified panel:
+Toggle: `?`. Click any cell to see all 15+ metrics at once in a unified panel:
 entropy, temperature, Lyapunov, Fourier, fractal, surprisal, mutual info,
-Kolmogorov, complexity, frequency, flow, RG, topology.
+Kolmogorov, correlation, complexity, frequency, flow, RG, topology.
 
 ## Visualization
 

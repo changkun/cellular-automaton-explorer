@@ -85,6 +85,9 @@
  *                 Green=ergodic (averages match), magenta=non-ergodic (frozen)
  *   |           Toggle percolation analysis (cluster connectivity)
  *                 Gold=largest cluster, spectrum=others; detects spanning clusters
+ *   ;           Toggle Hamiltonian energy landscape (Ising spin analogy)
+ *                 Maps alive/dead → spin ±1; H = -s·Σs_neighbors
+ *                 Blue=energy well (stable), red=frustrated (domain wall)
  *   K           Toggle spacetime kymograph (1D slice through time)
  *                 Y-axis=time (scrolling up), X-axis=space (scan row)
  *                 Arrow Up/Down to move scan row; gliders appear as diagonals
@@ -665,6 +668,31 @@ static float perc_hist_density[PERC_HIST_LEN]; /* density history */
 static int   perc_hist_idx = 0;
 static int   perc_hist_count = 0;
 
+/* ── Hamiltonian Energy Landscape (Ising Analogy) ────────────────────────── */
+/* Maps alive/dead cells to spin +1/-1 (Ising model).  Per-cell Hamiltonian
+   energy H_i = -J * s_i * Σ s_neighbors measures neighbor alignment.
+   Low energy (deep blue) = stable structures in energy wells.
+   High energy (red) = frustrated boundaries, domain walls.
+   Magnetization m = mean spin, susceptibility χ = variance of local m.
+   Toggle with ';' key. */
+
+#define ISING_HIST_LEN 64  /* sparkline history length */
+
+static float ising_energy[MAX_H][MAX_W];      /* per-cell energy -4J..+4J, normalized to -1..+1 */
+static int   ising_mode = 0;
+static int   ising_stale = 1;
+static float ising_total_energy = 0.0f;       /* total Hamiltonian (sum of all cell energies) */
+static float ising_magnetization = 0.0f;      /* mean spin: +1=all alive, -1=all dead */
+static float ising_susceptibility = 0.0f;     /* χ = variance of local magnetization */
+static int   ising_domain_walls = 0;          /* count of misaligned neighbor pairs */
+static int   ising_frustrated = 0;            /* cells with H > 0 (locally unfavorable) */
+
+/* Sparkline history */
+static float ising_hist_energy[ISING_HIST_LEN];
+static float ising_hist_mag[ISING_HIST_LEN];
+static int   ising_hist_idx = 0;
+static int   ising_hist_count = 0;
+
 /* ── Spacetime Kymograph ─────────────────────────────────────────────────── */
 /* Displays a 1D horizontal slice of the grid evolving over time as a 2D
    spacetime diagram.  Y-axis = time (scrolling upward), X-axis = grid row.
@@ -700,7 +728,7 @@ static int   probe_y = -1;            /* selected cell y */
    Toggle with ')' key. TAB cycles the right panel, '`' cycles the left. */
 
 /* Overlay table: ordered list of analysis overlays for cycling */
-#define N_SPLIT_OVERLAYS 22
+#define N_SPLIT_OVERLAYS 23
 typedef struct {
     const char *name;   /* short display name */
     char key;           /* toggle key character */
@@ -729,6 +757,7 @@ static const SplitOverlayInfo split_overlay_table[N_SPLIT_OVERLAYS] = {
     { "Wolfram",       'C' },  /* 19 */
     { "Census",        'v' },  /* 20 */
     { "Percolation",   '|' },  /* 21 */
+    { "Ising",         ';' },  /* 22 */
 };
 
 static int split_mode = 0;         /* 0=off, 1=on */
@@ -785,7 +814,7 @@ static void split_set_overlay(int idx) {
     surp_mode = 0; mi_mode = 0; cplx_mode = 0; topo_mode = 0;
     rg_mode = 0; kc_mode = 0; corr_mode = 0; eprod_mode = 0;
     wave_mode = 0; vort_mode = 0; ergo_mode = 0; census_mode = 0;
-    perc_mode = 0;
+    perc_mode = 0; ising_mode = 0;
 
     switch (idx) {
         case  0: break;
@@ -810,6 +839,7 @@ static void split_set_overlay(int idx) {
         case 19: wolfram_mode = 1; break;
         case 20: census_mode = 1; break;
         case 21: perc_mode = 1; break;
+        case 22: ising_mode = 1; break;
     }
 }
 
@@ -835,6 +865,7 @@ static int split_detect_current(void) {
     if (wolfram_mode) return 19;
     if (census_mode) return 20;
     if (perc_mode) return 21;
+    if (ising_mode) return 22;
     return 0;
 }
 
@@ -1746,6 +1777,7 @@ static void grid_step(void) {
     vort_stale = 1;
     ergo_stale = 1;
     perc_stale = 1;
+    ising_stale = 1;
 
     /* Always record frames for surprise field (cheap memcpy) */
     surp_record_frame();
@@ -2415,6 +2447,7 @@ static void wave_compute(void);
 static void vort_compute(void);
 static void ergo_compute(void);
 static void perc_compute(void);
+static void ising_compute(void);
 
 static void demo_reset_overlays(void) {
     freq_mode = 0;
@@ -2434,6 +2467,7 @@ static void demo_reset_overlays(void) {
     vort_mode = 0;
     ergo_mode = 0;
     perc_mode = 0;
+    ising_mode = 0;
     fourier_mode = 0;
     fractal_mode = 0;
     wolfram_mode = 0;
@@ -2498,6 +2532,7 @@ static void demo_setup_scene(int idx) {
             case '*': vort_mode = 1; vort_compute(); break;
             case '(': ergo_mode = 1; ergo_compute(); break;
             case '|': perc_mode = 1; perc_compute(); break;
+            case ';': ising_mode = 1; ising_compute(); break;
             case 'h': heatmap_mode = 1; break;
             case 'g': show_graph = 1; break;
         }
@@ -5871,6 +5906,104 @@ static RGB perc_cluster_rgb(int cluster_idx) {
     return (RGB){(unsigned char)(r * 255), (unsigned char)(g * 255), (unsigned char)(b * 255)};
 }
 
+/* ── Hamiltonian Energy Landscape (Ising) computation ────────────────────── */
+/* Ising model analogy: s_i = +1 (alive), s_i = -1 (dead).
+   Per-cell energy: H_i = -J * s_i * Σ_neighbors s_j   (J=1, coupling constant)
+   Low H = aligned neighbors (stable), High H = misaligned (frustrated).
+   Magnetization m = <s>, susceptibility χ = <m²> - <m>².  */
+
+static void ising_compute(void) {
+    float total_H = 0.0f;
+    float sum_spin = 0.0f;
+    float sum_local_m = 0.0f;
+    float sum_local_m2 = 0.0f;
+    int walls = 0;
+    int frustrated = 0;
+    int total_cells = W * H;
+
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            int s = grid[y][x] > 0 ? 1 : -1;
+            sum_spin += s;
+
+            /* Sum neighbor spins (Moore neighborhood, 8 neighbors) */
+            int nn_sum = 0;
+            int nn_count = 0;
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    if (dx == 0 && dy == 0) continue;
+                    int nx = x + dx, ny = y + dy;
+                    if (nx >= 0 && nx < W && ny >= 0 && ny < H) {
+                        int sn = grid[ny][nx] > 0 ? 1 : -1;
+                        nn_sum += sn;
+                        nn_count++;
+                        /* Count domain walls (misaligned pairs, only right/down to avoid double counting) */
+                        if ((dx == 1 && dy == 0) || (dx == 0 && dy == 1)) {
+                            if (s != sn) walls++;
+                        }
+                    }
+                }
+            }
+
+            /* Per-cell Hamiltonian: H_i = -s_i * Σ s_j */
+            float H_i = (float)(-s * nn_sum);
+            /* Normalize to [-1, +1]: max |H_i| = 8 (all 8 neighbors) */
+            float H_norm = H_i / 8.0f;
+            ising_energy[y][x] = H_norm;
+            total_H += H_i;
+
+            if (H_i > 0) frustrated++;
+
+            /* Local magnetization in 3x3 block */
+            float local_m = (float)(s + nn_sum) / (float)(1 + nn_count);
+            sum_local_m += local_m;
+            sum_local_m2 += local_m * local_m;
+        }
+    }
+
+    ising_total_energy = total_H / (float)total_cells;
+    ising_magnetization = sum_spin / (float)total_cells;
+    ising_domain_walls = walls;
+    ising_frustrated = frustrated;
+
+    /* Susceptibility: variance of local magnetization */
+    float mean_m = sum_local_m / (float)total_cells;
+    float mean_m2 = sum_local_m2 / (float)total_cells;
+    ising_susceptibility = mean_m2 - mean_m * mean_m;
+
+    /* Record sparkline history */
+    ising_hist_energy[ising_hist_idx] = ising_total_energy;
+    ising_hist_mag[ising_hist_idx] = ising_magnetization;
+    ising_hist_idx = (ising_hist_idx + 1) % ISING_HIST_LEN;
+    if (ising_hist_count < ISING_HIST_LEN) ising_hist_count++;
+
+    ising_stale = 0;
+}
+
+/* Ising energy to RGB:
+   Deep blue (H < 0, stable energy well) → dark (H ≈ 0, neutral) → red (H > 0, frustrated)
+   Domain walls glow bright at high |gradient|. */
+static RGB ising_to_rgb(float H_norm) {
+    /* H_norm in [-1, +1]: -1 = deepest well, +1 = most frustrated */
+    if (H_norm < -0.5f) {
+        /* Deep well: dark blue → bright blue */
+        float t = (H_norm + 1.0f) * 2.0f; /* 0..1 */
+        return (RGB){0, (unsigned char)(30 + 60 * t), (unsigned char)(80 + 175 * t)};
+    } else if (H_norm < 0.0f) {
+        /* Shallow well: blue → cyan */
+        float t = (H_norm + 0.5f) * 2.0f; /* 0..1 */
+        return (RGB){0, (unsigned char)(90 + 100 * t), (unsigned char)(255 - 55 * t)};
+    } else if (H_norm < 0.5f) {
+        /* Mild frustration: yellow → orange */
+        float t = H_norm * 2.0f; /* 0..1 */
+        return (RGB){(unsigned char)(180 + 75 * t), (unsigned char)(180 - 80 * t), (unsigned char)(40 - 40 * t)};
+    } else {
+        /* Strong frustration: orange → bright red */
+        float t = (H_norm - 0.5f) * 2.0f; /* 0..1 */
+        return (RGB){(unsigned char)(255), (unsigned char)(100 - 80 * t), (unsigned char)(20 * (1.0f - t))};
+    }
+}
+
 /* ── Wave Mechanics computation ───────────────────────────────────────────── */
 /* Damped 2D wave equation: d²u/dt² = c²∇²u - γ du/dt + S(x,y,t)
    where S = impulses from cell births (+) and deaths (-).
@@ -6380,6 +6513,7 @@ static void split_ensure_computed(int idx) {
         case 19: if (wolfram_stale) wolfram_classify(); break;
         case 20: if (census_stale) census_scan(); break;
         case 21: if (perc_stale) perc_compute(); break;
+        case 22: if (ising_stale) ising_compute(); break;
         default: break;
     }
 }
@@ -7976,6 +8110,22 @@ static int cell_color(int x, int y, RGB *out) {
         return 0;
     }
 
+    /* Hamiltonian energy landscape (Ising analogy) overlay */
+    if (ising_mode) {
+        float H = ising_energy[y][x];
+        if (grid[y][x] || (H > -0.95f && H < 0.95f)) {
+            *out = ising_to_rgb(H);
+            if (grid[y][x]) {
+                /* Brighten alive cells */
+                out->r = (unsigned char)(out->r < 210 ? out->r + 45 : 255);
+                out->g = (unsigned char)(out->g < 210 ? out->g + 45 : 255);
+                out->b = (unsigned char)(out->b < 210 ? out->b + 45 : 255);
+            }
+            return grid[y][x] ? 1 : 29; /* 29 = ising ghost */
+        }
+        return 0;
+    }
+
     /* Renormalization group flow overlay: multi-scale structure */
     if (rg_mode) {
         if (grid[y][x]) {
@@ -8489,7 +8639,7 @@ static void render(int running, int speed_ms, int draw_mode) {
     int split_saved_surp, split_saved_mi, split_saved_cplx, split_saved_topo;
     int split_saved_rg, split_saved_kc, split_saved_corr, split_saved_eprod;
     int split_saved_wave, split_saved_vort, split_saved_ergo, split_saved_census;
-    int split_saved_perc;
+    int split_saved_perc, split_saved_ising;
     int split_mid = view_w / 2; /* column divider position */
 
     if (split_mode) {
@@ -8505,6 +8655,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         split_saved_wave = wave_mode; split_saved_vort = vort_mode;
         split_saved_ergo = ergo_mode; split_saved_census = census_mode;
         split_saved_perc = perc_mode;
+        split_saved_ising = ising_mode;
 
         /* Ensure data is computed for both panels */
         split_ensure_computed(split_left);
@@ -8761,6 +8912,7 @@ static void render(int running, int speed_ms, int draw_mode) {
             wave_mode = split_saved_wave; vort_mode = split_saved_vort;
             ergo_mode = split_saved_ergo; census_mode = split_saved_census;
             perc_mode = split_saved_perc;
+            ising_mode = split_saved_ising;
         } else {
         /* Normal (non-split) rendering */
         for (int row = 0; row < usable_rows && row < view_h; row++) {
@@ -11979,6 +12131,174 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", pcrst);
     }
 
+    /* ── Hamiltonian Energy Landscape (Ising) overlay panel ───────────────── */
+    if (ising_mode) {
+        int is_w = 46;
+        int is_col = term_cols - is_w - 2;
+        int is_row = 3;
+        if (entropy_mode)   is_row += 8;
+        if (temp_mode)      is_row += 9;
+        if (lyapunov_mode)  is_row += 8;
+        if (fourier_mode)   is_row += 18;
+        if (fractal_mode)   is_row += 11;
+        if (wolfram_mode)   is_row += 14;
+        if (flow_mode)      is_row += 9;
+        if (attractor_mode) is_row += 8;
+        if (cone_mode >= 1) is_row += 8;
+        if (surp_mode)      is_row += 8;
+        if (mi_mode)        is_row += 12;
+        if (cplx_mode)      is_row += 11;
+        if (topo_mode)      is_row += 11;
+        if (rg_mode)        is_row += 11;
+        if (kc_mode)        is_row += 9;
+        if (corr_mode)      is_row += 9;
+        if (eprod_mode)     is_row += 9;
+        if (vort_mode)      is_row += 9;
+        if (wave_mode)      is_row += 9;
+        if (ergo_mode)      is_row += 10;
+        if (perc_mode)      is_row += 10;
+        if (is_col < 1) is_col = 1;
+
+        const char *isbdr = "\033[38;2;100;140;255;48;2;8;10;20m";
+        const char *isbg  = "\033[48;2;8;10;20m";
+        const char *isrst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 \xe2\x9a\x9b Ising Energy Landscape ",
+                     is_row, is_col, isbdr);
+        for (int i = 28; i < is_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", isrst);
+
+        /* Row 1: Total energy & magnetization */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     is_row + 1, is_col, isbdr, isbg);
+        p += sprintf(p, " \033[38;2;100;140;220mH=");
+        if (ising_total_energy < -2.0f)
+            p += sprintf(p, "\033[38;2;60;100;255m%+.2f", ising_total_energy);
+        else if (ising_total_energy < 0.0f)
+            p += sprintf(p, "\033[38;2;100;180;220m%+.2f", ising_total_energy);
+        else
+            p += sprintf(p, "\033[38;2;255;100;60m%+.2f", ising_total_energy);
+        p += sprintf(p, "\033[0;38;2;100;120;160m%s  m=", isbg);
+        if (ising_magnetization > 0.3f)
+            p += sprintf(p, "\033[38;2;100;220;100m%+.3f", ising_magnetization);
+        else if (ising_magnetization < -0.3f)
+            p += sprintf(p, "\033[38;2;220;100;100m%+.3f", ising_magnetization);
+        else
+            p += sprintf(p, "\033[38;2;180;180;100m%+.3f", ising_magnetization);
+        p += sprintf(p, "%s", isbg);
+        { int used = 30; for (int i = used; i < is_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", isbdr, isrst);
+
+        /* Row 2: Susceptibility & frustrated cells */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     is_row + 2, is_col, isbdr, isbg);
+        p += sprintf(p, " \033[38;2;100;140;220m\xcf\x87=");
+        p += sprintf(p, "\033[38;2;180;160;220m%.4f", ising_susceptibility);
+        p += sprintf(p, "\033[0;38;2;100;120;160m%s  frust:", isbg);
+        p += sprintf(p, "\033[38;2;255;120;60m%d", ising_frustrated);
+        p += sprintf(p, "%s", isbg);
+        { int used = 30; for (int i = used; i < is_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", isbdr, isrst);
+
+        /* Row 3: Domain walls */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     is_row + 3, is_col, isbdr, isbg);
+        p += sprintf(p, " \033[38;2;100;140;220mDomain walls: ");
+        p += sprintf(p, "\033[38;2;220;180;80m%d", ising_domain_walls);
+        float wall_density = (float)ising_domain_walls / (float)(W * H * 2);
+        p += sprintf(p, "\033[0;38;2;100;120;160m%s  (%.1f%%)", isbg, wall_density * 100.0f);
+        p += sprintf(p, "%s", isbg);
+        { int used = 34; for (int i = used; i < is_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", isbdr, isrst);
+
+        /* Row 4: Color legend */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     is_row + 4, is_col, isbdr, isbg);
+        p += sprintf(p, " \033[38;2;40;60;200m\xe2\x96\x88\xe2\x96\x88");
+        p += sprintf(p, "\033[38;2;80;140;200m\xe2\x96\x88");
+        p += sprintf(p, "\033[38;2;100;180;200m\xe2\x96\x88");
+        p += sprintf(p, "\033[38;2;80;100;120mwell");
+        p += sprintf(p, "  \033[38;2;180;180;40m\xe2\x96\x88\xe2\x96\x88");
+        p += sprintf(p, "\033[38;2;240;120;20m\xe2\x96\x88");
+        p += sprintf(p, "\033[38;2;255;40;0m\xe2\x96\x88");
+        p += sprintf(p, "\033[38;2;180;80;60mfrust");
+        p += sprintf(p, "%s", isbg);
+        { int used = 25; for (int i = used; i < is_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", isbdr, isrst);
+
+        /* Row 5: Energy sparkline */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     is_row + 5, is_col, isbdr, isbg);
+        p += sprintf(p, " \033[38;2;80;100;160mH ");
+        if (ising_hist_count > 1) {
+            const char *spark_chars[] = {"\xe2\x96\x81","\xe2\x96\x82","\xe2\x96\x83",
+                                         "\xe2\x96\x84","\xe2\x96\x85","\xe2\x96\x86",
+                                         "\xe2\x96\x87","\xe2\x96\x88"};
+            /* Find min/max for normalization */
+            float emin = 0, emax = -8;
+            int n = ising_hist_count < 30 ? ising_hist_count : 30;
+            for (int i = 0; i < n; i++) {
+                int idx = (ising_hist_idx - n + i + ISING_HIST_LEN) % ISING_HIST_LEN;
+                float e = ising_hist_energy[idx];
+                if (e < emin) emin = e;
+                if (e > emax) emax = e;
+            }
+            float erange = emax - emin;
+            if (erange < 0.01f) erange = 0.01f;
+            for (int i = 0; i < n; i++) {
+                int idx = (ising_hist_idx - n + i + ISING_HIST_LEN) % ISING_HIST_LEN;
+                float v = (ising_hist_energy[idx] - emin) / erange;
+                if (v < 0.0f) v = 0.0f;
+                if (v > 1.0f) v = 1.0f;
+                int lvl = (int)(v * 7.0f);
+                if (lvl > 7) lvl = 7;
+                /* Blue for low energy, red for high */
+                if (v < 0.5f)
+                    p += sprintf(p, "\033[38;2;60;100;%dm%s", 150 + (int)(v * 200), spark_chars[lvl]);
+                else
+                    p += sprintf(p, "\033[38;2;%d;80;60m%s", 150 + (int)((v - 0.5f) * 200), spark_chars[lvl]);
+            }
+        }
+        p += sprintf(p, "%s", isbg);
+        { int used = 2 + (ising_hist_count < 30 ? ising_hist_count : 30);
+          for (int i = used; i < is_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", isbdr, isrst);
+
+        /* Row 6: Phase interpretation */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     is_row + 6, is_col, isbdr, isbg);
+        p += sprintf(p, " \033[38;2;100;120;160mPhase: ");
+        float abs_m = ising_magnetization < 0 ? -ising_magnetization : ising_magnetization;
+        if (abs_m > 0.8f)
+            p += sprintf(p, "\033[38;2;100;200;255mOrdered (ferromagnetic)");
+        else if (abs_m > 0.4f)
+            p += sprintf(p, "\033[38;2;180;180;100mPartially ordered");
+        else if (ising_susceptibility > 0.15f)
+            p += sprintf(p, "\033[1;38;2;255;220;80mCritical (high \xcf\x87)");
+        else if (abs_m < 0.1f)
+            p += sprintf(p, "\033[38;2;255;100;80mDisordered (paramagnetic)");
+        else
+            p += sprintf(p, "\033[38;2;160;140;120mMixed phase");
+        p += sprintf(p, "%s", isbg);
+        { int used = 38; for (int i = used; i < is_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", isbdr, isrst);
+
+        /* Row 7: Toggle hint */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     is_row + 7, is_col, isbdr, isbg);
+        p += sprintf(p, " \033[38;2;60;80;120m[;]toggle  s=\xc2\xb1" "1 spin model");
+        { int used = 32; for (int i = used; i < is_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", isbdr, isrst);
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", is_row + 8, is_col, isbdr);
+        for (int i = 0; i < is_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", isrst);
+    }
+
     /* ── Cell Probe Inspector overlay panel ──────────────────────────────── */
     if (probe_mode == 2 && probe_x >= 0 && probe_x < W && probe_y >= 0 && probe_y < H) {
         int pp_w = 48;
@@ -13031,6 +13351,12 @@ int main(int argc, char **argv) {
                 perc_compute(); /* compute on toggle-on */
             }
         }
+        else if (key == ';') {
+            ising_mode = !ising_mode;
+            if (ising_mode) {
+                ising_compute(); /* compute on toggle-on */
+            }
+        }
         else if (key == 'K') {
             kymo_mode = !kymo_mode;
             if (kymo_mode) {
@@ -13607,6 +13933,11 @@ int main(int argc, char **argv) {
         /* Auto-refresh percolation analysis every 2 generations */
         if (perc_mode && perc_stale && (generation % 2 == 0 || !running)) {
             perc_compute();
+        }
+
+        /* Auto-refresh Ising energy landscape every 2 generations */
+        if (ising_mode && ising_stale && (generation % 2 == 0 || !running)) {
+            ising_compute();
         }
 
         /* Auto-refresh wave mechanics every generation (continuous propagation) */

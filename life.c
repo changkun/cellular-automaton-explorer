@@ -1067,7 +1067,7 @@ static int   probe_y = -1;            /* selected cell y */
    Toggle with '\\' key. TAB cycles the right panel, '`' cycles the left. */
 
 /* Overlay table: ordered list of analysis overlays for cycling */
-#define N_SPLIT_OVERLAYS 44
+#define N_SPLIT_OVERLAYS 45
 typedef struct {
     const char *name;   /* short display name */
     char key;           /* toggle key character */
@@ -1118,6 +1118,7 @@ static const SplitOverlayInfo split_overlay_table[N_SPLIT_OVERLAYS] = {
     { "Roughness",    'V'-64 },  /* 41: Ctrl-V */
     { "Recurrence",   'Y'-64 },  /* 42: Ctrl-Y */
     { "MultiFrac",    'W'-64 },  /* 43: Ctrl-W */
+    { "FisherInfo",   'X'-64 },  /* 44: Ctrl-X */
 };
 
 static int split_mode = 0;         /* 0=off, 1=on */
@@ -2230,6 +2231,7 @@ static void split_set_overlay(int idx) {
         case 41: ir_mode = 1; break;
         case 42: pr_mode = 1; break;
         case 43: mfs_mode = 1; break;
+        case 44: fi_mode = 1; break;
     }
 }
 
@@ -2277,6 +2279,7 @@ static int split_detect_current(void) {
     if (ir_mode) return 41;
     if (pr_mode) return 42;
     if (mfs_mode) return 43;
+    if (fi_mode) return 44;
     return 0;
 }
 
@@ -11506,6 +11509,7 @@ static void split_ensure_computed(int idx) {
         case 41: if (ir_stale) ir_compute(); break;
         case 42: if (pr_stale) pr_compute(); break;
         case 43: if (mfs_stale) mfs_compute(); break;
+        case 44: if (fi_stale) fi_compute(); break;
         default: break;
     }
 }
@@ -24274,12 +24278,12 @@ int main(int argc, char **argv) {
                 }
             }
         }
-        else if (key == '1') {
+        else if (key == 24) { /* Ctrl-X: Fisher Information Field */
             if (!ecosystem_mode) {
                 fi_mode = !fi_mode;
                 if (fi_mode) {
                     fi_reset();
-                    flash_set("Fisher Information: phase boundary sensitivity [1]exit");
+                    flash_set("Fisher Information: phase boundary sensitivity [^X]exit");
                     printf("\033[2J"); fflush(stdout);
                 } else {
                     flash_set("Fisher Information off");

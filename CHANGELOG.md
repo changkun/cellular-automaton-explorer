@@ -1,8 +1,28 @@
 # Changelog
 
 Development history organized by round. Each round adds one or two major
-features. The project grew from ~790 lines (Round 1) to ~26,000 lines
-(Round 80).
+features. The project grew from ~790 lines (Round 1) to ~26,000+ lines
+(Round 81).
+
+## Round 81 — Evolutionary Game Theory Overlay (Spatial Prisoner's Dilemma)
+
+Adds the **Evolutionary Game Theory** overlay — the first game-theoretic
+analysis in the project. Press `Ctrl-A` to map each live cell to a
+strategy (Cooperate or Defect) based on neighborhood density, then
+compute payoffs using the classical Prisoner's Dilemma matrix (T=5, R=3,
+P=1, S=0) against all Moore neighbors. Cooperator clusters form in dense
+regions; defectors exploit sparse boundaries — reproducing the classic
+Nowak & May (1992) spatial reciprocity result where lattice structure
+promotes cooperation via cluster formation.
+
+**Visualization**: blue spectrum (cooperators, dark=low payoff →
+bright cyan=thriving) vs red spectrum (defectors, crimson=exploited →
+orange=exploiting). Sidebar shows cooperation frequency, average payoff
+by strategy, spatial reciprocity index (positive = spatial structure helps
+cooperation), invasion front velocity, boundary cell count, payoff
+distribution histogram, and cooperation frequency sparkline over time.
+
+Overlay index 46, bringing the total to **47 overlays**.
 
 ## Round 80 — Radial Distribution Function g(r) Overlay
 

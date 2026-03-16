@@ -1069,7 +1069,7 @@ static int   probe_y = -1;            /* selected cell y */
    Toggle with '\\' key. TAB cycles the right panel, '`' cycles the left. */
 
 /* Overlay table: ordered list of analysis overlays for cycling */
-#define N_SPLIT_OVERLAYS 46
+#define N_SPLIT_OVERLAYS 47
 typedef struct {
     const char *name;   /* short display name */
     char key;           /* toggle key character */
@@ -1122,6 +1122,7 @@ static const SplitOverlayInfo split_overlay_table[N_SPLIT_OVERLAYS] = {
     { "MultiFrac",    'W'-64 },  /* 43: Ctrl-W */
     { "FisherInfo",   'X'-64 },  /* 44: Ctrl-X */
     { "RadialDist",   'B'-64 },  /* 45: Ctrl-B */
+    { "EvoGame",      'A'-64 },  /* 46: Ctrl-A */
 };
 
 static int split_mode = 0;         /* 0=off, 1=on */
@@ -1536,6 +1537,84 @@ static void rdf_reset(void) {
     memset(rdf_gr, 0, sizeof(rdf_gr));
     memset(rdf_grid, 0, sizeof(float) * MAX_H * MAX_W);
     memset(rdf_hist, 0, sizeof(rdf_hist));
+}
+
+/* ── Evolutionary Game Theory — Spatial Prisoner's Dilemma ─────────────────── */
+/* Maps each live cell to a strategy (Cooperate/Defect) based on neighborhood
+   density.  Computes payoffs using the classical Prisoner's Dilemma matrix
+   against all Moore neighbors, then visualizes per-cell payoff as a heatmap
+   (blue=cooperators thriving, red=defectors exploiting).  Strategy classification
+   shows cooperator clusters, defector invasions, and tit-for-tat boundaries.
+   Tracks cooperation frequency, average payoff by strategy, spatial reciprocity
+   index (Nowak & May 1992), invasion front velocity, and payoff distribution.
+   Spatial structure promotes cooperation via cluster formation — a classic
+   result from evolutionary dynamics on lattices.
+   Toggle with Ctrl-A key. */
+
+/* Prisoner's Dilemma payoff matrix:
+   Both Cooperate: R=3, Both Defect: P=1
+   C vs D: S=0 (sucker), D vs C: T=5 (temptation)
+   Satisfies T > R > P > S and 2R > T + S */
+#define EGT_R  3.0f   /* reward for mutual cooperation */
+#define EGT_T  5.0f   /* temptation to defect */
+#define EGT_S  0.0f   /* sucker's payoff */
+#define EGT_P  1.0f   /* punishment for mutual defection */
+
+#define EGT_HIST_LEN   64    /* sparkline history depth */
+#define EGT_PAY_BINS   20    /* payoff histogram bins */
+
+static int   egt_mode = 0;
+static int   egt_stale = 1;
+
+/* Per-cell data */
+static unsigned char egt_strategy[MAX_H][MAX_W];  /* 0=Defect, 1=Cooperate */
+static float         egt_payoff[MAX_H][MAX_W];     /* total payoff vs neighbors */
+static float         egt_grid[MAX_H][MAX_W];       /* normalized payoff for color */
+
+/* Global stats */
+static float egt_coop_freq = 0.0f;       /* fraction of live cells that cooperate */
+static float egt_avg_payoff_c = 0.0f;    /* mean payoff of cooperators */
+static float egt_avg_payoff_d = 0.0f;    /* mean payoff of defectors */
+static float egt_reciprocity = 0.0f;     /* spatial reciprocity index */
+static float egt_front_velocity = 0.0f;  /* invasion front velocity (C/D boundary change rate) */
+static int   egt_n_coop = 0;             /* cooperator count */
+static int   egt_n_defect = 0;           /* defector count */
+static int   egt_n_boundary = 0;         /* C-D boundary cells */
+static int   egt_prev_boundary = 0;      /* previous boundary count for velocity */
+
+/* Payoff distribution histogram */
+static int   egt_pay_hist[EGT_PAY_BINS];
+static float egt_pay_min = 0.0f;
+static float egt_pay_max = 0.0f;
+
+/* Sparkline histories */
+static float egt_hist_coop[EGT_HIST_LEN];     /* cooperation frequency over time */
+static float egt_hist_payoff[EGT_HIST_LEN];   /* mean payoff over time */
+static int   egt_hist_idx = 0;
+static int   egt_hist_count = 0;
+
+static void egt_compute(void);
+static void egt_reset(void) {
+    egt_stale = 1;
+    egt_coop_freq = 0.0f;
+    egt_avg_payoff_c = 0.0f;
+    egt_avg_payoff_d = 0.0f;
+    egt_reciprocity = 0.0f;
+    egt_front_velocity = 0.0f;
+    egt_n_coop = 0;
+    egt_n_defect = 0;
+    egt_n_boundary = 0;
+    egt_prev_boundary = 0;
+    egt_pay_min = 0.0f;
+    egt_pay_max = 0.0f;
+    egt_hist_idx = 0;
+    egt_hist_count = 0;
+    memset(egt_strategy, 0, sizeof(egt_strategy));
+    memset(egt_payoff, 0, sizeof(float) * MAX_H * MAX_W);
+    memset(egt_grid, 0, sizeof(float) * MAX_H * MAX_W);
+    memset(egt_pay_hist, 0, sizeof(egt_pay_hist));
+    memset(egt_hist_coop, 0, sizeof(egt_hist_coop));
+    memset(egt_hist_payoff, 0, sizeof(egt_hist_payoff));
 }
 
 /* ── Symmetry Group Detection ─────────────────────────────────────────────── */
@@ -2350,6 +2429,7 @@ static int split_detect_current(void) {
     if (mfs_mode) return 43;
     if (fi_mode) return 44;
     if (rdf_mode) return 45;
+    if (egt_mode) return 46;
     return 0;
 }
 
@@ -3708,6 +3788,7 @@ static void grid_step(void) {
     ew_stale = 1;
     fi_stale = 1;
     rdf_stale = 1;
+    egt_stale = 1;
     sg_stale = 1;
     td_stale = 1;
     mf_stale = 1;
@@ -9082,6 +9163,171 @@ static void rdf_compute(void) {
     if (rdf_hist_count < RDF_HIST_LEN) rdf_hist_count++;
 }
 
+/* ── Evolutionary Game Theory computation ──────────────────────────────────── */
+static void egt_compute(void) {
+    egt_stale = 0;
+
+    /* Moore neighborhood offsets (8-connected) */
+    static const int dx8[8] = {-1, 0, 1, -1, 1, -1, 0, 1};
+    static const int dy8[8] = {-1,-1,-1,  0, 0,  1, 1, 1};
+
+    /* Phase 1: Assign strategies based on local neighborhood density.
+       High local density → Cooperator (cells in clusters cooperate).
+       Low local density  → Defector  (isolated cells defect).
+       Threshold: 3 live neighbors out of 8 possible (incl. self context).
+       This mirrors the Nowak & May (1992) spatial PD setup where strategy
+       correlates with local structure. */
+    int live_count = 0;
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            if (!grid[y][x]) {
+                egt_strategy[y][x] = 0;
+                continue;
+            }
+            live_count++;
+            int neighbors = 0;
+            for (int d = 0; d < 8; d++) {
+                int nx = x + dx8[d], ny = y + dy8[d];
+                if (nx >= 0 && nx < W && ny >= 0 && ny < H && grid[ny][nx])
+                    neighbors++;
+            }
+            /* Dense neighborhoods → cooperate; sparse → defect */
+            egt_strategy[y][x] = (neighbors >= 3) ? 1 : 0;
+        }
+    }
+
+    if (live_count < 2) {
+        memset(egt_payoff, 0, sizeof(float) * H * MAX_W);
+        memset(egt_grid, 0, sizeof(float) * H * MAX_W);
+        egt_coop_freq = 0; egt_avg_payoff_c = 0; egt_avg_payoff_d = 0;
+        egt_reciprocity = 0; egt_n_coop = 0; egt_n_defect = 0;
+        egt_n_boundary = 0;
+        return;
+    }
+
+    /* Phase 2: Compute payoffs — each live cell plays PD against all live neighbors */
+    float global_max = 0.0f;
+    float global_min = 1e30f;
+    double sum_c = 0.0, sum_d = 0.0;
+    int cnt_c = 0, cnt_d = 0;
+    int boundary = 0;
+    double cc_games = 0, cd_games = 0, dc_games = 0, dd_games = 0;
+
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            if (!grid[y][x]) {
+                egt_payoff[y][x] = 0.0f;
+                continue;
+            }
+            int my_strat = egt_strategy[y][x];
+            float payoff = 0.0f;
+            int has_diff_neighbor = 0;
+
+            for (int d = 0; d < 8; d++) {
+                int nx = x + dx8[d], ny = y + dy8[d];
+                if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
+                if (!grid[ny][nx]) continue;
+
+                int their_strat = egt_strategy[ny][nx];
+                if (my_strat == 1 && their_strat == 1) {
+                    payoff += EGT_R;    /* mutual cooperation */
+                    cc_games += 1.0;
+                } else if (my_strat == 1 && their_strat == 0) {
+                    payoff += EGT_S;    /* sucker */
+                    cd_games += 1.0;
+                } else if (my_strat == 0 && their_strat == 1) {
+                    payoff += EGT_T;    /* temptation */
+                    dc_games += 1.0;
+                } else {
+                    payoff += EGT_P;    /* mutual defection */
+                    dd_games += 1.0;
+                }
+                if (their_strat != my_strat) has_diff_neighbor = 1;
+            }
+
+            egt_payoff[y][x] = payoff;
+            if (payoff > global_max) global_max = payoff;
+            if (payoff < global_min) global_min = payoff;
+
+            if (my_strat == 1) { sum_c += payoff; cnt_c++; }
+            else               { sum_d += payoff; cnt_d++; }
+
+            if (has_diff_neighbor) boundary++;
+        }
+    }
+
+    egt_n_coop = cnt_c;
+    egt_n_defect = cnt_d;
+    egt_coop_freq = (float)cnt_c / (cnt_c + cnt_d > 0 ? cnt_c + cnt_d : 1);
+    egt_avg_payoff_c = cnt_c > 0 ? (float)(sum_c / cnt_c) : 0.0f;
+    egt_avg_payoff_d = cnt_d > 0 ? (float)(sum_d / cnt_d) : 0.0f;
+
+    /* Invasion front velocity: rate of change of boundary cells */
+    egt_front_velocity = (float)(boundary - egt_prev_boundary);
+    egt_prev_boundary = egt_n_boundary;
+    egt_n_boundary = boundary;
+
+    /* Spatial reciprocity index (Nowak & May 1992):
+       Measures how much spatial structure benefits cooperation.
+       R_spatial = (payoff_C_spatial - payoff_C_wellmixed) / payoff_C_wellmixed
+       In well-mixed: expected payoff_C = f_C * R + f_D * S
+       Positive R_spatial → spatial structure helps cooperators. */
+    {
+        float f_c = egt_coop_freq;
+        float f_d = 1.0f - f_c;
+        float wm_payoff_c = f_c * EGT_R + f_d * EGT_S;  /* well-mixed expectation */
+        if (wm_payoff_c > 0.01f)
+            egt_reciprocity = (egt_avg_payoff_c - wm_payoff_c) / wm_payoff_c;
+        else
+            egt_reciprocity = 0.0f;
+        /* Clamp to [-2, 2] for display */
+        if (egt_reciprocity > 2.0f) egt_reciprocity = 2.0f;
+        if (egt_reciprocity < -2.0f) egt_reciprocity = -2.0f;
+    }
+
+    /* Phase 3: Normalize payoffs to [0,1] for visualization */
+    egt_pay_min = global_min;
+    egt_pay_max = global_max;
+    {
+        float range = global_max - global_min;
+        if (range < 0.01f) range = 0.01f;
+        float inv = 1.0f / range;
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                if (!grid[y][x]) {
+                    egt_grid[y][x] = 0.0f;
+                    continue;
+                }
+                egt_grid[y][x] = (egt_payoff[y][x] - global_min) * inv;
+            }
+        }
+    }
+
+    /* Phase 4: Payoff distribution histogram */
+    memset(egt_pay_hist, 0, sizeof(egt_pay_hist));
+    {
+        float range = global_max - global_min;
+        if (range < 0.01f) range = 0.01f;
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                if (!grid[y][x]) continue;
+                int bin = (int)((egt_payoff[y][x] - global_min) / range * (EGT_PAY_BINS - 1));
+                if (bin < 0) bin = 0;
+                if (bin >= EGT_PAY_BINS) bin = EGT_PAY_BINS - 1;
+                egt_pay_hist[bin]++;
+            }
+        }
+    }
+
+    /* Phase 5: Sparkline histories */
+    egt_hist_coop[egt_hist_idx] = egt_coop_freq;
+    float mean_payoff = (cnt_c + cnt_d > 0) ?
+        (float)((sum_c + sum_d) / (cnt_c + cnt_d)) : 0.0f;
+    egt_hist_payoff[egt_hist_idx] = mean_payoff;
+    egt_hist_idx = (egt_hist_idx + 1) % EGT_HIST_LEN;
+    if (egt_hist_count < EGT_HIST_LEN) egt_hist_count++;
+}
+
 /* ── Symmetry Group Detection computation ──────────────────────────────────── */
 static void sg_compute(void) {
     sg_stale = 0;
@@ -11773,6 +12019,7 @@ static void split_ensure_computed(int idx) {
         case 43: if (mfs_stale) mfs_compute(); break;
         case 44: if (fi_stale) fi_compute(); break;
         case 45: if (rdf_stale) rdf_compute(); break;
+        case 46: if (egt_stale) egt_compute(); break;
         default: break;
     }
 }
@@ -12882,6 +13129,7 @@ static void render_help_overlay(char **pp) {
         {"Ctrl-U",   "Order parameter susceptibility"},
         {"Ctrl-V",   "Interface roughness (KPZ)"},
         {"Ctrl-W",   "Multifractal singularity spectrum"},
+        {"Ctrl-A",   "Evolutionary game theory (spatial PD)"},
         {"Ctrl-B",   "Radial distribution function g(r)"},
         {"Ctrl-X",   "Fisher information field"},
         {"Ctrl-Y",   "Poincare recurrence time map"},
@@ -14342,6 +14590,62 @@ static int cell_color(int x, int y, RGB *out) {
             }
             out->r = r; out->g = g; out->b = b;
             return grid[y][x] ? 1 : 45; /* 45 = RDF ghost */
+        }
+        return 0;
+    }
+
+    /* Evolutionary Game Theory overlay: spatial Prisoner's Dilemma */
+    if (egt_mode) {
+        if (grid[y][x] || egt_grid[y][x] > 0.01f) {
+            float v = egt_grid[y][x];
+            int strat = egt_strategy[y][x];
+            unsigned char r, g, b;
+            if (strat == 1) {
+                /* Cooperator: blue spectrum — dark blue (low payoff) → bright cyan (high) */
+                if (v < 0.3f) {
+                    float t = v / 0.3f;
+                    r = (unsigned char)(10 + 15 * t);
+                    g = (unsigned char)(20 + 60 * t);
+                    b = (unsigned char)(80 + 100 * t);
+                } else if (v < 0.6f) {
+                    float t = (v - 0.3f) / 0.3f;
+                    r = (unsigned char)(25 + 20 * t);
+                    g = (unsigned char)(80 + 100 * t);
+                    b = (unsigned char)(180 + 40 * t);
+                } else {
+                    float t = (v - 0.6f) / 0.4f;
+                    if (t > 1.0f) t = 1.0f;
+                    r = (unsigned char)(45 + 60 * t);
+                    g = (unsigned char)(180 + 70 * t);
+                    b = (unsigned char)(220 + 35 * t);
+                }
+            } else {
+                /* Defector: red spectrum — dark crimson (low payoff) → bright orange (high) */
+                if (v < 0.3f) {
+                    float t = v / 0.3f;
+                    r = (unsigned char)(80 + 80 * t);
+                    g = (unsigned char)(10 + 15 * t);
+                    b = (unsigned char)(10 + 10 * t);
+                } else if (v < 0.6f) {
+                    float t = (v - 0.3f) / 0.3f;
+                    r = (unsigned char)(160 + 60 * t);
+                    g = (unsigned char)(25 + 60 * t);
+                    b = (unsigned char)(20 - 5 * t);
+                } else {
+                    float t = (v - 0.6f) / 0.4f;
+                    if (t > 1.0f) t = 1.0f;
+                    r = (unsigned char)(220 + 35 * t);
+                    g = (unsigned char)(85 + 120 * t);
+                    b = (unsigned char)(15 + 30 * t);
+                }
+            }
+            if (grid[y][x]) {
+                r = (unsigned char)(r < 200 ? r + 55 : 255);
+                g = (unsigned char)(g < 200 ? g + 55 : 255);
+                b = (unsigned char)(b < 200 ? b + 55 : 255);
+            }
+            out->r = r; out->g = g; out->b = b;
+            return grid[y][x] ? 1 : 46; /* 46 = EGT ghost */
         }
         return 0;
     }
@@ -20100,6 +20404,203 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", rdrst);
     }
 
+    /* ── Evolutionary Game Theory overlay panel ─────────────────────────── */
+    if (egt_mode) {
+        int egt_pw = 50;
+        int egt_col = term_cols - egt_pw - 2;
+        int egt_row = 3;
+        if (entropy_mode)   egt_row += 8;
+        if (temp_mode)      egt_row += 9;
+        if (lyapunov_mode)  egt_row += 8;
+        if (fourier_mode)   egt_row += 18;
+        if (fractal_mode)   egt_row += 11;
+        if (wolfram_mode)   egt_row += 14;
+        if (flow_mode)      egt_row += 9;
+        if (attractor_mode) egt_row += 8;
+        if (cone_mode >= 1) egt_row += 8;
+        if (surp_mode)      egt_row += 8;
+        if (mi_mode)        egt_row += 12;
+        if (cplx_mode)      egt_row += 11;
+        if (topo_mode)      egt_row += 11;
+        if (rg_mode)        egt_row += 11;
+        if (kc_mode)        egt_row += 9;
+        if (corr_mode)      egt_row += 9;
+        if (eprod_mode)     egt_row += 9;
+        if (vort_mode)      egt_row += 9;
+        if (wave_mode)      egt_row += 9;
+        if (ergo_mode)      egt_row += 10;
+        if (coh_mode)       egt_row += 8;
+        if (ce_mode)        egt_row += 9;
+        if (ew_mode)        egt_row += 10;
+        if (hr_mode)        egt_row += 10;
+        if (rd_mode)        egt_row += 13;
+        if (xc_mode && xc_count >= 20) egt_row += 28;
+        if (fi_mode && fi_count >= 16)  egt_row += 12;
+        if (rdf_mode)       egt_row += 11;
+        if (egt_col < 1) egt_col = 1;
+
+        const char *egbdr = "\033[38;2;180;120;220;48;2;10;6;14m";  /* purple border */
+        const char *egbg  = "\033[48;2;10;6;14m";
+        const char *egrst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 \xe2\x9a\x94 Evolutionary Game Theory ",
+                     egt_row, egt_col, egbdr);
+        for (int i = 30; i < egt_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", egrst);
+
+        /* Row 1: Cooperation frequency + strategy counts */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     egt_row + 1, egt_col, egbdr, egbg);
+        {
+            const char *cclr;
+            if (egt_coop_freq > 0.6f) cclr = "\033[1;38;2;80;200;255m";
+            else if (egt_coop_freq > 0.3f) cclr = "\033[38;2;180;180;120m";
+            else cclr = "\033[38;2;255;100;80m";
+            int n = sprintf(p, " \033[38;2;140;100;180mCoop:%s%.1f%%"
+                               "\033[0m%s \033[38;2;80;180;220mC:%d"
+                               " \033[38;2;220;80;60mD:%d"
+                               " \033[38;2;100;80;120m[^A]",
+                            cclr, egt_coop_freq * 100.0f,
+                            egbg, egt_n_coop, egt_n_defect);
+            p += n;
+            int used = 42;
+            for (int i = used; i < egt_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", egbdr, egrst);
+
+        /* Row 2: Average payoffs by strategy */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     egt_row + 2, egt_col, egbdr, egbg);
+        {
+            int n = sprintf(p, " \033[38;2;80;180;220m\xe2\x9f\xa8\xcf\x80\xe2\x9f\xa9\xe2\x82\x92=%.1f"
+                               "  \033[38;2;220;80;60m\xe2\x9f\xa8\xcf\x80\xe2\x9f\xa9\xe2\x82\x83=%.1f"
+                               "  \033[38;2;140;140;100mrange:[%.0f,%.0f]",
+                            egt_avg_payoff_c, egt_avg_payoff_d,
+                            egt_pay_min, egt_pay_max);
+            p += n;
+            int used = 44;
+            for (int i = used; i < egt_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", egbdr, egrst);
+
+        /* Row 3: Spatial reciprocity index + invasion front */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     egt_row + 3, egt_col, egbdr, egbg);
+        {
+            const char *rclr;
+            if (egt_reciprocity > 0.1f) rclr = "\033[38;2;80;255;180m";       /* green = spatial helps */
+            else if (egt_reciprocity > -0.1f) rclr = "\033[38;2;180;180;100m"; /* neutral */
+            else rclr = "\033[38;2;255;80;80m";                                 /* red = spatial hurts */
+            int n = sprintf(p, " \033[38;2;140;100;180mReciprocity:%s%+.2f"
+                               "\033[0m%s \033[38;2;120;100;140mfront:%+d"
+                               " bnd:%d",
+                            rclr, egt_reciprocity, egbg,
+                            (int)egt_front_velocity, egt_n_boundary);
+            p += n;
+            int used = 44;
+            for (int i = used; i < egt_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", egbdr, egrst);
+
+        /* Row 4: Separator */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     egt_row + 4, egt_col, egbdr, egbg);
+        p += sprintf(p, " \033[38;2;60;40;80m");
+        for (int i = 1; i < egt_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", egbdr, egrst);
+
+        /* Rows 5-6: Payoff distribution histogram (2 rows) */
+        {
+            int hmax = 0;
+            for (int b = 0; b < EGT_PAY_BINS; b++)
+                if (egt_pay_hist[b] > hmax) hmax = egt_pay_hist[b];
+            if (hmax < 1) hmax = 1;
+
+            for (int row_i = 0; row_i < 2; row_i++) {
+                p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s ",
+                             egt_row + 5 + row_i, egt_col, egbdr, egbg);
+                float row_lo = (float)hmax * (1 - row_i) / 2.0f;
+                float row_hi = (float)hmax * (2 - row_i) / 2.0f;
+                int bars = egt_pw - 4;
+                if (bars > EGT_PAY_BINS) bars = EGT_PAY_BINS;
+                for (int b = 0; b < bars; b++) {
+                    float v = (float)egt_pay_hist[b];
+                    /* Color: bins in lower half blue (cooperators), upper half red (defectors) */
+                    float t = (float)b / (bars > 1 ? bars - 1 : 1);
+                    int cr = (int)(40 + 200 * t);
+                    int cg = (int)(120 - 40 * t);
+                    int cb = (int)(220 - 180 * t);
+                    if (v >= row_hi) {
+                        p += sprintf(p, "\033[38;2;%d;%d;%dm\xe2\x96\x88", cr, cg, cb);
+                    } else if (v > row_lo) {
+                        float frac = (v - row_lo) / (row_hi - row_lo);
+                        if (frac > 0.5f)
+                            p += sprintf(p, "\033[38;2;%d;%d;%dm\xe2\x96\x84", cr, cg, cb);
+                        else
+                            p += sprintf(p, "\033[38;2;%d;%d;%dm\xe2\x96\x81", cr, cg, cb);
+                    } else {
+                        *p++ = ' ';
+                    }
+                }
+                int used2 = bars + 3;
+                for (int i = used2; i < egt_pw - 1; i++) *p++ = ' ';
+                p += sprintf(p, "%s\xe2\x94\x82%s", egbdr, egrst);
+            }
+        }
+
+        /* Row 7: Cooperation frequency sparkline */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     egt_row + 7, egt_col, egbdr, egbg);
+        {
+            p += sprintf(p, " \033[38;2;80;180;220mCoop%%:");
+            const char *spark_chars[] = {
+                "\xe2\x96\x81", "\xe2\x96\x82", "\xe2\x96\x83", "\xe2\x96\x84",
+                "\xe2\x96\x85", "\xe2\x96\x86", "\xe2\x96\x87", "\xe2\x96\x88"
+            };
+            int spark_w = egt_pw - 12;
+            if (spark_w > egt_hist_count) spark_w = egt_hist_count;
+            for (int i = 0; i < spark_w; i++) {
+                int idx = (egt_hist_idx - spark_w + i + EGT_HIST_LEN) % EGT_HIST_LEN;
+                /* Cooperation frequency is [0,1], map to sparkline level */
+                int lvl = (int)(egt_hist_coop[idx] * 7.0f);
+                if (lvl < 0) lvl = 0;
+                if (lvl > 7) lvl = 7;
+                /* Color: more cooperation → blue, less → red */
+                float cf = egt_hist_coop[idx];
+                int cr = (int)(220 - 180 * cf);
+                int cg = (int)(80 + 120 * cf);
+                int cb = (int)(60 + 180 * cf);
+                p += sprintf(p, "\033[38;2;%d;%d;%dm%s", cr, cg, cb, spark_chars[lvl]);
+            }
+            int used = 8 + spark_w;
+            for (int i = used; i < egt_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", egbdr, egrst);
+
+        /* Row 8: Legend */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     egt_row + 8, egt_col, egbdr, egbg);
+        {
+            int n = sprintf(p, " \033[38;2;80;180;220m\xe2\x96\x88\xe2\x96\x88\033[38;2;100;80;120mCoop "
+                               "\033[38;2;220;80;60m\xe2\x96\x88\xe2\x96\x88\033[38;2;100;80;120mDefect "
+                               "\033[38;2;80;80;80mT=%g R=%g P=%g S=%g",
+                            (double)EGT_T, (double)EGT_R, (double)EGT_P, (double)EGT_S);
+            p += n;
+            int used = 44;
+            for (int i = used; i < egt_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", egbdr, egrst);
+
+        /* Bottom border */
+        int egt_bottom = egt_row + 9;
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", egt_bottom, egt_col, egbdr);
+        for (int i = 0; i < egt_pw; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", egrst);
+    }
+
     /* ── Symmetry Group Detection overlay panel ────────────────────────── */
     if (sg_mode) {
         int sg_pw = 50;  /* panel width */
@@ -20134,6 +20635,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (xc_mode && xc_count >= 20) sg_row += 28;
         if (fi_mode && fi_count >= 16)  sg_row += 12;
         if (rdf_mode)       sg_row += 11;
+        if (egt_mode)       sg_row += 10;
         if (sg_col < 1) sg_col = 1;
 
         const char *sgbdr = "\033[38;2;200;220;80;48;2;10;12;6m";  /* gold-green border */
@@ -20360,6 +20862,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (xc_mode && xc_count >= 20) td_row += 28;
         if (fi_mode && fi_count >= 16)  td_row += 12;
         if (rdf_mode)       td_row += 11;
+        if (egt_mode)       td_row += 10;
         if (sg_mode)        td_row += 12;
         if (td_col < 1) td_col = 1;
 
@@ -20559,6 +21062,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (xc_mode && xc_count >= 20) mf_row += 28;
         if (fi_mode && fi_count >= 16)  mf_row += 12;
         if (rdf_mode)       mf_row += 11;
+        if (egt_mode)       mf_row += 10;
         if (sg_mode)        mf_row += 12;
         if (td_mode)        mf_row += 10;
         if (mf_col < 1) mf_col = 1;
@@ -20725,6 +21229,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (xc_mode && xc_count >= 20) ri_row += 28;
         if (fi_mode && fi_count >= 16)  ri_row += 12;
         if (rdf_mode)       ri_row += 11;
+        if (egt_mode)       ri_row += 10;
         if (sg_mode)        ri_row += 12;
         if (td_mode)        ri_row += 10;
         if (mf_mode)        ri_row += 10;
@@ -20971,6 +21476,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (xc_mode && xc_count >= 20) sg2_row += 28;
         if (fi_mode && fi_count >= 16)  sg2_row += 12;
         if (rdf_mode)       sg2_row += 11;
+        if (egt_mode)       sg2_row += 10;
         if (sg_mode)        sg2_row += 12;
         if (td_mode)        sg2_row += 10;
         if (mf_mode)        sg2_row += 10;
@@ -21136,6 +21642,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (xc_mode && xc_count >= 20) su_row += 28;
         if (fi_mode && fi_count >= 16)  su_row += 12;
         if (rdf_mode)       su_row += 11;
+        if (egt_mode)       su_row += 10;
         if (sg_mode)        su_row += 12;
         if (td_mode)        su_row += 10;
         if (mf_mode)        su_row += 10;
@@ -21314,6 +21821,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (xc_mode && xc_count >= 20) ir_row += 28;
         if (fi_mode && fi_count >= 16)  ir_row += 12;
         if (rdf_mode)       ir_row += 11;
+        if (egt_mode)       ir_row += 10;
         if (sg_mode)        ir_row += 12;
         if (td_mode)        ir_row += 10;
         if (mf_mode)        ir_row += 10;
@@ -21501,6 +22009,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (xc_mode && xc_count >= 20) pr_row += 28;
         if (fi_mode && fi_count >= 16)  pr_row += 12;
         if (rdf_mode)       pr_row += 11;
+        if (egt_mode)       pr_row += 10;
         if (sg_mode)        pr_row += 12;
         if (td_mode)        pr_row += 10;
         if (mf_mode)        pr_row += 10;
@@ -21666,6 +22175,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (xc_mode && xc_count >= 20) mfs_row += 28;
         if (fi_mode && fi_count >= 16)  mfs_row += 12;
         if (rdf_mode)       mfs_row += 11;
+        if (egt_mode)       mfs_row += 10;
         if (sg_mode)        mfs_row += 12;
         if (td_mode)        mfs_row += 10;
         if (mf_mode)        mfs_row += 10;
@@ -21831,6 +22341,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (xc_mode && xc_count >= 20) pc_row += 28;
         if (fi_mode && fi_count >= 16) pc_row += 11;
         if (rdf_mode)       pc_row += 11;
+        if (egt_mode)       pc_row += 10;
         if (sg2_mode)       pc_row += 9;
         if (su_mode)        pc_row += 9;
         if (ir_mode)        pc_row += 10;
@@ -25117,6 +25628,19 @@ int main(int argc, char **argv) {
                 }
             }
         }
+        else if (key == 1) { /* Ctrl-A: Evolutionary Game Theory */
+            if (!ecosystem_mode) {
+                egt_mode = !egt_mode;
+                if (egt_mode) {
+                    egt_reset();
+                    flash_set("Evolutionary Game Theory: spatial Prisoner's Dilemma [^A]exit");
+                    printf("\033[2J"); fflush(stdout);
+                } else {
+                    flash_set("Evolutionary Game Theory off");
+                    printf("\033[2J"); fflush(stdout);
+                }
+            }
+        }
         else if (key == 2) { /* Ctrl-B: Radial Distribution Function */
             if (!ecosystem_mode) {
                 rdf_mode = !rdf_mode;
@@ -26005,6 +26529,13 @@ int main(int argc, char **argv) {
         if (rdf_mode && running && (generation % 4 == 0)) {
             if (rdf_stale) {
                 rdf_compute();
+            }
+        }
+
+        /* Evolutionary Game Theory: recompute every 4 generations */
+        if (egt_mode && running && (generation % 4 == 0)) {
+            if (egt_stale) {
+                egt_compute();
             }
         }
 

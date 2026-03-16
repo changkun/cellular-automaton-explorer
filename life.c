@@ -15,6 +15,8 @@
  *   y           Toggle population dynamics dashboard overlay
  *   w           Cycle topology: flat → torus → Klein bottle → Möbius strip → projective plane
  *   h           Toggle heatmap mode (age coloring + ghost trails)
+ *   H           Toggle help overlay (categorized keybinding reference)
+ *                 Arrow Up/Down to scroll, Page Up/Down for fast scroll
  *   [ / ]       Cycle through rule presets (or zone brush in zone mode)
  *   m           Mutate — randomly flip one birth/survival bit
  *   b           Toggle rule editor overlay (click B/S bits or preset names)
@@ -1130,6 +1132,12 @@ static int split_active = -1;      /* runtime: which overlay to force in cell_co
 static void split_set_overlay(int idx);
 static int  split_detect_current(void);
 static void split_ensure_computed(int idx);
+
+/* ── Interactive Help Overlay ─────────────────────────────────────────────── */
+/* Toggle with 'H' key. Categorized, scrollable keybinding reference panel.
+   Arrow Up/Down to scroll, Page Up/Down for fast scroll, H or q to close. */
+static int help_mode = 0;           /* 0=off, 1=showing */
+static int help_scroll = 0;         /* scroll offset (line index of top visible row) */
 
 /* ── Auto-Demo Mode ──────────────────────────────────────────────────────── */
 
@@ -4852,6 +4860,8 @@ static MouseEvent last_mouse;
 #define KEY_DOWN   (-4)
 #define KEY_RIGHT  (-5)
 #define KEY_LEFT   (-6)
+#define KEY_PGUP   (-7)
+#define KEY_PGDN   (-8)
 #define KEY_IGNORE (-1)
 
 static int read_input(void) {
@@ -4872,6 +4882,9 @@ static int read_input(void) {
             if (c3 == 'B') return KEY_DOWN;
             if (c3 == 'C') return KEY_RIGHT;
             if (c3 == 'D') return KEY_LEFT;
+            /* Page Up/Down: CSI 5~ / CSI 6~ */
+            if (c3 == '5') { int c4 = read_byte(); (void)c4; return KEY_PGUP; }
+            if (c3 == '6') { int c4 = read_byte(); (void)c4; return KEY_PGDN; }
             /* Other CSI sequences — consume and ignore */
             while (c3 >= 0 && c3 < 0x40) c3 = read_byte();
             return KEY_IGNORE;
@@ -12517,6 +12530,263 @@ static int rule_editor_preset_click(int mx, int my) {
     return 1;
 }
 
+/* ── Help Overlay Renderer ────────────────────────────────────────────────── */
+
+typedef struct { const char *key; const char *desc; } HelpEntry;
+typedef struct { const char *title; const HelpEntry *entries; int count; } HelpCategory;
+
+static void render_help_overlay(char **pp) {
+    if (!help_mode) return;
+    char *p = *pp;
+
+    /* ── Help entries by category ── */
+    static const HelpEntry cat_core[] = {
+        {"SPC / p",  "Play / Pause"},
+        {"s",        "Step one generation"},
+        {"r",        "Randomize grid"},
+        {"c",        "Clear grid"},
+        {"1-5",      "Load preset (Glider/Pulsar/Gun/R-pent/Acorn)"},
+        {"+/-",      "Speed up / slow down"},
+        {"d",        "Toggle draw mode"},
+        {"q / ESC",  "Quit"},
+    };
+    static const HelpEntry cat_view[] = {
+        {"Arrows",   "Pan viewport"},
+        {"z / x",    "Zoom in / out"},
+        {"0",        "Re-center viewport"},
+        {"n",        "Toggle minimap"},
+        {"g",        "Toggle population sparkline"},
+        {"y",        "Toggle population dashboard"},
+        {"t",        "Toggle timeline bar"},
+        {"< / >",    "Rewind / fast-forward history"},
+        {"K",        "Toggle kymograph (Up/Down=scan row)"},
+        {") / \\",   "Toggle split-screen (TAB/` cycle)"},
+    };
+    static const HelpEntry cat_sim[] = {
+        {"w",        "Cycle topology (flat/torus/Klein/Mobius/proj)"},
+        {"h",        "Toggle heatmap (age coloring + ghosts)"},
+        {"T",        "Cycle signal tracer"},
+        {"[ / ]",    "Cycle rule presets"},
+        {"m",        "Mutate rule (flip one B/S bit)"},
+        {"b",        "Toggle rule editor"},
+        {"k",        "Cycle symmetry (2/4/8-fold)"},
+        {"j",        "Toggle zone-paint mode"},
+        {"e",        "Toggle emitter/absorber mode"},
+        {"a",        "Toggle dual-species ecosystem"},
+        {"6",        "Toggle brush species (A/B)"},
+        {"{ / }",    "Adjust cross-species interaction"},
+        {"X",        "Toggle temperature mode"},
+        {"W",        "Toggle wormhole portals"},
+        {"G",        "Genetic rule explorer"},
+        {"S",        "Toggle stamp mode ([/] cycle, scroll rotate)"},
+        {"v",        "Toggle pattern census"},
+    };
+    static const HelpEntry cat_info[] = {
+        {"f",        "Frequency analysis (period detection)"},
+        {"i",        "Entropy heatmap (Shannon entropy)"},
+        {"L",        "Lyapunov sensitivity map"},
+        {"u",        "2D Fourier spectrum analyzer"},
+        {"F",        "Fractal dimension (box-counting)"},
+        {"C",        "Wolfram class detector (I/II/III/IV)"},
+        {"O",        "Information flow field (transfer entropy)"},
+        {"A",        "Phase-space attractor (Takens embedding)"},
+    };
+    static const HelpEntry cat_stat[] = {
+        {"!",        "Prediction surprise (per-cell surprisal)"},
+        {"@",        "Mutual information network"},
+        {"#",        "Composite complexity index"},
+        {"$",        "Topological features (components + holes)"},
+        {"%",        "Renormalization group flow"},
+        {"^",        "Kolmogorov complexity (LZ77 compression)"},
+        {"&",        "Spatial correlation length"},
+        {"=",        "Entropy production rate (dS/dt)"},
+        {"*",        "Vorticity detection (curl field)"},
+        {"~",        "Wave mechanics (interference)"},
+        {"(",        "Ergodicity metric"},
+        {"|",        "Percolation analysis"},
+        {":",        "Topological persistence barcode"},
+        {";",        "Hamiltonian energy (Ising analogy)"},
+        {"'",        "Correlation matrix heatmap"},
+        {"\"",       "Geodesic distance (click seed)"},
+        {"o",        "Recurrence plot"},
+        {"/",        "3D strange attractor"},
+        {"2",        "Cross-correlation field"},
+        {"7",        "Particle tracker (velocity field)"},
+        {"`",        "Spatial coherence (Kuramoto sync)"},
+    };
+    static const HelpEntry cat_meta[] = {
+        {"9",        "Causal light cone (click cell)"},
+        {"8",        "Anomaly detector (16-metric watchdog)"},
+        {"3",        "Early warning (critical slowing down)"},
+        {"4",        "Hurst exponent (long-range memory)"},
+        {"?",        "Cell probe inspector (click cell)"},
+        {"D",        "Auto-demo tour"},
+        {"H",        "This help screen"},
+    };
+    static const HelpEntry cat_ctrl[] = {
+        {"Ctrl-G",   "Symmetry group detection"},
+        {"Ctrl-D",   "Topological defect tracker"},
+        {"Ctrl-F",   "Mean field deviation"},
+        {"Ctrl-R",   "Rule inference engine"},
+        {"Ctrl-T",   "Spectral gap estimator"},
+        {"Ctrl-U",   "Order parameter susceptibility"},
+        {"Ctrl-V",   "Interface roughness (KPZ)"},
+        {"Ctrl-W",   "Multifractal singularity spectrum"},
+        {"Ctrl-X",   "Fisher information field"},
+        {"Ctrl-Y",   "Poincare recurrence time map"},
+    };
+    static const HelpEntry cat_io[] = {
+        {"P",        "Screenshot (PPM)"},
+        {"Ctrl-P",   "Dump timeline as image sequence"},
+        {"Ctrl-S",   "Save state to .life file"},
+        {"Ctrl-O",   "Load most recent .life save"},
+        {"Ctrl-E",   "Export grid as RLE file"},
+        {"Mouse L",  "Place cells / click UI"},
+        {"Mouse R",  "Erase cells"},
+        {"Scroll",   "Zoom in/out"},
+    };
+
+    #define HELP_CAT(title, arr) { title, arr, (int)(sizeof(arr)/sizeof(arr[0])) }
+    static const HelpCategory categories[] = {
+        HELP_CAT("Core",                     cat_core),
+        HELP_CAT("View & Navigation",        cat_view),
+        HELP_CAT("Simulation & Modes",       cat_sim),
+        HELP_CAT("Analysis: Information",     cat_info),
+        HELP_CAT("Analysis: Statistical",     cat_stat),
+        HELP_CAT("Analysis: Meta & Tools",    cat_meta),
+        HELP_CAT("Analysis: Ctrl Overlays",   cat_ctrl),
+        HELP_CAT("I/O & Mouse",              cat_io),
+    };
+    #define N_HELP_CATS (int)(sizeof(categories)/sizeof(categories[0]))
+
+    /* Count total lines: each category has 1 header + entries + 1 blank separator */
+    int total_lines = 0;
+    for (int c = 0; c < N_HELP_CATS; c++)
+        total_lines += 1 + categories[c].count + 1; /* header + entries + blank */
+    if (total_lines > 0) total_lines--; /* no trailing blank */
+
+    /* Panel dimensions */
+    int pw = 56;  /* panel width */
+    int max_vis = term_rows - 6;  /* visible rows (leave room for borders + title) */
+    if (max_vis < 5) max_vis = 5;
+    if (max_vis > total_lines) max_vis = total_lines;
+
+    /* Clamp scroll */
+    int max_scroll = total_lines - max_vis;
+    if (max_scroll < 0) max_scroll = 0;
+    if (help_scroll > max_scroll) help_scroll = max_scroll;
+    if (help_scroll < 0) help_scroll = 0;
+
+    /* Position: centered */
+    int col0 = (term_cols - pw - 2) / 2;
+    if (col0 < 1) col0 = 1;
+    int row0 = (term_rows - max_vis - 4) / 2;
+    if (row0 < 1) row0 = 1;
+
+    /* Style */
+    const char *bdr = "\033[38;2;140;160;220;48;2;12;12;22m";
+    const char *bg  = "\033[48;2;12;12;22m";
+    const char *rst = "\033[0m";
+    const char *cat_clr = "\033[38;2;100;200;255m"; /* category headers: bright cyan */
+    const char *key_clr = "\033[38;2;255;220;80m";  /* key names: gold */
+    const char *desc_clr = "\033[38;2;190;190;200m"; /* descriptions: light gray */
+    const char *dim_clr = "\033[38;2;80;80;100m";    /* scroll hints: dim */
+    const char *title_clr = "\033[38;2;255;255;255m"; /* title: white */
+
+    int right_col = col0 + pw + 1;
+
+    /* Top border */
+    p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 %sKeybinding Reference%s ",
+                 row0, col0, bdr, title_clr, bdr);
+    { int used = 22;
+      for (int i = used; i < pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; } }
+    *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+    p += sprintf(p, "%s", rst);
+
+    /* Scroll indicator row */
+    p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s ", row0 + 1, col0, bdr, bg);
+    if (help_scroll > 0)
+        p += sprintf(p, "%s\xe2\x96\xb2 Up for more ", dim_clr);
+    else
+        p += sprintf(p, "%s              ", dim_clr);
+    /* Pad to right border */
+    { int used = 14;
+      p += sprintf(p, "%s", bg);
+      for (int i = used; i < pw; i++) *p++ = ' '; }
+    p += sprintf(p, "%s\xe2\x94\x82%s", bdr, rst);
+
+    /* Content rows */
+    int line_idx = 0;  /* global line counter across all categories */
+    int vis_row = 0;   /* visible row counter */
+    for (int c = 0; c < N_HELP_CATS && vis_row < max_vis; c++) {
+        /* Category header line */
+        if (line_idx >= help_scroll && vis_row < max_vis) {
+            int r = row0 + 2 + vis_row;
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s ", r, col0, bdr, bg);
+            p += sprintf(p, "%s\xe2\x94\x80\xe2\x94\x80 %s ", cat_clr, categories[c].title);
+            /* Pad with dashes */
+            int hdr_len = 4 + (int)strlen(categories[c].title) + 1;
+            p += sprintf(p, "%s", cat_clr);
+            for (int i = hdr_len; i < pw; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+            p += sprintf(p, "%s\xe2\x94\x82%s", bdr, rst);
+            vis_row++;
+        }
+        line_idx++;
+
+        /* Entry lines */
+        for (int e = 0; e < categories[c].count && vis_row < max_vis; e++) {
+            if (line_idx >= help_scroll && vis_row < max_vis) {
+                int r = row0 + 2 + vis_row;
+                p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s ", r, col0, bdr, bg);
+                p += sprintf(p, " %s%-10s%s%s",
+                             key_clr, categories[c].entries[e].key,
+                             desc_clr, categories[c].entries[e].desc);
+                /* Pad */
+                int used = 1 + 10 + (int)strlen(categories[c].entries[e].desc);
+                p += sprintf(p, "%s", bg);
+                for (int i = used; i < pw; i++) *p++ = ' ';
+                p += sprintf(p, "%s\xe2\x94\x82%s", bdr, rst);
+                vis_row++;
+            }
+            line_idx++;
+        }
+
+        /* Blank separator line (except after last category) */
+        if (c < N_HELP_CATS - 1) {
+            if (line_idx >= help_scroll && vis_row < max_vis) {
+                int r = row0 + 2 + vis_row;
+                p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s", r, col0, bdr, bg);
+                for (int i = 0; i < pw; i++) *p++ = ' ';
+                p += sprintf(p, "%s\xe2\x94\x82%s", bdr, rst);
+                vis_row++;
+            }
+            line_idx++;
+        }
+    }
+
+    /* Bottom scroll indicator */
+    int bot_row = row0 + 2 + max_vis;
+    p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s ", bot_row, col0, bdr, bg);
+    if (help_scroll < max_scroll)
+        p += sprintf(p, "%s\xe2\x96\xbc Down for more ", dim_clr);
+    else
+        p += sprintf(p, "%s                ", dim_clr);
+    { int used = 16;
+      p += sprintf(p, "%s", bg);
+      for (int i = used; i < pw; i++) *p++ = ' '; }
+    p += sprintf(p, "%s\xe2\x94\x82%s", bdr, rst);
+
+    /* Bottom border */
+    p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", bot_row + 1, col0, bdr);
+    p += sprintf(p, "\xe2\x94\x80 %s[H]close [\xe2\x86\x91\xe2\x86\x93]scroll%s ", dim_clr, bdr);
+    { int used = 20;
+      for (int i = used; i < pw; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; } }
+    *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+    p += sprintf(p, "%s", rst);
+
+    *pp = p;
+}
+
 static void render_rule_editor(char **pp) {
     if (!rule_editor) return;
     char *p = *pp;
@@ -14327,6 +14597,12 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(probe_str, sizeof(probe_str),
                  " \033[38;2;0;220;180m\xe2\x97\x86PROBE:(%d,%d)\033[0m", probe_x, probe_y);
 
+    /* Help mode indicator */
+    char help_str[64] = "";
+    if (help_mode)
+        snprintf(help_str, sizeof(help_str),
+                 " \033[38;2;140;160;220m\xe2\x93\x98HELP\033[0m");
+
     /* Genetic explorer indicator */
     char gene_str[64] = "";
     if (gene_mode == 1)
@@ -14446,10 +14722,10 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
                  state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, gd_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, corr_str, eprod_str, wave_str, pp_str, cm_str, xc_str, fi_str, ps_str, rp_str, sa_str, pt_str, ad_str, ce_str, split_str, kymo_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
-                 portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
+                 portal_str, emit_str, eco_str, stamp_str, help_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
     if (flash_active()) {
@@ -14503,7 +14779,7 @@ static void render(int running, int speed_ms, int draw_mode) {
                          "[1-5]pre [d]draw [D]demo [k]sym [g]graph [y]dash [w]topo [h]heat [T]trace [f]freq [i]ent [L]lyap [u]fft "
                          "[X]temp [C]class [O]flow [9]cone [!]surp [@]mi [#]cplx [$]topo [=]dS/dt [/]rule [m]mut [b]edit [G]evolve [j]zone [e]emit [W]worm [a]eco [6]sp {/}int "
                          "[S]stamp [v]census [?]probe [)]split [K]kymo [8]watch [z/x]zoom [n]map [<>]time [t]tbar [P]snap C-p:seq "
-                         "C-s:save C-o:load C-e:rle [q]quit\033[0m\033[K\n");
+                         "C-s:save C-o:load C-e:rle [H]help [q]quit\033[0m\033[K\n");
     }
 
     int usable_rows = term_rows - 3;
@@ -23622,6 +23898,9 @@ static void render(int running, int speed_ms, int draw_mode) {
 
     } /* end !split_mode panel suppression */
 
+    /* Help overlay — rendered last so it draws on top of everything */
+    render_help_overlay(&p);
+
     *p = '\0';
 
     (void)!write(STDOUT_FILENO, render_buf, p - render_buf);
@@ -23953,7 +24232,11 @@ int main(int argc, char **argv) {
             }
             printf("\033[2J"); fflush(stdout);
         }
-        else if (key == 'h' || key == 'H')
+        else if (key == 'H') {
+            help_mode = !help_mode;
+            help_scroll = 0;
+        }
+        else if (key == 'h')
             heatmap_mode = !heatmap_mode;
         else if (key == 'f') {
             freq_mode = !freq_mode;
@@ -24631,7 +24914,9 @@ int main(int argc, char **argv) {
             viewport_center();
         }
         else if (key == KEY_UP) {
-            if (sa_mode) {
+            if (help_mode) {
+                if (help_scroll > 0) help_scroll--;
+            } else if (sa_mode) {
                 sa_pitch -= 0.15f;
                 sa_auto_rotate = 0;
             } else if (kymo_mode) {
@@ -24642,7 +24927,9 @@ int main(int argc, char **argv) {
             } else viewport_pan(0, -1);
         }
         else if (key == KEY_DOWN) {
-            if (sa_mode) {
+            if (help_mode) {
+                help_scroll++;
+            } else if (sa_mode) {
                 sa_pitch += 0.15f;
                 sa_auto_rotate = 0;
             } else if (kymo_mode) {
@@ -24658,6 +24945,12 @@ int main(int argc, char **argv) {
         else if (key == KEY_RIGHT) {
             if (sa_mode) { sa_yaw += 0.15f; sa_auto_rotate = 0; }
             else viewport_pan(1, 0);
+        }
+        else if (key == KEY_PGUP) {
+            if (help_mode) help_scroll -= 10;
+        }
+        else if (key == KEY_PGDN) {
+            if (help_mode) help_scroll += 10;
         }
         else if (key == KEY_MOUSE) {
             MouseEvent *m = &last_mouse;

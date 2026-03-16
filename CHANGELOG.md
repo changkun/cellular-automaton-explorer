@@ -1,8 +1,20 @@
 # Changelog
 
 Development history organized by round. Each round adds one or two major
-features. The project grew from ~790 lines (Round 1) to ~12,433 lines
-(Round 46).
+features. The project grew from ~790 lines (Round 1) to ~12,756 lines
+(Round 47).
+
+## Round 47 — Ergodicity Metric
+
+Per-cell time-averaged density (EMA) compared against global spatial average
+density. Deviation map shows ergodic regions (green, where time and space
+averages converge) versus non-ergodic regions (magenta, persistent local bias
+from still lifes, oscillators, or absorbing boundaries). Stats panel displays
+ergodicity index (0–1), fraction of ergodic cells, equilibration generation,
+phase classification (Broken → Ergodic), and sparkline history. Toggle with
+`(`. Key insight: Conway's Life is fundamentally non-ergodic — frozen
+structures create permanently biased cells visible as magenta clusters against
+a green chaotic background.
 
 ## Round 46 — Vorticity Detection
 

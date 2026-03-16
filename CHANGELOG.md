@@ -1,8 +1,36 @@
 # Changelog
 
 Development history organized by round. Each round adds one or two major
-features. The project grew from ~790 lines (Round 1) to ~14,830 lines
-(Round 53).
+features. The project grew from ~790 lines (Round 1) to ~17,700 lines
+(Round 62).
+
+## Round 62 — Spatial Coherence Overlay
+
+Kuramoto phase synchronization heatmap. Press `` ` `` (backtick) to visualize
+where cells oscillate in lockstep versus where dynamics are desynchronized.
+Extracts each cell's oscillation phase from 32-frame flip history in the
+timeline buffer, then computes the Kuramoto order parameter
+R = |1/N Σ e^{iθ}| over a radius-3 (7×7) neighbourhood. Grid renders as a
+heatmap: dark blue (desynchronized) → cyan (partial sync) → white (perfect
+lockstep). Flood-fill BFS detects coherent domains (contiguous R > 0.6
+regions). Sidebar shows global R, sync fraction, domain count, and sparkline.
+Fills the gap between round 61's global frequency analysis and spatial
+structure — reveals *where* synchronization lives, not just that it exists.
+30th analysis overlay in the system.
+
+## Round 61 — Temporal Power Spectrum Overlay
+
+128-point DFT across all 16 metrics via a ring buffer sampled every 2
+generations. Press `6` for a 16×32 heatmap (metric × frequency bin) with
+Hann windowing, DC removal, and Goertzel-style direct DFT. Color: dark blue
+→ cyan → yellow → red (peak in white). Sidebar shows top 4 dominant metrics
+with period and spectral entropy, plus overall character (PERIODIC/MIXED/CHAOTIC).
+
+## Round 60 — Enhanced Metric Correlation Matrix
+
+Upgraded correlation matrix to 128-frame sliding window with top-3 ranked
+correlation pairs displayed in the sidebar. Improves statistical reliability
+of correlation estimates and highlights the strongest metric relationships.
 
 ## Round 59 — Anomaly Detector
 

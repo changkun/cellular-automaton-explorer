@@ -1047,7 +1047,7 @@ static int   probe_y = -1;            /* selected cell y */
    Toggle with '\\' key. TAB cycles the right panel, '`' cycles the left. */
 
 /* Overlay table: ordered list of analysis overlays for cycling */
-#define N_SPLIT_OVERLAYS 34
+#define N_SPLIT_OVERLAYS 35
 typedef struct {
     const char *name;   /* short display name */
     char key;           /* toggle key character */
@@ -1088,6 +1088,7 @@ static const SplitOverlayInfo split_overlay_table[N_SPLIT_OVERLAYS] = {
     { "EarlyWarn",    '3'  },  /* 31 */
     { "HurstExp",     '4'  },  /* 32 */
     { "Dashboard",    '5'  },  /* 33 */
+    { "CrossCorr",    '2'  },  /* 34 */
 };
 
 static int split_mode = 0;         /* 0=off, 1=on */
@@ -1385,6 +1386,63 @@ static void rd_reset(void) {
     memset(rd_grid, 0, sizeof(float) * MAX_H * MAX_W);
 }
 
+/* ── Cross-Correlation Matrix ──────────────────────────────────────────────── */
+/* Computes pairwise time-lagged cross-correlation across all 16 metric streams
+   at lags -8 to +8.  For each pair, identifies the optimal lag (peak |r|),
+   revealing causal lead-lag structure.  Per-cell visualization: projects the
+   dominant correlation cluster onto the grid.  Sidebar: 16×16 mini matrix,
+   top-5 strongest lead-lag pairs with direction arrows, cluster count.
+   Toggle with '2' key. */
+
+#define XC_WINDOW  128   /* sliding window for cross-correlation */
+#define XC_N       PP_N_METRICS   /* 16 metrics */
+#define XC_MAX_LAG 8     /* lags from -8 to +8 */
+#define XC_HIST_LEN 64   /* sparkline history */
+#define XC_TOP     5     /* top lead-lag pairs to display */
+
+static int   xc_mode = 0;           /* 0=off, 1=on */
+static float xc_buf[XC_WINDOW][XC_N]; /* ring buffer of metric snapshots */
+static int   xc_head = 0;
+static int   xc_count = 0;
+static int   xc_stale = 1;
+
+/* Results: optimal lag and correlation at that lag for each pair */
+static float xc_peak_r[XC_N][XC_N];    /* peak |r| correlation for each pair */
+static int   xc_peak_lag[XC_N][XC_N];  /* lag at peak |r|: negative = i leads j */
+static float xc_mean_abs_r = 0.0f;     /* mean |peak r| across all pairs */
+
+/* Per-metric cluster assignment via spectral clustering on correlation */
+static int   xc_cluster[XC_N];         /* cluster ID per metric [0..n_clusters-1] */
+static int   xc_n_clusters = 1;        /* number of distinct clusters found */
+
+/* Sparkline history of mean |r| */
+static float xc_hist[XC_HIST_LEN];
+static int   xc_hist_idx = 0;
+static int   xc_hist_count = 0;
+
+/* Per-cell grid: cluster identity mapped to [0,1] for coloring */
+static float xc_grid[MAX_H][MAX_W];
+
+static void xc_record(void);
+static void xc_compute(void);
+static void xc_reset(void) {
+    xc_head = 0;
+    xc_count = 0;
+    xc_stale = 1;
+    xc_mean_abs_r = 0.0f;
+    xc_n_clusters = 1;
+    xc_hist_idx = 0;
+    xc_hist_count = 0;
+    for (int i = 0; i < XC_N; i++) {
+        xc_cluster[i] = 0;
+        for (int j = 0; j < XC_N; j++) {
+            xc_peak_r[i][j] = (i == j) ? 1.0f : 0.0f;
+            xc_peak_lag[i][j] = 0;
+        }
+    }
+    memset(xc_grid, 0, sizeof(float) * MAX_H * MAX_W);
+}
+
 /* ── Anomaly Detector ─────────────────────────────────────────────────────── */
 /* Real-time watchdog that monitors all 16 scalar metrics for statistical
    anomalies.  Maintains running mean and variance (Welford's algorithm) over
@@ -1452,6 +1510,7 @@ static void split_set_overlay(int idx) {
     ce_mode = 0;
     ew_mode = 0;
     hr_mode = 0;
+    xc_mode = 0;
 
     switch (idx) {
         case  0: break;
@@ -1488,6 +1547,7 @@ static void split_set_overlay(int idx) {
         case 31: ew_mode = 1; break;
         case 32: hr_mode = 1; break;
         case 33: rd_mode = 1; break;
+        case 34: xc_mode = 1; break;
     }
 }
 
@@ -1525,6 +1585,7 @@ static int split_detect_current(void) {
     if (ew_mode) return 31;
     if (hr_mode) return 32;
     if (rd_mode) return 33;
+    if (xc_mode) return 34;
     return 0;
 }
 
@@ -1894,6 +1955,15 @@ static void hr_record(void) {
     hr_head = (hr_head + 1) % HR_WINDOW;
     if (hr_count < HR_WINDOW) hr_count++;
     hr_stale = 1;
+}
+
+/* ── Cross-Correlation Matrix: xc_record ───────────────────────────────────── */
+static void xc_record(void) {
+    for (int i = 0; i < XC_N; i++)
+        xc_buf[xc_head][i] = pp_read_metric(i);
+    xc_head = (xc_head + 1) % XC_WINDOW;
+    if (xc_count < XC_WINDOW) xc_count++;
+    xc_stale = 1;
 }
 
 /* ── Metric Correlation Matrix implementations ────────────────────────────── */
@@ -3737,6 +3807,7 @@ static void demo_reset_overlays(void) {
     ce_mode = 0;
     ew_mode = 0;
     hr_mode = 0;
+    xc_mode = 0;
     fourier_mode = 0;
     fractal_mode = 0;
     wolfram_mode = 0;
@@ -7653,6 +7724,198 @@ static void rd_compute(void) {
     rd_stale = 0;
 }
 
+/* ── Cross-Correlation Matrix computation ──────────────────────────────────── */
+static void xc_compute(void) {
+    if (xc_count < 20) { xc_stale = 0; return; } /* need enough data for lags */
+    xc_stale = 0;
+    int n = xc_count;
+
+    /* Extract series for each metric (chronological order) */
+    float series[XC_N][XC_WINDOW];
+    for (int m = 0; m < XC_N; m++) {
+        for (int k = 0; k < n; k++) {
+            int idx = (xc_head - n + k + XC_WINDOW) % XC_WINDOW;
+            series[m][k] = xc_buf[idx][m];
+        }
+    }
+
+    /* Compute means and stddevs */
+    float mean[XC_N], sd[XC_N];
+    for (int m = 0; m < XC_N; m++) {
+        double s = 0.0, ss = 0.0;
+        for (int k = 0; k < n; k++) { s += series[m][k]; }
+        mean[m] = (float)(s / n);
+        for (int k = 0; k < n; k++) {
+            float d = series[m][k] - mean[m];
+            ss += (double)d * d;
+        }
+        sd[m] = (float)sqrt(ss / n);
+    }
+
+    /* For each pair (i,j), compute cross-correlation at lags -XC_MAX_LAG..+XC_MAX_LAG
+       Positive lag means j is shifted forward (i leads j).
+       Find the lag with max |r|. */
+    double abs_r_sum = 0.0;
+    int abs_r_cnt = 0;
+
+    for (int i = 0; i < XC_N; i++) {
+        xc_peak_r[i][i] = 1.0f;
+        xc_peak_lag[i][i] = 0;
+        for (int j = i + 1; j < XC_N; j++) {
+            float best_r = 0.0f;
+            int best_lag = 0;
+
+            if (sd[i] < 1e-12f || sd[j] < 1e-12f) {
+                xc_peak_r[i][j] = xc_peak_r[j][i] = 0.0f;
+                xc_peak_lag[i][j] = 0;
+                xc_peak_lag[j][i] = 0;
+                continue;
+            }
+
+            for (int lag = -XC_MAX_LAG; lag <= XC_MAX_LAG; lag++) {
+                /* Compute correlation between i[t] and j[t+lag] */
+                int start = (lag >= 0) ? 0 : -lag;
+                int end = (lag >= 0) ? n - lag : n;
+                if (end - start < 8) continue; /* need min overlap */
+
+                double cov = 0.0;
+                int cnt = 0;
+                for (int k = start; k < end; k++) {
+                    cov += (double)(series[i][k] - mean[i]) * (series[j][k + lag] - mean[j]);
+                    cnt++;
+                }
+                if (cnt < 8) continue;
+                float r = (float)(cov / cnt / ((double)sd[i] * sd[j]));
+                if (r > 1.0f) r = 1.0f;
+                if (r < -1.0f) r = -1.0f;
+
+                if (fabsf(r) > fabsf(best_r)) {
+                    best_r = r;
+                    best_lag = lag;
+                }
+            }
+
+            xc_peak_r[i][j] = best_r;
+            xc_peak_r[j][i] = best_r;
+            /* lag sign convention: positive lag in [i][j] means i leads j */
+            xc_peak_lag[i][j] = best_lag;
+            xc_peak_lag[j][i] = -best_lag;
+
+            abs_r_sum += fabsf(best_r);
+            abs_r_cnt++;
+        }
+    }
+    xc_mean_abs_r = (abs_r_cnt > 0) ? (float)(abs_r_sum / abs_r_cnt) : 0.0f;
+
+    /* Simple clustering: group metrics by correlation similarity.
+       Use single-linkage clustering with threshold 0.5 on peak |r|. */
+    {
+        int label[XC_N];
+        for (int i = 0; i < XC_N; i++) label[i] = i; /* each metric starts in own cluster */
+
+        /* Union-find merge: if |peak_r[i][j]| > 0.5, merge clusters */
+        for (int i = 0; i < XC_N; i++) {
+            for (int j = i + 1; j < XC_N; j++) {
+                if (fabsf(xc_peak_r[i][j]) > 0.5f) {
+                    /* Find roots */
+                    int ri = i, rj = j;
+                    while (label[ri] != ri) ri = label[ri];
+                    while (label[rj] != rj) rj = label[rj];
+                    if (ri != rj) {
+                        if (ri < rj) label[rj] = ri;
+                        else label[ri] = rj;
+                    }
+                }
+            }
+        }
+        /* Flatten and count unique clusters */
+        for (int i = 0; i < XC_N; i++) {
+            int r = i;
+            while (label[r] != r) r = label[r];
+            label[i] = r;
+        }
+        /* Remap to contiguous IDs */
+        int map[XC_N];
+        for (int i = 0; i < XC_N; i++) map[i] = -1;
+        int nc = 0;
+        for (int i = 0; i < XC_N; i++) {
+            if (map[label[i]] < 0) map[label[i]] = nc++;
+            xc_cluster[i] = map[label[i]];
+        }
+        xc_n_clusters = nc;
+    }
+
+    /* Sparkline */
+    xc_hist[xc_hist_idx] = xc_mean_abs_r;
+    xc_hist_idx = (xc_hist_idx + 1) % XC_HIST_LEN;
+    if (xc_hist_count < XC_HIST_LEN) xc_hist_count++;
+
+    /* Per-cell grid: for each cell, find which metric's local behavior
+       most resembles (using timeline density history) and assign cluster color.
+       We use a simplified approach: compute local density variance over
+       recent frames and map to the cluster of the most correlated metric. */
+    {
+        int frames_avail = tl_len < 32 ? tl_len : 32;
+        if (frames_avail >= 8) {
+            for (int y = 0; y < H; y++) {
+                for (int x = 0; x < W; x++) {
+                    /* Local density: count live cells in 3x3 neighborhood over time */
+                    float local_series[32];
+                    for (int f = 0; f < frames_avail; f++) {
+                        int fi = (tl_head - 1 - f + TL_MAX) % TL_MAX;
+                        int cnt = 0;
+                        for (int dy = -1; dy <= 1; dy++) {
+                            for (int dx = -1; dx <= 1; dx++) {
+                                int ny = y + dy, nx = x + dx;
+                                if (ny >= 0 && ny < H && nx >= 0 && nx < W) {
+                                    if (timeline[fi].grid[ny][nx] > 0) cnt++;
+                                }
+                            }
+                        }
+                        local_series[frames_avail - 1 - f] = cnt / 9.0f;
+                    }
+                    /* Compute local mean and stddev */
+                    float lmean = 0.0f, lsd = 0.0f;
+                    for (int f = 0; f < frames_avail; f++) lmean += local_series[f];
+                    lmean /= frames_avail;
+                    for (int f = 0; f < frames_avail; f++) {
+                        float d = local_series[f] - lmean;
+                        lsd += d * d;
+                    }
+                    lsd = sqrtf(lsd / frames_avail);
+
+                    /* Find which global metric this cell's series correlates best with */
+                    int best_m = 0;
+                    float best_corr = 0.0f;
+                    if (lsd > 1e-6f) {
+                        for (int m = 0; m < XC_N; m++) {
+                            if (sd[m] < 1e-12f) continue;
+                            /* Correlate local_series with last frames_avail of metric m */
+                            float mc = 0.0f;
+                            for (int f = 0; f < frames_avail; f++) {
+                                int idx = (xc_head - frames_avail + f + XC_WINDOW) % XC_WINDOW;
+                                mc += (local_series[f] - lmean) * (xc_buf[idx][m] - mean[m]);
+                            }
+                            mc /= frames_avail * lsd * sd[m];
+                            if (fabsf(mc) > best_corr) {
+                                best_corr = fabsf(mc);
+                                best_m = m;
+                            }
+                        }
+                    }
+                    /* Map to cluster: normalize cluster ID to [0,1] for coloring */
+                    xc_grid[y][x] = (xc_n_clusters > 1) ?
+                        (float)xc_cluster[best_m] / (xc_n_clusters - 1) : 0.5f;
+                }
+            }
+        } else {
+            for (int y = 0; y < H; y++)
+                for (int x = 0; x < W; x++)
+                    xc_grid[y][x] = 0.5f;
+        }
+    }
+}
+
 /* ── Causal Emergence computation ──────────────────────────────────────────── */
 /* Color mapping: scale 0 (micro best) = cool blue,
    scale 1 (2x2) = green, scale 2 (4x4) = warm orange,
@@ -8943,6 +9206,7 @@ static void split_ensure_computed(int idx) {
         case 29: if (ce_stale) ce_compute(); break;
         case 31: if (ew_stale && ew_count >= 16) ew_compute(); break;
         case 33: if (rd_stale) rd_compute(); break;
+        case 34: if (xc_stale && xc_count >= 20) xc_compute(); break;
         default: break;
     }
 }
@@ -10682,6 +10946,55 @@ static int cell_color(int x, int y, RGB *out) {
         return 0;
     }
 
+    /* Cross-Correlation Matrix overlay: cluster-colored cells */
+    if (xc_mode) {
+        float v = xc_grid[y][x];
+        if (grid[y][x] || v > 0.01f) {
+            /* Map cluster ID [0,1] to distinct hues via HSV-like palette */
+            unsigned char r, g, b;
+            if (v < 0.2f) {
+                /* Cluster 0: cyan-blue */
+                float t = v / 0.2f;
+                r = (unsigned char)(20 + 30 * t);
+                g = (unsigned char)(120 + 80 * t);
+                b = (unsigned char)(180 + 60 * t);
+            } else if (v < 0.4f) {
+                /* Cluster 1: green-teal */
+                float t = (v - 0.2f) / 0.2f;
+                r = (unsigned char)(30 + 20 * t);
+                g = (unsigned char)(180 + 40 * t);
+                b = (unsigned char)(80 - 20 * t);
+            } else if (v < 0.6f) {
+                /* Cluster 2: amber-yellow */
+                float t = (v - 0.4f) / 0.2f;
+                r = (unsigned char)(200 + 40 * t);
+                g = (unsigned char)(180 + 30 * t);
+                b = (unsigned char)(30 + 20 * t);
+            } else if (v < 0.8f) {
+                /* Cluster 3: magenta-purple */
+                float t = (v - 0.6f) / 0.2f;
+                r = (unsigned char)(180 + 40 * t);
+                g = (unsigned char)(60 + 30 * t);
+                b = (unsigned char)(200 + 30 * t);
+            } else {
+                /* Cluster 4+: warm red-orange */
+                float t = (v - 0.8f) / 0.2f;
+                if (t > 1.0f) t = 1.0f;
+                r = (unsigned char)(220 + 35 * t);
+                g = (unsigned char)(100 + 40 * t);
+                b = (unsigned char)(40 + 30 * t);
+            }
+            if (grid[y][x]) {
+                r = (unsigned char)(r < 200 ? r + 55 : 255);
+                g = (unsigned char)(g < 200 ? g + 55 : 255);
+                b = (unsigned char)(b < 200 ? b + 55 : 255);
+            }
+            out->r = r; out->g = g; out->b = b;
+            return grid[y][x] ? 1 : 34; /* 34 = cross-corr ghost */
+        }
+        return 0;
+    }
+
     /* Percolation analysis overlay: cluster connectivity */
     if (perc_mode) {
         unsigned short lbl = perc_label[y][x];
@@ -11127,6 +11440,14 @@ static void render(int running, int speed_ms, int draw_mode) {
                  cm_count, CM_WINDOW);
     }
 
+    /* Cross-correlation matrix indicator */
+    char xc_str[96] = "";
+    if (xc_mode) {
+        snprintf(xc_str, sizeof(xc_str),
+                 " \033[38;2;80;200;180m\xe2\x96\xa6" "XCOR:%d/%d\033[0m",
+                 xc_count, XC_WINDOW);
+    }
+
     /* Power spectrum indicator */
     char ps_str[96] = "";
     if (ps_mode) {
@@ -11337,9 +11658,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, gd_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, corr_str, eprod_str, wave_str, pp_str, cm_str, ps_str, rp_str, sa_str, pt_str, ad_str, ce_str, split_str, kymo_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
+                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, gd_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, corr_str, eprod_str, wave_str, pp_str, cm_str, xc_str, ps_str, rp_str, sa_str, pt_str, ad_str, ce_str, split_str, kymo_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -15696,6 +16017,245 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", rdrst);
     }
 
+    /* ── Cross-Correlation Matrix overlay panel ───────────────────────── */
+    if (xc_mode && xc_count >= 20) {
+        int xc_pw = 52;  /* panel width */
+        int xc_col = term_cols - xc_pw - 2;
+        int xc_row = 3;
+        /* Stack below other panels */
+        if (entropy_mode)   xc_row += 8;
+        if (temp_mode)      xc_row += 9;
+        if (lyapunov_mode)  xc_row += 8;
+        if (fourier_mode)   xc_row += 18;
+        if (fractal_mode)   xc_row += 11;
+        if (wolfram_mode)   xc_row += 14;
+        if (flow_mode)      xc_row += 9;
+        if (attractor_mode) xc_row += 8;
+        if (cone_mode >= 1) xc_row += 8;
+        if (surp_mode)      xc_row += 8;
+        if (mi_mode)        xc_row += 12;
+        if (cplx_mode)      xc_row += 11;
+        if (topo_mode)      xc_row += 11;
+        if (rg_mode)        xc_row += 11;
+        if (kc_mode)        xc_row += 9;
+        if (corr_mode)      xc_row += 9;
+        if (eprod_mode)     xc_row += 9;
+        if (vort_mode)      xc_row += 9;
+        if (wave_mode)      xc_row += 9;
+        if (ergo_mode)      xc_row += 10;
+        if (coh_mode)       xc_row += 8;
+        if (ce_mode)        xc_row += 9;
+        if (ew_mode)        xc_row += 10;
+        if (hr_mode)        xc_row += 10;
+        if (rd_mode)        xc_row += 13;
+        if (xc_col < 1) xc_col = 1;
+
+        const char *xcbdr = "\033[38;2;80;200;180;48;2;6;14;12m";  /* teal border */
+        const char *xcbg  = "\033[48;2;6;14;12m";
+        const char *xcrst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 \xe2\x96\xa3 Cross-Correlation ",
+                     xc_row, xc_col, xcbdr);
+        for (int i = 24; i < xc_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", xcrst);
+
+        /* Row 1: Window info */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     xc_row + 1, xc_col, xcbdr, xcbg);
+        {
+            int n = sprintf(p, " \033[38;2;120;220;200mWindow: %d/%d  "
+                               "\033[38;2;80;160;140mMean|r|=%.3f  [2]exit",
+                            xc_count, XC_WINDOW, xc_mean_abs_r);
+            p += n;
+            /* Pad */
+            int used = 42 + (xc_count >= 100 ? 1 : 0);
+            for (int i = used; i < xc_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", xcbdr, xcrst);
+
+        /* Row 2: Mini 16×16 matrix header */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     xc_row + 2, xc_col, xcbdr, xcbg);
+        p += sprintf(p, " \033[38;2;80;160;140m      ");
+        for (int j = 0; j < XC_N; j++) {
+            p += sprintf(p, "\033[38;2;120;200;180m%c ", pp_metric_table[j].name[0]);
+        }
+        {
+            int used = 7 + XC_N * 2;
+            for (int i = used; i < xc_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", xcbdr, xcrst);
+
+        /* Rows 3..3+15: Mini heatmap with lag-colored cells */
+        for (int i = 0; i < XC_N; i++) {
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                         xc_row + 3 + i, xc_col, xcbdr, xcbg);
+            p += sprintf(p, " \033[38;2;120;200;180m%-5.5s ", pp_metric_table[i].name);
+            for (int j = 0; j < XC_N; j++) {
+                float r = xc_peak_r[i][j];
+                int lag = xc_peak_lag[i][j];
+                int cr, cg, cb;
+                float ar = fabsf(r);
+                if (i == j) {
+                    /* Diagonal: gray */
+                    cr = cg = cb = 60;
+                } else if (lag < 0) {
+                    /* i leads j: green tones, intensity by |r| */
+                    cr = (int)(20 * ar);
+                    cg = (int)(100 + 155 * ar);
+                    cb = (int)(40 * ar);
+                } else if (lag > 0) {
+                    /* j leads i: blue tones */
+                    cr = (int)(20 * ar);
+                    cg = (int)(40 * ar);
+                    cb = (int)(100 + 155 * ar);
+                } else {
+                    /* Synchronous (lag=0): red/white tones by |r| */
+                    cr = (int)(100 + 155 * ar);
+                    cg = (int)(60 * ar);
+                    cb = (int)(60 * ar);
+                }
+                if (cr > 255) cr = 255; if (cg > 255) cg = 255; if (cb > 255) cb = 255;
+                p += sprintf(p, "\033[48;2;%d;%d;%dm  ", cr, cg, cb);
+                p += sprintf(p, "%s", xcbg);
+            }
+            {
+                int used = 7 + XC_N * 2;
+                for (int i2 = used; i2 < xc_pw - 1; i2++) *p++ = ' ';
+            }
+            p += sprintf(p, "%s\xe2\x94\x82%s", xcbdr, xcrst);
+        }
+
+        /* Separator */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     xc_row + 3 + XC_N, xc_col, xcbdr, xcbg);
+        p += sprintf(p, " \033[38;2;60;120;100m");
+        for (int i = 1; i < xc_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", xcbdr, xcrst);
+
+        /* Top 5 lead-lag pairs */
+        float top_val[XC_TOP];
+        int   top_i[XC_TOP], top_j[XC_TOP], top_lag[XC_TOP];
+        for (int k = 0; k < XC_TOP; k++) {
+            top_val[k] = -1.0f; top_i[k] = 0; top_j[k] = 1; top_lag[k] = 0;
+        }
+        for (int i = 0; i < XC_N; i++) {
+            for (int j = i + 1; j < XC_N; j++) {
+                float ar = fabsf(xc_peak_r[i][j]);
+                for (int k = 0; k < XC_TOP; k++) {
+                    if (ar > top_val[k]) {
+                        for (int m = XC_TOP - 1; m > k; m--) {
+                            top_val[m] = top_val[m-1];
+                            top_i[m] = top_i[m-1];
+                            top_j[m] = top_j[m-1];
+                            top_lag[m] = top_lag[m-1];
+                        }
+                        top_val[k] = ar;
+                        top_i[k] = i;
+                        top_j[k] = j;
+                        top_lag[k] = xc_peak_lag[i][j];
+                        break;
+                    }
+                }
+            }
+        }
+
+        int xc_detail_row = xc_row + 4 + XC_N;
+        for (int k = 0; k < XC_TOP; k++) {
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                         xc_detail_row + k, xc_col, xcbdr, xcbg);
+            /* Direction arrow: → means i leads j (positive lag means j is delayed) */
+            const char *arrow;
+            const char *leader_name, *follower_name;
+            if (top_lag[k] > 0) {
+                /* i leads j */
+                arrow = "\xe2\x86\x92"; /* → */
+                leader_name = pp_metric_table[top_i[k]].name;
+                follower_name = pp_metric_table[top_j[k]].name;
+            } else if (top_lag[k] < 0) {
+                /* j leads i */
+                arrow = "\xe2\x86\x92"; /* → */
+                leader_name = pp_metric_table[top_j[k]].name;
+                follower_name = pp_metric_table[top_i[k]].name;
+            } else {
+                arrow = "\xe2\x87\x94"; /* ⇔ sync */
+                leader_name = pp_metric_table[top_i[k]].name;
+                follower_name = pp_metric_table[top_j[k]].name;
+            }
+            int lag_abs = abs(top_lag[k]);
+            const char *lag_color = (lag_abs == 0) ? "\033[38;2;255;180;80m" :
+                                    (top_lag[k] > 0) ? "\033[38;2;80;255;120m" :
+                                    "\033[38;2;80;120;255m";
+            int n = sprintf(p, " %s%d. %s%s%s%s \033[38;2;200;200;200mr=%+.2f lag=%d",
+                            lag_color, k + 1,
+                            leader_name, arrow, follower_name, lag_color,
+                            xc_peak_r[top_i[k]][top_j[k]], top_lag[k]);
+            p += n;
+            {
+                /* conservative padding */
+                int used2 = 30 + (int)strlen(leader_name) + (int)strlen(follower_name);
+                if (used2 > xc_pw - 1) used2 = xc_pw - 1;
+                for (int i2 = used2; i2 < xc_pw - 1; i2++) *p++ = ' ';
+            }
+            p += sprintf(p, "%s\xe2\x94\x82%s", xcbdr, xcrst);
+        }
+
+        /* Cluster info row */
+        int xc_cluster_row = xc_detail_row + XC_TOP;
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     xc_cluster_row, xc_col, xcbdr, xcbg);
+        {
+            int n = sprintf(p, " \033[38;2;120;220;200mClusters: %d  "
+                               "\033[38;2;80;160;140mLegend: "
+                               "\033[38;2;80;255;120m\xe2\x96\x88\033[38;2;80;160;140mlead "
+                               "\033[38;2;255;100;100m\xe2\x96\x88\033[38;2;80;160;140msync "
+                               "\033[38;2;80;120;255m\xe2\x96\x88\033[38;2;80;160;140mlag",
+                            xc_n_clusters);
+            p += n;
+            int used = 42;
+            for (int i = used; i < xc_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", xcbdr, xcrst);
+
+        /* Sparkline row */
+        int xc_spark_row = xc_cluster_row + 1;
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     xc_spark_row, xc_col, xcbdr, xcbg);
+        p += sprintf(p, " \033[38;2;80;160;140m|r|: ");
+        {
+            const char *spark_chars[] = {"\xe2\x96\x81","\xe2\x96\x82","\xe2\x96\x83",
+                                         "\xe2\x96\x84","\xe2\x96\x85","\xe2\x96\x86",
+                                         "\xe2\x96\x87","\xe2\x96\x88"};
+            int nsp = xc_hist_count < 32 ? xc_hist_count : 32;
+            for (int s = 0; s < nsp; s++) {
+                int si = (xc_hist_idx - nsp + s + XC_HIST_LEN) % XC_HIST_LEN;
+                float v = xc_hist[si];
+                if (v < 0.0f) v = 0.0f;
+                if (v > 1.0f) v = 1.0f;
+                int bi = (int)(v * 7.99f);
+                if (bi > 7) bi = 7;
+                /* Color: low = dim teal, high = bright teal */
+                int sr = 40 + (int)(40 * v);
+                int sg = 120 + (int)(135 * v);
+                int sb = 100 + (int)(100 * v);
+                p += sprintf(p, "\033[38;2;%d;%d;%dm%s", sr, sg, sb, spark_chars[bi]);
+            }
+            for (int i = nsp; i < 32; i++) p += sprintf(p, " ");
+            int used = 6 + 32;
+            for (int i = used; i < xc_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", xcbdr, xcrst);
+
+        /* Bottom border */
+        int xc_bottom = xc_spark_row + 1;
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", xc_bottom, xc_col, xcbdr);
+        for (int i = 0; i < xc_pw; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", xcrst);
+    }
+
     /* ── Percolation Analysis overlay panel ─────────────────────────────── */
     if (perc_mode) {
         int pc_w = 46;
@@ -15726,6 +16286,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (ew_mode)        pc_row += 10;
         if (hr_mode)        pc_row += 10;
         if (rd_mode)        pc_row += 13;
+        if (xc_mode && xc_count >= 20) pc_row += 28;
         if (pc_col < 1) pc_col = 1;
 
         const char *pcbdr = "\033[38;2;255;200;40;48;2;14;12;6m";
@@ -15907,6 +16468,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (ew_mode)        is_row += 10;
         if (hr_mode)        is_row += 10;
         if (rd_mode)        is_row += 13;
+        if (xc_mode && xc_count >= 20) is_row += 28;
         if (perc_mode)      is_row += 10;
         if (is_col < 1) is_col = 1;
 
@@ -16080,6 +16642,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (ew_mode)        pb_row += 10;
         if (hr_mode)        pb_row += 10;
         if (rd_mode)        pb_row += 13;
+        if (xc_mode && xc_count >= 20) pb_row += 28;
         if (perc_mode)      pb_row += 10;
         if (ising_mode)     pb_row += 10;
         if (pb_col < 1) pb_col = 1;
@@ -16296,6 +16859,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (ew_mode)        gd_row_p += 10;
         if (hr_mode)        gd_row_p += 10;
         if (rd_mode)        gd_row_p += 13;
+        if (xc_mode && xc_count >= 20) gd_row_p += 28;
         if (perc_mode)      gd_row_p += 10;
         if (ising_mode)     gd_row_p += 10;
         if (pb_mode)        gd_row_p += 14;
@@ -16434,6 +16998,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (ew_mode)       pp_row += 10;
         if (hr_mode)       pp_row += 10;
         if (rd_mode)       pp_row += 13;
+        if (xc_mode && xc_count >= 20) pp_row += 28;
         if (perc_mode)     pp_row += 10;
         if (ising_mode)    pp_row += 10;
         if (pb_mode)       pp_row += 14;
@@ -16658,6 +17223,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (ew_mode)       cm_row += 10;
         if (hr_mode)       cm_row += 10;
         if (rd_mode)       cm_row += 13;
+        if (xc_mode && xc_count >= 20) cm_row += 28;
         if (perc_mode)     cm_row += 10;
         if (ising_mode)    cm_row += 10;
         if (pb_mode)       cm_row += 14;
@@ -16866,6 +17432,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (ew_mode)        ps_row_p += 10;
         if (hr_mode)        ps_row_p += 10;
         if (rd_mode)        ps_row_p += 13;
+        if (xc_mode && xc_count >= 20) ps_row_p += 28;
         if (perc_mode)      ps_row_p += 10;
         if (ising_mode)     ps_row_p += 10;
         if (pb_mode)        ps_row_p += 14;
@@ -17109,6 +17676,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (ew_mode)        rp_row_p += 10;
         if (hr_mode)        rp_row_p += 10;
         if (rd_mode)        rp_row_p += 13;
+        if (xc_mode && xc_count >= 20) rp_row_p += 28;
         if (perc_mode)      rp_row_p += 10;
         if (ising_mode)     rp_row_p += 10;
         if (pb_mode)        rp_row_p += 14;
@@ -17314,6 +17882,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (ew_mode)        sa_row_p += 10;
         if (hr_mode)        sa_row_p += 10;
         if (rd_mode)        sa_row_p += 13;
+        if (xc_mode && xc_count >= 20) sa_row_p += 28;
         if (perc_mode)      sa_row_p += 10;
         if (ising_mode)     sa_row_p += 10;
         if (pb_mode)        sa_row_p += 14;
@@ -17544,6 +18113,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (ew_mode)        pt_row_p += 10;
         if (hr_mode)        pt_row_p += 10;
         if (rd_mode)        pt_row_p += 13;
+        if (xc_mode && xc_count >= 20) pt_row_p += 28;
         if (perc_mode)      pt_row_p += 10;
         if (ising_mode)     pt_row_p += 10;
         if (pb_mode)        pt_row_p += 14;
@@ -18965,6 +19535,19 @@ int main(int argc, char **argv) {
                 }
             }
         }
+        else if (key == '2') {
+            if (!ecosystem_mode) {
+                xc_mode = !xc_mode;
+                if (xc_mode) {
+                    xc_reset();
+                    flash_set("Cross-Correlation: lead-lag relationships [2]exit");
+                    printf("\033[2J"); fflush(stdout);
+                } else {
+                    flash_set("Cross-Correlation off");
+                    printf("\033[2J"); fflush(stdout);
+                }
+            }
+        }
         else if (key == '?') {
             if (probe_mode > 0) {
                 probe_mode = 0; /* toggle off */
@@ -19678,6 +20261,14 @@ int main(int argc, char **argv) {
         if (rd_mode && running && (generation % 4 == 0)) {
             rd_stale = 1;
             rd_compute();
+        }
+
+        /* Cross-Correlation Matrix: record and compute every 2 generations */
+        if (xc_mode && running && (generation % 2 == 0)) {
+            xc_record();
+            if (xc_stale && xc_count >= 20) {
+                xc_compute();
+            }
         }
 
         render(running, speed_ms, draw_mode);

@@ -1047,7 +1047,7 @@ static int   probe_y = -1;            /* selected cell y */
    Toggle with '\\' key. TAB cycles the right panel, '`' cycles the left. */
 
 /* Overlay table: ordered list of analysis overlays for cycling */
-#define N_SPLIT_OVERLAYS 33
+#define N_SPLIT_OVERLAYS 34
 typedef struct {
     const char *name;   /* short display name */
     char key;           /* toggle key character */
@@ -1087,6 +1087,7 @@ static const SplitOverlayInfo split_overlay_table[N_SPLIT_OVERLAYS] = {
     { "PowerSpec",     '6'  },  /* 30 */
     { "EarlyWarn",    '3'  },  /* 31 */
     { "HurstExp",     '4'  },  /* 32 */
+    { "Dashboard",    '5'  },  /* 33 */
 };
 
 static int split_mode = 0;         /* 0=off, 1=on */
@@ -1335,6 +1336,55 @@ static void hr_reset(void) {
     memset(hr_grid, 0, sizeof(float) * MAX_H * MAX_W);
 }
 
+/* ── Regime Dashboard ────────────────────────────────────────────────────── */
+/* Synthesis overlay that aggregates signals from all meta-analytical overlays
+   into a unified status panel.  Reads from: Wolfram classifier (19), early
+   warning (31), Hurst exponent (32), power spectrum (30), causal emergence (29),
+   and anomaly detector.  No new algorithms — pure aggregation.
+   Toggle with '5' key. */
+
+#define RD_HIST_LEN 64   /* sparkline history length */
+
+static int   rd_mode = 0;           /* 0=off, 1=on */
+static int   rd_stale = 1;
+
+/* Cached dashboard state (updated each compute) */
+static int   rd_regime = 0;         /* Wolfram class 0-4 */
+static float rd_regime_conf = 0.0f; /* confidence */
+static float rd_risk = 0.0f;       /* transition risk [0,1] from EW */
+static float rd_hurst = 0.5f;      /* global Hurst H */
+static float rd_peak_period = 0.0f; /* dominant period from PS */
+static int   rd_peak_freq_metric = 0; /* which metric has strongest spectral peak */
+static int   rd_emerg_scale = 0;    /* peak EI scale from CE */
+static float rd_emerg_idx = 0.0f;   /* emergence index from CE */
+static int   rd_n_anomalies = 0;    /* active anomaly count from AD */
+
+/* Sparkline histories */
+static float rd_risk_hist[RD_HIST_LEN];
+static float rd_hurst_hist[RD_HIST_LEN];
+static int   rd_hist_idx = 0;
+static int   rd_hist_count = 0;
+
+/* Per-cell composite grid: weighted blend of available per-cell grids */
+static float rd_grid[MAX_H][MAX_W];
+
+static void rd_compute(void);
+static void rd_reset(void) {
+    rd_stale = 1;
+    rd_regime = 0;
+    rd_regime_conf = 0.0f;
+    rd_risk = 0.0f;
+    rd_hurst = 0.5f;
+    rd_peak_period = 0.0f;
+    rd_peak_freq_metric = 0;
+    rd_emerg_scale = 0;
+    rd_emerg_idx = 0.0f;
+    rd_n_anomalies = 0;
+    rd_hist_idx = 0;
+    rd_hist_count = 0;
+    memset(rd_grid, 0, sizeof(float) * MAX_H * MAX_W);
+}
+
 /* ── Anomaly Detector ─────────────────────────────────────────────────────── */
 /* Real-time watchdog that monitors all 16 scalar metrics for statistical
    anomalies.  Maintains running mean and variance (Welford's algorithm) over
@@ -1437,6 +1487,7 @@ static void split_set_overlay(int idx) {
         case 30: ps_mode = 1; break;
         case 31: ew_mode = 1; break;
         case 32: hr_mode = 1; break;
+        case 33: rd_mode = 1; break;
     }
 }
 
@@ -1473,6 +1524,7 @@ static int split_detect_current(void) {
     if (ps_mode) return 30;
     if (ew_mode) return 31;
     if (hr_mode) return 32;
+    if (rd_mode) return 33;
     return 0;
 }
 
@@ -7541,6 +7593,66 @@ static void hr_compute(void) {
     }
 }
 
+/* ── Regime Dashboard computation ─────────────────────────────────────────── */
+static void rd_compute(void) {
+    /* 1. Wolfram regime — read directly from wolfram classifier state */
+    rd_regime = wolfram_class;
+    rd_regime_conf = wolfram_confidence;
+
+    /* If wolfram hasn't been run yet this session, trigger a classify */
+    if (rd_regime == 0 && !wolfram_mode) {
+        wolfram_classify();
+        rd_regime = wolfram_class;
+        rd_regime_conf = wolfram_confidence;
+    }
+
+    /* 2. Transition risk — from early warning global warning level */
+    rd_risk = ew_global_warning;
+
+    /* 3. Hurst exponent — global H */
+    rd_hurst = hr_global_h;
+
+    /* 4. Dominant frequency — find metric with strongest spectral peak */
+    {
+        float max_pow = 0.0f;
+        int best_m = 0;
+        for (int m = 0; m < PS_N; m++) {
+            if (ps_total_power[m] > max_pow) {
+                max_pow = ps_total_power[m];
+                best_m = m;
+            }
+        }
+        rd_peak_freq_metric = best_m;
+        rd_peak_period = ps_peak_period[best_m];
+    }
+
+    /* 5. Causal emergence — peak scale and emergence index */
+    rd_emerg_scale = ce_peak_scale;
+    rd_emerg_idx = ce_emergence_idx;
+
+    /* 6. Active anomalies from anomaly detector */
+    rd_n_anomalies = ad_n_alerts;
+
+    /* Record sparkline histories */
+    rd_risk_hist[rd_hist_idx] = rd_risk;
+    rd_hurst_hist[rd_hist_idx] = rd_hurst;
+    rd_hist_idx = (rd_hist_idx + 1) % RD_HIST_LEN;
+    if (rd_hist_count < RD_HIST_LEN) rd_hist_count++;
+
+    /* Per-cell composite grid: blend EW warning + Hurst deviation + CE scale */
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            float ew_v = ew_grid[y][x];                       /* [0,1] warning */
+            float hr_v = fabsf(hr_grid[y][x] - 0.5f) * 2.0f; /* [0,1] memory strength */
+            float ce_v = ce_grid[y][x] / 3.0f;                /* [0,1] emergence scale */
+            /* Weighted composite: risk most visible, then memory, then emergence */
+            rd_grid[y][x] = ew_v * 0.5f + hr_v * 0.3f + ce_v * 0.2f;
+        }
+    }
+
+    rd_stale = 0;
+}
+
 /* ── Causal Emergence computation ──────────────────────────────────────────── */
 /* Color mapping: scale 0 (micro best) = cool blue,
    scale 1 (2x2) = green, scale 2 (4x4) = warm orange,
@@ -8830,6 +8942,7 @@ static void split_ensure_computed(int idx) {
         case 28: if (coh_stale) coh_compute(); break;
         case 29: if (ce_stale) ce_compute(); break;
         case 31: if (ew_stale && ew_count >= 16) ew_compute(); break;
+        case 33: if (rd_stale) rd_compute(); break;
         default: break;
     }
 }
@@ -10526,6 +10639,45 @@ static int cell_color(int x, int y, RGB *out) {
             }
             out->r = r; out->g = g; out->b = b;
             return grid[y][x] ? 1 : 32; /* 32 = hurst ghost */
+        }
+        return 0;
+    }
+
+    /* Regime Dashboard overlay: composite heatmap */
+    if (rd_mode) {
+        float v = rd_grid[y][x];
+        if (grid[y][x] || v > 0.05f) {
+            /* Low composite → cool blue/green (stable), high → warm orange/red (active) */
+            unsigned char r, g, b;
+            if (v < 0.25f) {
+                float t = v / 0.25f;
+                r = (unsigned char)(10 + 20 * t);
+                g = (unsigned char)(40 + 100 * t);
+                b = (unsigned char)(80 + 60 * t);
+            } else if (v < 0.5f) {
+                float t = (v - 0.25f) / 0.25f;
+                r = (unsigned char)(30 + 80 * t);
+                g = (unsigned char)(140 + 40 * t);
+                b = (unsigned char)(140 - 40 * t);
+            } else if (v < 0.75f) {
+                float t = (v - 0.5f) / 0.25f;
+                r = (unsigned char)(110 + 100 * t);
+                g = (unsigned char)(180 - 60 * t);
+                b = (unsigned char)(100 - 60 * t);
+            } else {
+                float t = (v - 0.75f) / 0.25f;
+                if (t > 1.0f) t = 1.0f;
+                r = (unsigned char)(210 + 45 * t);
+                g = (unsigned char)(120 - 70 * t);
+                b = (unsigned char)(40 + 20 * t);
+            }
+            if (grid[y][x]) {
+                r = (unsigned char)(r < 200 ? r + 55 : 255);
+                g = (unsigned char)(g < 200 ? g + 55 : 255);
+                b = (unsigned char)(b < 200 ? b + 55 : 255);
+            }
+            out->r = r; out->g = g; out->b = b;
+            return grid[y][x] ? 1 : 33; /* 33 = dashboard ghost */
         }
         return 0;
     }
@@ -15296,6 +15448,254 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", hrrst);
     }
 
+    /* ── Regime Dashboard overlay panel ────────────────────────────────── */
+    if (rd_mode) {
+        int rd_w = 50;
+        int rd_col = term_cols - rd_w - 2;
+        int rd_row = 3;
+        if (entropy_mode)   rd_row += 8;
+        if (temp_mode)      rd_row += 9;
+        if (lyapunov_mode)  rd_row += 8;
+        if (fourier_mode)   rd_row += 18;
+        if (fractal_mode)   rd_row += 11;
+        if (wolfram_mode)   rd_row += 14;
+        if (flow_mode)      rd_row += 9;
+        if (attractor_mode) rd_row += 8;
+        if (cone_mode >= 1) rd_row += 8;
+        if (surp_mode)      rd_row += 8;
+        if (mi_mode)        rd_row += 12;
+        if (cplx_mode)      rd_row += 11;
+        if (topo_mode)      rd_row += 11;
+        if (rg_mode)        rd_row += 11;
+        if (kc_mode)        rd_row += 9;
+        if (corr_mode)      rd_row += 9;
+        if (eprod_mode)     rd_row += 9;
+        if (vort_mode)      rd_row += 9;
+        if (wave_mode)      rd_row += 9;
+        if (ergo_mode)      rd_row += 10;
+        if (coh_mode)       rd_row += 8;
+        if (ce_mode)        rd_row += 9;
+        if (ew_mode)        rd_row += 10;
+        if (hr_mode)        rd_row += 10;
+        if (rd_col < 1) rd_col = 1;
+
+        const char *rdbdr = "\033[38;2;220;180;255;48;2;8;6;14m";  /* lavender border */
+        const char *rdbg  = "\033[48;2;8;6;14m";
+        const char *rdrst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 \xe2\x96\xa3 Regime Dashboard ",
+                     rd_row, rd_col, rdbdr);
+        for (int i = 24; i < rd_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", rdrst);
+
+        /* Row 1: Current regime (Wolfram class) */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     rd_row + 1, rd_col, rdbdr, rdbg);
+        p += sprintf(p, " \033[38;2;160;140;200mRegime: ");
+        {
+            const char *class_names[] = {"???", "I Fixed", "II Periodic", "III Chaotic", "IV Complex"};
+            const char *class_colors[] = {
+                "\033[38;2;80;80;80m",        /* unknown: dim */
+                "\033[38;2;60;60;120m",        /* I: dark blue */
+                "\033[38;2;60;180;120m",        /* II: green */
+                "\033[1;38;2;255;100;60m",     /* III: bright red */
+                "\033[1;38;2;255;220;60m"      /* IV: bright gold */
+            };
+            int ci = rd_regime;
+            if (ci < 0 || ci > 4) ci = 0;
+            p += sprintf(p, "%s%-12s", class_colors[ci], class_names[ci]);
+            p += sprintf(p, "\033[38;2;120;100;160m conf:%.0f%%", rd_regime_conf * 100.0f);
+        }
+        p += sprintf(p, "%s", rdbg);
+        { int used = 35; for (int i = used; i < rd_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", rdbdr, rdrst);
+
+        /* Row 2: Transition risk (early warning) */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     rd_row + 2, rd_col, rdbdr, rdbg);
+        p += sprintf(p, " \033[38;2;160;140;200mRisk:   ");
+        {
+            /* Risk bar: 20 chars wide */
+            int bar = (int)(rd_risk * 20.0f + 0.5f);
+            if (bar > 20) bar = 20;
+            for (int i = 0; i < 20; i++) {
+                float t = (float)i / 19.0f;
+                if (i < bar) {
+                    unsigned char br = (unsigned char)(40 + 215 * t);
+                    unsigned char bg2 = (unsigned char)(200 - 150 * t);
+                    p += sprintf(p, "\033[38;2;%d;%d;40m\xe2\x96\x88", br, bg2);
+                } else {
+                    p += sprintf(p, "\033[38;2;30;30;40m\xe2\x96\x91");
+                }
+            }
+            p += sprintf(p, " ");
+            if (rd_risk < 0.25f)
+                p += sprintf(p, "\033[38;2;40;200;80mLOW   ");
+            else if (rd_risk < 0.5f)
+                p += sprintf(p, "\033[38;2;200;200;40mMODER ");
+            else if (rd_risk < 0.75f)
+                p += sprintf(p, "\033[1;38;2;255;140;40mHIGH  ");
+            else
+                p += sprintf(p, "\033[1;38;2;255;60;60mCRIT! ");
+        }
+        p += sprintf(p, "%s", rdbg);
+        { int used = 35; for (int i = used; i < rd_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", rdbdr, rdrst);
+
+        /* Row 3: Memory character (Hurst H) */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     rd_row + 3, rd_col, rdbdr, rdbg);
+        p += sprintf(p, " \033[38;2;160;140;200mMemory: ");
+        if (rd_hurst > 0.6f)
+            p += sprintf(p, "\033[1;38;2;40;200;255mH=%.3f PERSISTENT  ", rd_hurst);
+        else if (rd_hurst < 0.4f)
+            p += sprintf(p, "\033[1;38;2;255;140;40mH=%.3f ANTI-PERSIST", rd_hurst);
+        else
+            p += sprintf(p, "\033[38;2;140;140;140mH=%.3f Brownian    ", rd_hurst);
+        p += sprintf(p, "%s", rdbg);
+        { int used = 35; for (int i = used; i < rd_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", rdbdr, rdrst);
+
+        /* Row 4: Dominant frequency (power spectrum) */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     rd_row + 4, rd_col, rdbdr, rdbg);
+        p += sprintf(p, " \033[38;2;160;140;200mFreq:   ");
+        if (rd_peak_period > 0.0f)
+            p += sprintf(p, "\033[38;2;180;200;255mT=%.1f gen  \033[38;2;120;100;160m(%s)",
+                         rd_peak_period, pp_metric_table[rd_peak_freq_metric].name);
+        else
+            p += sprintf(p, "\033[38;2;80;80;80m(no spectral data)       ");
+        p += sprintf(p, "%s", rdbg);
+        { int used = 38; for (int i = used; i < rd_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", rdbdr, rdrst);
+
+        /* Row 5: Emergence scale (causal emergence) */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     rd_row + 5, rd_col, rdbdr, rdbg);
+        p += sprintf(p, " \033[38;2;160;140;200mEmrg:   ");
+        {
+            const char *scale_names[] = {"1\xc3\x97" "1 micro", "2\xc3\x97" "2 meso", "4\xc3\x97" "4 macro", "8\xc3\x97" "8 mega"};
+            const char *scale_colors[] = {
+                "\033[38;2;60;90;160m", "\033[38;2;60;180;120m",
+                "\033[38;2;220;160;40m", "\033[1;38;2;255;80;60m"
+            };
+            int si = rd_emerg_scale;
+            if (si < 0) si = 0;
+            if (si > 3) si = 3;
+            p += sprintf(p, "%s%-10s", scale_colors[si], scale_names[si]);
+            p += sprintf(p, "\033[38;2;120;100;160m idx:%.2f", rd_emerg_idx);
+        }
+        p += sprintf(p, "%s", rdbg);
+        { int used = 34; for (int i = used; i < rd_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", rdbdr, rdrst);
+
+        /* Row 6: Active anomalies */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     rd_row + 6, rd_col, rdbdr, rdbg);
+        p += sprintf(p, " \033[38;2;160;140;200mAnomal: ");
+        if (rd_n_anomalies > 0) {
+            p += sprintf(p, "\033[1;38;2;255;60;60m%d ACTIVE ", rd_n_anomalies);
+            /* Show first 2 alert details */
+            for (int a = 0; a < rd_n_anomalies && a < 2; a++) {
+                int mi = ad_alerts[a].metric;
+                p += sprintf(p, "\033[38;2;255;160;80m%s%c%.1f\xcf\x83 ",
+                             pp_metric_table[mi].name,
+                             ad_alerts[a].direction > 0 ? '+' : '-',
+                             fabsf(ad_alerts[a].zscore));
+            }
+        } else {
+            p += sprintf(p, "\033[38;2;40;180;80mnone                     ");
+        }
+        p += sprintf(p, "%s", rdbg);
+        { int used = 40; for (int i = used; i < rd_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", rdbdr, rdrst);
+
+        /* Row 7: Separator */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     rd_row + 7, rd_col, rdbdr, rdbg);
+        p += sprintf(p, " \033[38;2;80;60;120m");
+        for (int i = 0; i < rd_w - 3; i++) p += sprintf(p, "\xe2\x94\x80");
+        p += sprintf(p, " ");
+        p += sprintf(p, "%s\xe2\x94\x82%s", rdbdr, rdrst);
+
+        /* Row 8: Risk sparkline */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     rd_row + 8, rd_col, rdbdr, rdbg);
+        p += sprintf(p, " \033[38;2;120;100;160mRisk: ");
+        {
+            const char *spark_chars[] = {"\xe2\x96\x81","\xe2\x96\x82","\xe2\x96\x83",
+                                         "\xe2\x96\x84","\xe2\x96\x85","\xe2\x96\x86",
+                                         "\xe2\x96\x87","\xe2\x96\x88"};
+            int slen = rd_hist_count < 32 ? rd_hist_count : 32;
+            for (int i = 0; i < slen; i++) {
+                int idx = (rd_hist_idx - slen + i + RD_HIST_LEN) % RD_HIST_LEN;
+                float v = rd_risk_hist[idx];
+                if (v < 0.0f) v = 0.0f;
+                if (v > 1.0f) v = 1.0f;
+                int si = (int)(v * 7.99f);
+                if (si > 7) si = 7;
+                /* Green to red gradient */
+                unsigned char sr = (unsigned char)(40 + 215 * v);
+                unsigned char sg2 = (unsigned char)(200 - 160 * v);
+                p += sprintf(p, "\033[38;2;%d;%d;40m%s", sr, sg2, spark_chars[si]);
+            }
+        }
+        p += sprintf(p, "%s", rdbg);
+        { int used = 6 + (rd_hist_count < 32 ? rd_hist_count : 32);
+          for (int i = used; i < rd_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", rdbdr, rdrst);
+
+        /* Row 9: Hurst sparkline */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     rd_row + 9, rd_col, rdbdr, rdbg);
+        p += sprintf(p, " \033[38;2;120;100;160mH\xcc\x84:   ");
+        {
+            const char *spark_chars[] = {"\xe2\x96\x81","\xe2\x96\x82","\xe2\x96\x83",
+                                         "\xe2\x96\x84","\xe2\x96\x85","\xe2\x96\x86",
+                                         "\xe2\x96\x87","\xe2\x96\x88"};
+            int slen = rd_hist_count < 32 ? rd_hist_count : 32;
+            for (int i = 0; i < slen; i++) {
+                int idx = (rd_hist_idx - slen + i + RD_HIST_LEN) % RD_HIST_LEN;
+                float v = rd_hurst_hist[idx];
+                if (v < 0.0f) v = 0.0f;
+                if (v > 1.0f) v = 1.0f;
+                int si = (int)(v * 7.99f);
+                if (si > 7) si = 7;
+                unsigned char sr, sg2, sb;
+                if (v > 0.6f) { sr = 40; sg2 = (unsigned char)(160 + 80 * v); sb = (unsigned char)(200 + 55 * v); }
+                else if (v < 0.4f) { sr = (unsigned char)(200 + 55 * v); sg2 = (unsigned char)(120 + 40 * v); sb = 40; }
+                else { sr = 120; sg2 = 120; sb = 120; }
+                p += sprintf(p, "\033[38;2;%d;%d;%dm%s", sr, sg2, sb, spark_chars[si]);
+            }
+        }
+        p += sprintf(p, "%s", rdbg);
+        { int used = 6 + (rd_hist_count < 32 ? rd_hist_count : 32);
+          for (int i = used; i < rd_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", rdbdr, rdrst);
+
+        /* Row 10: Color legend */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     rd_row + 10, rd_col, rdbdr, rdbg);
+        p += sprintf(p, " \033[38;2;80;60;120mgrid: ");
+        p += sprintf(p, "\033[38;2;10;60;80m\xe2\x96\x88\033[38;2;60;140;120m\xe2\x96\x88");
+        p += sprintf(p, "\033[38;2;120;100;160m stable ");
+        p += sprintf(p, "\033[38;2;160;160;60m\xe2\x96\x88\033[38;2;210;120;40m\xe2\x96\x88");
+        p += sprintf(p, "\033[38;2;120;100;160m active ");
+        p += sprintf(p, "\033[38;2;255;50;60m\xe2\x96\x88");
+        p += sprintf(p, "\033[38;2;120;100;160m critical");
+        p += sprintf(p, "%s", rdbg);
+        { int used = 36; for (int i = used; i < rd_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", rdbdr, rdrst);
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", rd_row + 11, rd_col, rdbdr);
+        for (int i = 0; i < rd_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", rdrst);
+    }
+
     /* ── Percolation Analysis overlay panel ─────────────────────────────── */
     if (perc_mode) {
         int pc_w = 46;
@@ -15325,6 +15725,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (ce_mode)        pc_row += 9;
         if (ew_mode)        pc_row += 10;
         if (hr_mode)        pc_row += 10;
+        if (rd_mode)        pc_row += 13;
         if (pc_col < 1) pc_col = 1;
 
         const char *pcbdr = "\033[38;2;255;200;40;48;2;14;12;6m";
@@ -15505,6 +15906,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (ce_mode)        is_row += 9;
         if (ew_mode)        is_row += 10;
         if (hr_mode)        is_row += 10;
+        if (rd_mode)        is_row += 13;
         if (perc_mode)      is_row += 10;
         if (is_col < 1) is_col = 1;
 
@@ -15677,6 +16079,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (ce_mode)        pb_row += 9;
         if (ew_mode)        pb_row += 10;
         if (hr_mode)        pb_row += 10;
+        if (rd_mode)        pb_row += 13;
         if (perc_mode)      pb_row += 10;
         if (ising_mode)     pb_row += 10;
         if (pb_col < 1) pb_col = 1;
@@ -15892,6 +16295,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (ce_mode)        gd_row_p += 9;
         if (ew_mode)        gd_row_p += 10;
         if (hr_mode)        gd_row_p += 10;
+        if (rd_mode)        gd_row_p += 13;
         if (perc_mode)      gd_row_p += 10;
         if (ising_mode)     gd_row_p += 10;
         if (pb_mode)        gd_row_p += 14;
@@ -16029,6 +16433,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (ce_mode)       pp_row += 9;
         if (ew_mode)       pp_row += 10;
         if (hr_mode)       pp_row += 10;
+        if (rd_mode)       pp_row += 13;
         if (perc_mode)     pp_row += 10;
         if (ising_mode)    pp_row += 10;
         if (pb_mode)       pp_row += 14;
@@ -16252,6 +16657,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (ce_mode)       cm_row += 9;
         if (ew_mode)       cm_row += 10;
         if (hr_mode)       cm_row += 10;
+        if (rd_mode)       cm_row += 13;
         if (perc_mode)     cm_row += 10;
         if (ising_mode)    cm_row += 10;
         if (pb_mode)       cm_row += 14;
@@ -16459,6 +16865,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (ce_mode)        ps_row_p += 9;
         if (ew_mode)        ps_row_p += 10;
         if (hr_mode)        ps_row_p += 10;
+        if (rd_mode)        ps_row_p += 13;
         if (perc_mode)      ps_row_p += 10;
         if (ising_mode)     ps_row_p += 10;
         if (pb_mode)        ps_row_p += 14;
@@ -16701,6 +17108,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (ce_mode)        rp_row_p += 9;
         if (ew_mode)        rp_row_p += 10;
         if (hr_mode)        rp_row_p += 10;
+        if (rd_mode)        rp_row_p += 13;
         if (perc_mode)      rp_row_p += 10;
         if (ising_mode)     rp_row_p += 10;
         if (pb_mode)        rp_row_p += 14;
@@ -16905,6 +17313,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (ce_mode)        sa_row_p += 9;
         if (ew_mode)        sa_row_p += 10;
         if (hr_mode)        sa_row_p += 10;
+        if (rd_mode)        sa_row_p += 13;
         if (perc_mode)      sa_row_p += 10;
         if (ising_mode)     sa_row_p += 10;
         if (pb_mode)        sa_row_p += 14;
@@ -17134,6 +17543,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (ce_mode)        pt_row_p += 9;
         if (ew_mode)        pt_row_p += 10;
         if (hr_mode)        pt_row_p += 10;
+        if (rd_mode)        pt_row_p += 13;
         if (perc_mode)      pt_row_p += 10;
         if (ising_mode)     pt_row_p += 10;
         if (pb_mode)        pt_row_p += 14;
@@ -18539,6 +18949,22 @@ int main(int argc, char **argv) {
                 }
             }
         }
+        else if (key == '5') {
+            if (!ecosystem_mode) {
+                rd_mode = !rd_mode;
+                if (rd_mode) {
+                    rd_reset();
+                    /* Activate dependent data feeds silently */
+                    if (!ew_mode) { ew_mode = 1; ew_reset(); }
+                    if (!hr_mode) { hr_mode = 1; hr_reset(); }
+                    flash_set("Regime Dashboard: unified status [5]exit");
+                    printf("\033[2J"); fflush(stdout);
+                } else {
+                    flash_set("Regime Dashboard off");
+                    printf("\033[2J"); fflush(stdout);
+                }
+            }
+        }
         else if (key == '?') {
             if (probe_mode > 0) {
                 probe_mode = 0; /* toggle off */
@@ -19246,6 +19672,12 @@ int main(int argc, char **argv) {
             if (hr_stale && hr_count >= 32) {
                 hr_compute();
             }
+        }
+
+        /* Regime Dashboard: recompute synthesis every 4 generations */
+        if (rd_mode && running && (generation % 4 == 0)) {
+            rd_stale = 1;
+            rd_compute();
         }
 
         render(running, speed_ms, draw_mode);

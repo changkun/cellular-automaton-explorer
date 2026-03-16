@@ -1801,6 +1801,79 @@ static void sg2_reset(void) {
     memset(sg2_hist_crit, 0, sizeof(sg2_hist_crit));
 }
 
+/* ── Order Parameter Susceptibility ────────────────────────────────────────── */
+/* Computes the local susceptibility field χ(x,y) = N·Var(ρ) in sliding
+   spatial patches over a rolling time window.  For each 8×8 patch, tracks
+   the running mean and variance of local density (fraction of alive cells)
+   over the last 64 frames using Welford's online algorithm.
+   High χ signals proximity to a phase transition (fluctuation-dissipation
+   theorem: χ diverges at criticality).
+   Also computes the Binder cumulant U₄ = 1 − ⟨m⁴⟩/(3⟨m²⟩²) as a
+   universal crossing diagnostic.
+   Ghost code = 41.  Toggle with Ctrl-U key. */
+
+#define SU_PATCH   8     /* patch size (8×8) */
+#define SU_TWINDOW 64    /* rolling time window in frames */
+#define SU_HIST_LEN 64   /* sparkline history */
+#define SU_MAX_PX  (MAX_W / SU_PATCH)  /* max patches in x */
+#define SU_MAX_PY  (MAX_H / SU_PATCH)  /* max patches in y */
+
+static int   su_mode = 0;
+static int   su_stale = 1;
+static int   su_frame = 0;  /* frames collected so far */
+
+/* Per-patch rolling statistics (Welford online) */
+static float su_mean[SU_MAX_PY][SU_MAX_PX];   /* running mean density */
+static float su_m2[SU_MAX_PY][SU_MAX_PX];     /* running sum of squared deviations */
+static int   su_n[SU_MAX_PY][SU_MAX_PX];      /* count of observations */
+
+/* Per-patch density ring buffer for exact rolling window */
+static float su_ring[SU_MAX_PY][SU_MAX_PX][SU_TWINDOW];
+static int   su_ring_idx = 0;
+static int   su_ring_full = 0;  /* 1 once we have SU_TWINDOW frames */
+
+/* Per-patch susceptibility result (for grid rendering) */
+static float su_chi[SU_MAX_PY][SU_MAX_PX];
+
+/* Per-cell interpolated susceptibility (for smooth rendering) */
+static float su_cell[MAX_H][MAX_W];
+
+/* Global statistics */
+static float su_global_chi = 0.0f;     /* mean χ across all patches */
+static float su_max_chi = 0.0f;        /* peak χ */
+static int   su_peak_px = 0, su_peak_py = 0;  /* location of peak χ */
+static float su_binder = 0.0f;         /* Binder cumulant U₄ */
+static int   su_npx = 0, su_npy = 0;   /* actual patch grid dimensions */
+
+/* Sparkline history */
+static float su_hist_chi[SU_HIST_LEN];
+static float su_hist_binder[SU_HIST_LEN];
+static int   su_hist_idx = 0;
+static int   su_hist_count = 0;
+
+static void su_compute(void);
+static void su_reset(void) {
+    su_stale = 1;
+    su_frame = 0;
+    su_ring_idx = 0;
+    su_ring_full = 0;
+    su_global_chi = 0.0f;
+    su_max_chi = 0.0f;
+    su_peak_px = su_peak_py = 0;
+    su_binder = 0.0f;
+    su_npx = su_npy = 0;
+    su_hist_idx = 0;
+    su_hist_count = 0;
+    memset(su_mean, 0, sizeof(su_mean));
+    memset(su_m2, 0, sizeof(su_m2));
+    memset(su_n, 0, sizeof(su_n));
+    memset(su_ring, 0, sizeof(su_ring));
+    memset(su_chi, 0, sizeof(su_chi));
+    memset(su_cell, 0, sizeof(su_cell));
+    memset(su_hist_chi, 0, sizeof(su_hist_chi));
+    memset(su_hist_binder, 0, sizeof(su_hist_binder));
+}
+
 /* ── Cross-Correlation Matrix ──────────────────────────────────────────────── */
 /* Computes pairwise time-lagged cross-correlation across all 16 metric streams
    at lags -8 to +8.  For each pair, identifies the optimal lag (peak |r|),
@@ -2017,6 +2090,7 @@ static int split_detect_current(void) {
     if (mf_mode) return 37;
     if (ri_mode) return 38;
     if (sg2_mode) return 39;
+    if (su_mode) return 40;
     return 0;
 }
 
@@ -3379,6 +3453,7 @@ static void grid_step(void) {
     mf_stale = 1;
     ri_stale = 1;
     sg2_stale = 1;
+    su_stale = 1;
 
     /* Always record frames for surprise field (cheap memcpy) */
     surp_record_frame();
@@ -9233,6 +9308,115 @@ static void sg2_compute(void) {
     if (sg2_hist_count < SG2_HIST_LEN) sg2_hist_count++;
 }
 
+/* ── Order Parameter Susceptibility computation ────────────────────────────── */
+static void su_compute(void) {
+    su_stale = 0;
+
+    /* Determine patch grid dimensions */
+    su_npx = W / SU_PATCH;
+    su_npy = H / SU_PATCH;
+    if (su_npx < 1) su_npx = 1;
+    if (su_npy < 1) su_npy = 1;
+    if (su_npx > SU_MAX_PX) su_npx = SU_MAX_PX;
+    if (su_npy > SU_MAX_PY) su_npy = SU_MAX_PY;
+
+    int patch_area = SU_PATCH * SU_PATCH;
+
+    /* Phase 1: Compute current density per patch and store in ring buffer */
+    for (int py = 0; py < su_npy; py++) {
+        for (int px = 0; px < su_npx; px++) {
+            int alive = 0;
+            int y0 = py * SU_PATCH, x0 = px * SU_PATCH;
+            for (int dy = 0; dy < SU_PATCH && y0 + dy < H; dy++)
+                for (int dx = 0; dx < SU_PATCH && x0 + dx < W; dx++)
+                    if (grid[y0 + dy][x0 + dx]) alive++;
+            float rho = (float)alive / (float)patch_area;
+            su_ring[py][px][su_ring_idx] = rho;
+        }
+    }
+    su_ring_idx = (su_ring_idx + 1) % SU_TWINDOW;
+    su_frame++;
+    if (su_frame >= SU_TWINDOW) su_ring_full = 1;
+
+    int nframes = su_ring_full ? SU_TWINDOW : su_frame;
+    if (nframes < 4) return;  /* need minimum samples */
+
+    /* Phase 2: Compute variance and susceptibility per patch */
+    float sum_chi = 0.0f;
+    su_max_chi = 0.0f;
+    int n_patches = 0;
+
+    /* For Binder cumulant: accumulate ⟨m²⟩ and ⟨m⁴⟩ across patches */
+    float sum_m2 = 0.0f, sum_m4 = 0.0f;
+
+    for (int py = 0; py < su_npy; py++) {
+        for (int px = 0; px < su_npx; px++) {
+            /* Compute mean and variance over rolling window */
+            float mean = 0.0f;
+            for (int i = 0; i < nframes; i++)
+                mean += su_ring[py][px][i];
+            mean /= (float)nframes;
+
+            float var = 0.0f, m4 = 0.0f;
+            for (int i = 0; i < nframes; i++) {
+                float d = su_ring[py][px][i] - mean;
+                float d2 = d * d;
+                var += d2;
+                m4 += d2 * d2;
+            }
+            var /= (float)nframes;
+            m4 /= (float)nframes;
+
+            /* χ = N · Var(ρ) — fluctuation-dissipation form */
+            float chi = (float)patch_area * var;
+
+            su_chi[py][px] = chi;
+            su_mean[py][px] = mean;
+            su_m2[py][px] = var;
+
+            sum_chi += chi;
+            n_patches++;
+
+            if (chi > su_max_chi) {
+                su_max_chi = chi;
+                su_peak_px = px;
+                su_peak_py = py;
+            }
+
+            /* Binder cumulant accumulators */
+            sum_m2 += var;
+            sum_m4 += m4;
+        }
+    }
+
+    su_global_chi = (n_patches > 0) ? sum_chi / (float)n_patches : 0.0f;
+
+    /* Binder cumulant U₄ = 1 − ⟨m⁴⟩/(3⟨m²⟩²) */
+    float avg_m2 = (n_patches > 0) ? sum_m2 / (float)n_patches : 0.0f;
+    float avg_m4 = (n_patches > 0) ? sum_m4 / (float)n_patches : 0.0f;
+    if (avg_m2 > 1e-12f)
+        su_binder = 1.0f - avg_m4 / (3.0f * avg_m2 * avg_m2);
+    else
+        su_binder = 0.0f;
+
+    /* Phase 3: Interpolate to per-cell for smooth rendering */
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            int py = y / SU_PATCH;
+            int px = x / SU_PATCH;
+            if (py >= su_npy) py = su_npy - 1;
+            if (px >= su_npx) px = su_npx - 1;
+            su_cell[y][x] = su_chi[py][px];
+        }
+    }
+
+    /* Phase 4: Sparkline history */
+    su_hist_chi[su_hist_idx] = su_global_chi;
+    su_hist_binder[su_hist_idx] = su_binder;
+    su_hist_idx = (su_hist_idx + 1) % SU_HIST_LEN;
+    if (su_hist_count < SU_HIST_LEN) su_hist_count++;
+}
+
 /* ── Causal Emergence computation ──────────────────────────────────────────── */
 /* Color mapping: scale 0 (micro best) = cool blue,
    scale 1 (2x2) = green, scale 2 (4x4) = warm orange,
@@ -10529,6 +10713,7 @@ static void split_ensure_computed(int idx) {
         case 37: if (mf_stale) mf_compute(); break;
         case 38: if (ri_stale) ri_compute(); break;
         case 39: if (sg2_stale) sg2_compute(); break;
+        case 40: if (su_stale) su_compute(); break;
         default: break;
     }
 }
@@ -12534,6 +12719,58 @@ static int cell_color(int x, int y, RGB *out) {
             }
             out->r = r; out->g = g; out->b = b;
             return grid[y][x] ? 1 : 40; /* 40 = spectral gap ghost */
+        }
+        return 0;
+    }
+
+    /* Order Parameter Susceptibility overlay: phase-transition sensitivity map */
+    if (su_mode) {
+        float chi = su_cell[y][x];
+        if (grid[y][x] || chi > 0.01f) {
+            unsigned char r, g, b;
+            /* Normalize χ to [0,1] range using su_max_chi */
+            float norm = (su_max_chi > 0.01f) ? chi / su_max_chi : 0.0f;
+            if (norm > 1.0f) norm = 1.0f;
+
+            if (norm < 0.1f) {
+                /* Rigid/ordered: deep cold blue */
+                float t = norm / 0.1f;
+                r = (unsigned char)(8 + 15 * t);
+                g = (unsigned char)(15 + 30 * t);
+                b = (unsigned char)(60 + 60 * t);
+            } else if (norm < 0.3f) {
+                /* Low susceptibility: blue → teal */
+                float t = (norm - 0.1f) / 0.2f;
+                r = (unsigned char)(23 - 10 * t);
+                g = (unsigned char)(45 + 80 * t);
+                b = (unsigned char)(120 + 20 * t);
+            } else if (norm < 0.55f) {
+                /* Moderate: teal → yellow-green (approaching criticality) */
+                float t = (norm - 0.3f) / 0.25f;
+                r = (unsigned char)(13 + 140 * t);
+                g = (unsigned char)(125 + 80 * t);
+                b = (unsigned char)(140 - 120 * t);
+            } else if (norm < 0.8f) {
+                /* High susceptibility: orange-red glow */
+                float t = (norm - 0.55f) / 0.25f;
+                r = (unsigned char)(153 + 80 * t);
+                g = (unsigned char)(205 - 120 * t);
+                b = (unsigned char)(20 + 10 * t);
+            } else {
+                /* Critical/divergent: bright red → white-hot */
+                float t = (norm - 0.8f) / 0.2f;
+                if (t > 1.0f) t = 1.0f;
+                r = (unsigned char)(233 + 22 * t);
+                g = (unsigned char)(85 + 140 * t);
+                b = (unsigned char)(30 + 180 * t);
+            }
+            if (grid[y][x]) {
+                r = (unsigned char)(r < 200 ? r + 55 : 255);
+                g = (unsigned char)(g < 200 ? g + 55 : 255);
+                b = (unsigned char)(b < 200 ? b + 55 : 255);
+            }
+            out->r = r; out->g = g; out->b = b;
+            return grid[y][x] ? 1 : 41; /* 41 = susceptibility ghost */
         }
         return 0;
     }
@@ -19114,6 +19351,183 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", sgrst);
     }
 
+    /* ── Order Parameter Susceptibility overlay panel ────────────────────── */
+    if (su_mode) {
+        int su_pw = 50;
+        int su_col = term_cols - su_pw - 2;
+        int su_row = 3;
+        /* Stack below other panels */
+        if (entropy_mode)   su_row += 8;
+        if (temp_mode)      su_row += 9;
+        if (lyapunov_mode)  su_row += 8;
+        if (fourier_mode)   su_row += 18;
+        if (fractal_mode)   su_row += 11;
+        if (wolfram_mode)   su_row += 14;
+        if (flow_mode)      su_row += 9;
+        if (attractor_mode) su_row += 8;
+        if (cone_mode >= 1) su_row += 8;
+        if (surp_mode)      su_row += 8;
+        if (mi_mode)        su_row += 12;
+        if (cplx_mode)      su_row += 11;
+        if (topo_mode)      su_row += 11;
+        if (rg_mode)        su_row += 11;
+        if (kc_mode)        su_row += 9;
+        if (corr_mode)      su_row += 9;
+        if (eprod_mode)     su_row += 9;
+        if (vort_mode)      su_row += 9;
+        if (wave_mode)      su_row += 9;
+        if (ergo_mode)      su_row += 10;
+        if (coh_mode)       su_row += 8;
+        if (ce_mode)        su_row += 9;
+        if (ew_mode)        su_row += 10;
+        if (hr_mode)        su_row += 10;
+        if (rd_mode)        su_row += 13;
+        if (xc_mode && xc_count >= 20) su_row += 28;
+        if (fi_mode && fi_count >= 16)  su_row += 12;
+        if (sg_mode)        su_row += 12;
+        if (td_mode)        su_row += 10;
+        if (mf_mode)        su_row += 10;
+        if (ri_mode)        su_row += 10;
+        if (sg2_mode)       su_row += 9;
+        if (su_col < 1) su_col = 1;
+
+        const char *subdr = "\033[38;2;220;80;60;48;2;14;6;6m";  /* warm red border */
+        const char *subg  = "\033[48;2;14;6;6m";
+        const char *surst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 \xcf\x87 Susceptibility ",
+                     su_row, su_col, subdr);
+        for (int i = 22; i < su_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", surst);
+
+        /* Row 1: Global χ + classification */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     su_row + 1, su_col, subdr, subg);
+        {
+            const char *class_str, *class_clr;
+            if (su_global_chi < 0.5f) {
+                class_str = "ORDERED"; class_clr = "\033[38;2;80;140;220m";
+            } else if (su_global_chi < 2.0f) {
+                class_str = "MODERATE"; class_clr = "\033[38;2;180;200;60m";
+            } else if (su_global_chi < 5.0f) {
+                class_str = "SENSITIVE"; class_clr = "\033[38;2;230;140;40m";
+            } else {
+                class_str = "CRITICAL"; class_clr = "\033[38;2;255;60;60m";
+            }
+            int n = sprintf(p, " \033[38;2;200;120;100m\xcf\x87\xcc\x84: %s%.3f %s",
+                            class_clr, su_global_chi, class_str);
+            p += n;
+            int used = 32;
+            for (int i = used; i < su_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", subdr, surst);
+
+        /* Row 2: Peak χ + location */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     su_row + 2, su_col, subdr, subg);
+        {
+            int n = sprintf(p, " \033[38;2;160;90;80mPeak: \033[38;2;255;120;80m%.3f"
+                               " \033[38;2;120;80;70m@ (%d,%d)",
+                            su_max_chi, su_peak_px * SU_PATCH, su_peak_py * SU_PATCH);
+            p += n;
+            int used = 30;
+            for (int i = used; i < su_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", subdr, surst);
+
+        /* Row 3: Binder cumulant U₄ */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     su_row + 3, su_col, subdr, subg);
+        {
+            const char *bclr;
+            if (su_binder < 0.0f || su_binder > 0.8f) bclr = "\033[38;2;80;200;220m";
+            else if (su_binder > 0.5f) bclr = "\033[38;2;200;180;60m";
+            else bclr = "\033[38;2;255;80;80m";
+            int n = sprintf(p, " \033[38;2;160;90;80mBinder U\xe2\x82\x84: %s%.4f",
+                            bclr, su_binder);
+            p += n;
+            int used = 24;
+            for (int i = used; i < su_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", subdr, surst);
+
+        /* Row 4: Separator */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     su_row + 4, su_col, subdr, subg);
+        p += sprintf(p, " \033[38;2;40;20;20m");
+        for (int i = 1; i < su_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", subdr, surst);
+
+        /* Row 5: Color scale legend */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     su_row + 5, su_col, subdr, subg);
+        {
+            int n = sprintf(p, " \033[38;2;8;15;60m\xe2\x96\x88"
+                               "\033[38;2;13;125;140m\xe2\x96\x88"
+                               "\033[38;2;153;205;20m\xe2\x96\x88"
+                               "\033[38;2;233;85;30m\xe2\x96\x88"
+                               "\033[38;2;255;225;210m\xe2\x96\x88"
+                               "\033[38;2;160;90;80m rigid\xe2\x86\x90 \xe2\x86\x92" "crit [^U]");
+            p += n;
+            int used = 32;
+            for (int i = used; i < su_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", subdr, surst);
+
+        /* Rows 6-7: Sparklines — global χ and Binder cumulant */
+        for (int sp = 0; sp < 2; sp++) {
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                         su_row + 6 + sp, su_col, subdr, subg);
+            const char *spark_blocks[] = {"\xe2\x96\x81","\xe2\x96\x82","\xe2\x96\x83",
+                                          "\xe2\x96\x84","\xe2\x96\x85","\xe2\x96\x86",
+                                          "\xe2\x96\x87","\xe2\x96\x88"};
+            float *hist = (sp == 0) ? su_hist_chi : su_hist_binder;
+            const char *label = (sp == 0) ? " \xcf\x87 " : "U\xe2\x82\x84 ";
+            const char *clr = (sp == 0) ? "\033[38;2;220;100;80m" : "\033[38;2;80;180;200m";
+            int n = sprintf(p, " \033[38;2;60;40;40m%-3s%s", label, clr);
+            p += n;
+            int spark_w = su_pw - 7;
+
+            /* Find max for χ sparkline normalization */
+            float sp_max = 0.01f;
+            if (sp == 0) {
+                for (int i = 0; i < su_hist_count; i++) {
+                    int idx2 = (su_hist_idx - su_hist_count + i + SU_HIST_LEN) % SU_HIST_LEN;
+                    if (hist[idx2] > sp_max) sp_max = hist[idx2];
+                }
+            } else {
+                sp_max = 1.0f;  /* Binder is always in [0,1] roughly */
+            }
+
+            for (int i = 0; i < spark_w && i < SU_HIST_LEN; i++) {
+                int idx2 = (su_hist_idx - su_hist_count + i + SU_HIST_LEN) % SU_HIST_LEN;
+                if (i >= su_hist_count) {
+                    *p++ = ' ';
+                } else {
+                    float v = hist[idx2] / sp_max;
+                    if (v < 0.0f) v = 0.0f;
+                    if (v > 1.0f) v = 1.0f;
+                    int bi = (int)(v * 7.0f);
+                    if (bi > 7) bi = 7;
+                    const char *blk = spark_blocks[bi];
+                    while (*blk) *p++ = *blk++;
+                }
+            }
+            int used = spark_w + 5;
+            for (int i = used; i < su_pw - 1; i++) *p++ = ' ';
+            p += sprintf(p, "%s\xe2\x94\x82%s", subdr, surst);
+        }
+
+        /* Bottom border */
+        int su_bottom = su_row + 8;
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", su_bottom, su_col, subdr);
+        for (int i = 0; i < su_pw; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", surst);
+    }
+
     /* ── Percolation Analysis overlay panel ─────────────────────────────── */
     if (perc_mode) {
         int pc_w = 46;
@@ -19147,6 +19561,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (xc_mode && xc_count >= 20) pc_row += 28;
         if (fi_mode && fi_count >= 16) pc_row += 11;
         if (sg2_mode)       pc_row += 9;
+        if (su_mode)        pc_row += 9;
         if (pc_col < 1) pc_col = 1;
 
         const char *pcbdr = "\033[38;2;255;200;40;48;2;14;12;6m";
@@ -22482,6 +22897,19 @@ int main(int argc, char **argv) {
                     printf("\033[2J"); fflush(stdout);
                 } else {
                     flash_set("Spectral Gap off");
+                    printf("\033[2J"); fflush(stdout);
+                }
+            }
+        }
+        else if (key == 21) { /* Ctrl-U: Order Parameter Susceptibility */
+            if (!ecosystem_mode) {
+                su_mode = !su_mode;
+                if (su_mode) {
+                    su_reset();
+                    flash_set("Susceptibility: \xcf\x87=N\xc2\xb7Var(\xcf\x81) phase-transition sensitivity [^U]exit");
+                    printf("\033[2J"); fflush(stdout);
+                } else {
+                    flash_set("Susceptibility off");
                     printf("\033[2J"); fflush(stdout);
                 }
             }

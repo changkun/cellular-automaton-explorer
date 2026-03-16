@@ -31,6 +31,7 @@ how the implementation works, and where to read more.
 - [Dual-Species Ecosystem](#dual-species-ecosystem)
 - [Genetic Rule Explorer](#genetic-rule-explorer)
 - [Causal Emergence](#causal-emergence)
+- [Order Parameter Susceptibility](#order-parameter-susceptibility)
 - [References](#references)
 
 ---
@@ -1895,6 +1896,85 @@ J. M. Kosterlitz and D. J. Thouless, "Ordering, metastability and phase
 transitions in two-dimensional systems," *Journal of Physics C*, vol. 6,
 pp. 1181–1203, 1973.
 DOI: [10.1088/0022-3719/6/7/010](https://doi.org/10.1088/0022-3719/6/7/010)
+
+---
+
+## Order Parameter Susceptibility
+
+**Toggle:** `Ctrl-U` | **Ghost code:** 41 | **Refresh:** every generation (lazy)
+
+### What it measures
+
+The local susceptibility field χ(x,y) = N·Var(ρ) in sliding spatial patches,
+where N is the patch size and ρ is the local density (fraction of alive cells).
+This is the canonical response function from statistical mechanics: the
+fluctuation-dissipation theorem tells us that susceptibility measures how
+strongly a region responds to a small perturbation in external field.
+
+### Why it matters
+
+Susceptibility diverges at a phase transition — it is _the_ diagnostic for
+criticality. When χ is large in a region, density fluctuations are anomalously
+high, meaning the system is poised between ordered and disordered phases.
+This connects directly to:
+
+- **Spectral gap** (Round 73): regions with high χ should have small spectral
+  gap (slow mixing near criticality)
+- **Fisher information** (Round 68): high χ regions are also high-sensitivity
+  boundaries in parameter space
+- **Early warning signals** (Round 58): variance-based early warnings are
+  exactly the susceptibility in disguise
+
+The **Binder cumulant** U₄ = 1 − ⟨m⁴⟩/(3⟨m²⟩²) is also computed as a
+universal crossing diagnostic: at the critical point U₄ takes a universal
+value independent of system size, making it useful for identifying phase
+boundaries without finite-size extrapolation.
+
+### Formulation
+
+Divide the H×W grid into non-overlapping patches of size L×L (default L=8).
+For each patch (i,j), track the density time series ρᵢⱼ(t) over a rolling
+window of T frames (default T=64).
+
+**Local susceptibility:**
+
+    χᵢⱼ = L² · Var_t[ρᵢⱼ(t)]
+
+where Var_t denotes temporal variance over the rolling window.
+
+**Global susceptibility:**
+
+    χ̄ = (1/N_patches) Σᵢⱼ χᵢⱼ
+
+**Binder cumulant:**
+
+    U₄ = 1 − ⟨m⁴⟩ / (3⟨m²⟩²)
+
+where m = ρ − ⟨ρ⟩ is the order parameter fluctuation, and ⟨·⟩ averages
+over patches.
+
+### Color map
+
+| χ / χ_max | Color            | Interpretation          |
+|-----------|------------------|-------------------------|
+| 0.0–0.1   | Deep cold blue   | Rigid / fully ordered   |
+| 0.1–0.3   | Blue → teal      | Low susceptibility      |
+| 0.3–0.55  | Teal → yellow    | Approaching criticality |
+| 0.55–0.8  | Orange-red       | High susceptibility     |
+| 0.8–1.0   | Red → white-hot  | Critical / divergent    |
+
+Alive cells receive a +55 brightness boost on each RGB channel.
+
+### Background
+
+[19] H. E. Stanley, *Introduction to Phase Transitions and Critical
+Phenomena*. Oxford University Press, 1971.
+ISBN: 978-0-19-505316-6.
+
+[20] K. Binder, "Finite size scaling analysis of Ising model block
+distribution functions," *Zeitschrift für Physik B*, vol. 43,
+pp. 119–140, 1981.
+DOI: [10.1007/BF01293604](https://doi.org/10.1007/BF01293604)
 
 ---
 

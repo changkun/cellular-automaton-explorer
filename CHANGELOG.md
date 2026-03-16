@@ -1,8 +1,25 @@
 # Changelog
 
 Development history organized by round. Each round adds one or two major
-features. The project grew from ~790 lines (Round 1) to ~11,639 lines
-(Round 44).
+features. The project grew from ~790 lines (Round 1) to ~12,433 lines
+(Round 46).
+
+## Round 46 — Vorticity Detection
+
+Discrete curl of a velocity field derived from temporal density changes.
+Estimates local flow via activity-weighted center-of-mass shifts, then
+computes ω = ∂vy/∂x − ∂vx/∂y. Blue = clockwise, dark = irrotational,
+red = counterclockwise. Detects vortex centers as local |ω| maxima.
+Stats panel with net circulation Γ, vortex count, and sparkline. Toggle
+with `*`.
+
+## Round 45 — Wave Mechanics
+
+Damped 2D wave equation overlay. Cell births emit positive impulses,
+deaths negative — propagating via discretized wave equation with 5-point
+Laplacian stencil. Cyan = positive amplitude, dark = zero, orange =
+negative. Reveals standing waves near oscillators, expanding wavefronts,
+and interference patterns. Toggle with `~`.
 
 ## Round 44 — Entropy Production Rate
 

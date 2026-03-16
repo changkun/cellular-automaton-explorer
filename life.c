@@ -75,6 +75,9 @@
  *   =           Toggle entropy production rate (thermodynamic arrow of time)
  *                 Local dS/dt: where order emerges vs dissolves
  *                 Blue=ordering, gray=equilibrium, red=disordering
+ *   *           Toggle vorticity detection overlay (rotational structures)
+ *                 Curl of local density-gradient velocity field
+ *                 Blue=clockwise, dark=irrotational, red=counterclockwise
  *   ~           Toggle wave mechanics overlay (interference from births/deaths)
  *                 Births emit positive impulses, deaths negative — 2D wave equation
  *                 Cyan=positive amplitude, dark=zero, orange=negative
@@ -572,6 +575,33 @@ static float wave_hist_energy[WAVE_HIST_LEN];
 static float wave_hist_amp[WAVE_HIST_LEN];
 static int   wave_hist_idx = 0;
 static int   wave_hist_count = 0;
+
+/* ── Vorticity Detection ─────────────────────────────────────────────────── */
+/* Computes the discrete curl of a local velocity-like field derived from
+   temporal density changes.  Detects rotational structures: vortices, spirals,
+   eddies.  Blue = clockwise, red = counterclockwise, dark = irrotational. */
+
+#define VORT_HIST_LEN 64
+
+static float vort_grid[MAX_H][MAX_W];   /* per-cell vorticity ω */
+static float vort_mag[MAX_H][MAX_W];    /* |ω| for rendering */
+static int   vort_mode = 0;             /* 0=off, 1=on */
+static int   vort_stale = 1;            /* 1=needs recomputation */
+static float vort_max = 0.0f;           /* max |ω| across grid */
+static float vort_net = 0.0f;           /* net circulation (Σω) */
+static float vort_mean = 0.0f;          /* mean |ω| of active cells */
+static int   vort_n_vortices = 0;       /* count of detected vortex centers */
+
+/* Previous grid snapshots for velocity estimation */
+static unsigned char vort_prev[MAX_H][MAX_W];
+static unsigned char vort_prev2[MAX_H][MAX_W]; /* two frames back */
+static int   vort_has_prev = 0;         /* 0=none, 1=one frame, 2=two frames */
+
+/* Sparkline history */
+static float vort_hist_max[VORT_HIST_LEN];
+static float vort_hist_net[VORT_HIST_LEN];
+static int   vort_hist_idx = 0;
+static int   vort_hist_count = 0;
 
 /* ── Cell Probe Inspector ─────────────────────────────────────────────────── */
 /* Click-to-inspect tool: shows all analysis metrics for a single cell.
@@ -1500,6 +1530,7 @@ static void grid_step(void) {
     corr_stale = 1;
     eprod_stale = 1;
     wave_stale = 1;
+    vort_stale = 1;
 
     /* Always record frames for surprise field (cheap memcpy) */
     surp_record_frame();
@@ -2163,6 +2194,7 @@ static void kc_compute(void);
 static void corr_compute(void);
 static void eprod_compute(void);
 static void wave_compute(void);
+static void vort_compute(void);
 
 static void demo_reset_overlays(void) {
     freq_mode = 0;
@@ -2179,6 +2211,7 @@ static void demo_reset_overlays(void) {
     corr_mode = 0;
     eprod_mode = 0;
     wave_mode = 0;
+    vort_mode = 0;
     fourier_mode = 0;
     fractal_mode = 0;
     wolfram_mode = 0;
@@ -2238,6 +2271,7 @@ static void demo_setup_scene(int idx) {
             case '&': corr_mode = 1; corr_compute(); break;
             case '=': eprod_mode = 1; eprod_compute(); break;
             case '~': wave_mode = 1; wave_compute(); break;
+            case '*': vort_mode = 1; vort_compute(); break;
             case 'h': heatmap_mode = 1; break;
             case 'g': show_graph = 1; break;
         }
@@ -5203,6 +5237,196 @@ static RGB eprod_to_rgb(float ds) {
     }
 }
 
+/* ── Vorticity Detection computation ─────────────────────────────────────── */
+/* Compute discrete curl of a velocity-like field derived from temporal
+   density changes.  The "velocity" field is estimated from shifted
+   differences of the activity field across two frames:
+     vx(x,y) = Σ dx * Δactivity(x+dx, y+dy)   (activity-weighted shift)
+     vy(x,y) = Σ dy * Δactivity(x+dx, y+dy)
+   Then discrete curl:  ω = ∂vy/∂x − ∂vx/∂y                              */
+static void vort_compute(void) {
+    if (vort_has_prev < 2) {
+        /* Need at least two previous frames — just store and return */
+        if (vort_has_prev == 1) {
+            memcpy(vort_prev2, vort_prev, sizeof(vort_prev2));
+        }
+        memcpy(vort_prev, grid, sizeof(vort_prev));
+        vort_has_prev++;
+        memset(vort_grid, 0, sizeof(vort_grid));
+        memset(vort_mag, 0, sizeof(vort_mag));
+        vort_max = vort_net = vort_mean = 0.0f;
+        vort_n_vortices = 0;
+        vort_stale = 0;
+        return;
+    }
+
+    /* Step 1: Compute activity velocity field from temporal differences.
+       activity(t) = grid[y][x] > 0 ? 1 : 0
+       Δ = activity(t) - activity(t-2)  (two-frame diff for smoother signal) */
+    static float vx[MAX_H][MAX_W];
+    static float vy[MAX_H][MAX_W];
+
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            /* Activity change in neighborhood — estimate local velocity via
+               center-of-mass shift of activity changes in a 5x5 window */
+            float sx = 0.0f, sy = 0.0f, wt = 0.0f;
+            for (int dy = -2; dy <= 2; dy++) {
+                int ny = y + dy;
+                if (ny < 0 || ny >= H) continue;
+                for (int dx = -2; dx <= 2; dx++) {
+                    if (dx == 0 && dy == 0) continue;
+                    int nx = x + dx;
+                    if (nx < 0 || nx >= W) continue;
+                    float now  = grid[ny][nx] > 0 ? 1.0f : 0.0f;
+                    float prev = vort_prev2[ny][nx] > 0 ? 1.0f : 0.0f;
+                    float delta = now - prev;
+                    if (delta != 0.0f) {
+                        float dist = sqrtf((float)(dx * dx + dy * dy));
+                        float w = delta / dist;
+                        sx += dx * w;
+                        sy += dy * w;
+                        wt += fabsf(w);
+                    }
+                }
+            }
+            if (wt > 0.001f) {
+                vx[y][x] = sx / wt;
+                vy[y][x] = sy / wt;
+            } else {
+                vx[y][x] = 0.0f;
+                vy[y][x] = 0.0f;
+            }
+        }
+    }
+
+    /* Step 2: Compute discrete curl ω = ∂vy/∂x − ∂vx/∂y
+       using central differences */
+    double sum_omega = 0.0, sum_abs = 0.0;
+    float mx = 0.0f;
+    int n_active = 0;
+
+    for (int y = 1; y < H - 1; y++) {
+        for (int x = 1; x < W - 1; x++) {
+            float dvy_dx = (vy[y][x+1] - vy[y][x-1]) * 0.5f;
+            float dvx_dy = (vx[y+1][x] - vx[y-1][x]) * 0.5f;
+            float omega = dvy_dx - dvx_dy;
+            vort_grid[y][x] = omega;
+            float absw = fabsf(omega);
+            vort_mag[y][x] = absw;
+            if (absw > 0.001f) {
+                sum_omega += omega;
+                sum_abs += absw;
+                n_active++;
+                if (absw > mx) mx = absw;
+            }
+        }
+    }
+    /* Zero boundaries */
+    for (int x = 0; x < W; x++) {
+        vort_grid[0][x] = vort_grid[H-1][x] = 0.0f;
+        vort_mag[0][x] = vort_mag[H-1][x] = 0.0f;
+    }
+    for (int y = 0; y < H; y++) {
+        vort_grid[y][0] = vort_grid[y][W-1] = 0.0f;
+        vort_mag[y][0] = vort_mag[y][W-1] = 0.0f;
+    }
+
+    /* Step 3: Count vortex centers — local maxima of |ω| above threshold */
+    int n_vortices = 0;
+    float vort_thresh = mx * 0.35f;
+    if (vort_thresh < 0.02f) vort_thresh = 0.02f;
+    for (int y = 2; y < H - 2; y++) {
+        for (int x = 2; x < W - 2; x++) {
+            float v = vort_mag[y][x];
+            if (v < vort_thresh) continue;
+            /* Check if local maximum in 5x5 neighborhood */
+            int is_max = 1;
+            for (int dy = -2; dy <= 2 && is_max; dy++) {
+                for (int dx = -2; dx <= 2 && is_max; dx++) {
+                    if (dx == 0 && dy == 0) continue;
+                    if (vort_mag[y+dy][x+dx] > v)
+                        is_max = 0;
+                }
+            }
+            if (is_max) n_vortices++;
+        }
+    }
+
+    vort_max = mx;
+    vort_net = (float)sum_omega;
+    vort_mean = n_active > 0 ? (float)(sum_abs / n_active) : 0.0f;
+    vort_n_vortices = n_vortices;
+
+    /* Update history snapshots */
+    memcpy(vort_prev2, vort_prev, sizeof(vort_prev2));
+    memcpy(vort_prev, grid, sizeof(vort_prev));
+
+    /* Record sparkline history */
+    vort_hist_max[vort_hist_idx] = mx;
+    vort_hist_net[vort_hist_idx] = (float)sum_omega;
+    vort_hist_idx = (vort_hist_idx + 1) % VORT_HIST_LEN;
+    if (vort_hist_count < VORT_HIST_LEN) vort_hist_count++;
+
+    vort_stale = 0;
+}
+
+/* Vorticity to RGB:
+   Strong clockwise (ω < 0) → deep blue → bright blue
+   Irrotational (ω ≈ 0) → dark
+   Strong counterclockwise (ω > 0) → deep red → bright red/orange
+   Normalized by current max |ω| for adaptive contrast. */
+static RGB vort_to_rgb(float omega, float max_omega) {
+    if (max_omega < 0.001f) return (RGB){6, 6, 8};
+
+    float a = omega / max_omega;  /* -1 to +1 */
+    if (a > 1.0f) a = 1.0f;
+    if (a < -1.0f) a = -1.0f;
+
+    if (a < -0.02f) {
+        /* Clockwise: dark → deep blue → bright blue */
+        float t = -a;
+        if (t < 0.15f) {
+            float u = t / 0.15f;
+            return (RGB){(unsigned char)(8 + 10 * u),
+                         (unsigned char)(10 + 25 * u),
+                         (unsigned char)(30 + 60 * u)};
+        } else if (t < 0.5f) {
+            float u = (t - 0.15f) / 0.35f;
+            return (RGB){(unsigned char)(18 + 15 * u),
+                         (unsigned char)(35 + 60 * u),
+                         (unsigned char)(90 + 80 * u)};
+        } else {
+            float u = (t - 0.5f) / 0.5f;
+            return (RGB){(unsigned char)(33 + 50 * u),
+                         (unsigned char)(95 + 100 * u),
+                         (unsigned char)(170 + 80 * u)};
+        }
+    } else if (a > 0.02f) {
+        /* Counterclockwise: dark → deep red → bright red/orange */
+        float t = a;
+        if (t < 0.15f) {
+            float u = t / 0.15f;
+            return (RGB){(unsigned char)(30 + 55 * u),
+                         (unsigned char)(8 + 10 * u),
+                         (unsigned char)(8 + 8 * u)};
+        } else if (t < 0.5f) {
+            float u = (t - 0.15f) / 0.35f;
+            return (RGB){(unsigned char)(85 + 90 * u),
+                         (unsigned char)(18 + 40 * u),
+                         (unsigned char)(16 + 10 * u)};
+        } else {
+            float u = (t - 0.5f) / 0.5f;
+            return (RGB){(unsigned char)(175 + 70 * u),
+                         (unsigned char)(58 + 90 * u),
+                         (unsigned char)(26 + 50 * u)};
+        }
+    } else {
+        /* Irrotational: very dark */
+        return (RGB){6, 6, 8};
+    }
+}
+
 /* ── Wave Mechanics computation ───────────────────────────────────────────── */
 /* Damped 2D wave equation: d²u/dt² = c²∇²u - γ du/dt + S(x,y,t)
    where S = impulses from cell births (+) and deaths (-).
@@ -7220,6 +7444,21 @@ static int cell_color(int x, int y, RGB *out) {
                 out->b = (unsigned char)(out->b < 220 ? out->b + 35 : 255);
             }
             return grid[y][x] ? 1 : 24; /* 24 = eprod ghost */
+        }
+        return 0;
+    }
+
+    /* Vorticity detection overlay: rotational structures in density dynamics */
+    if (vort_mode) {
+        float omega = vort_grid[y][x];
+        if (fabsf(omega) > 0.005f || grid[y][x]) {
+            *out = vort_to_rgb(omega, vort_max > 0.01f ? vort_max : 1.0f);
+            if (grid[y][x]) {
+                out->r = (unsigned char)(out->r < 200 ? out->r + 55 : 255);
+                out->g = (unsigned char)(out->g < 200 ? out->g + 55 : 255);
+                out->b = (unsigned char)(out->b < 200 ? out->b + 55 : 255);
+            }
+            return grid[y][x] ? 1 : 26; /* 26 = vorticity ghost */
         }
         return 0;
     }
@@ -10373,6 +10612,137 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", erst);
     }
 
+    /* ── Vorticity Detection overlay panel ──────────────────────────────── */
+    if (vort_mode) {
+        int vt_w = 44;
+        int vt_col = term_cols - vt_w - 2;
+        /* Stack below other active panels */
+        int vt_row = 3;
+        if (entropy_mode)   vt_row += 8;
+        if (temp_mode)      vt_row += 9;
+        if (lyapunov_mode)  vt_row += 8;
+        if (fourier_mode)   vt_row += 18;
+        if (fractal_mode)   vt_row += 11;
+        if (wolfram_mode)   vt_row += 14;
+        if (flow_mode)      vt_row += 9;
+        if (attractor_mode) vt_row += 8;
+        if (cone_mode >= 1) vt_row += 8;
+        if (surp_mode)      vt_row += 8;
+        if (mi_mode)        vt_row += 12;
+        if (cplx_mode)      vt_row += 11;
+        if (topo_mode)      vt_row += 11;
+        if (rg_mode)        vt_row += 11;
+        if (kc_mode)        vt_row += 9;
+        if (corr_mode)      vt_row += 9;
+        if (eprod_mode)     vt_row += 9;
+        if (vt_col < 1) vt_col = 1;
+
+        const char *vbdr = "\033[38;2;140;80;180;48;2;12;6;16m";
+        const char *vbg  = "\033[48;2;12;6;16m";
+        const char *vrst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 \xe2\x86\xbb Vorticity Detection ",
+                     vt_row, vt_col, vbdr);
+        for (int i = 27; i < vt_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", vrst);
+
+        /* Row 1: Max vorticity & mean */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     vt_row + 1, vt_col, vbdr, vbg);
+        p += sprintf(p, " \033[38;2;160;120;200mmax|\xcf\x89|:");
+        p += sprintf(p, "\033[1;38;2;200;160;255m%.3f", vort_max);
+        p += sprintf(p, "\033[0;38;2;120;100;150m  mean:");
+        p += sprintf(p, "\033[38;2;200;180;230m%.3f", vort_mean);
+        p += sprintf(p, "%s", vbg);
+        { int used = 30; for (int i = used; i < vt_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", vbdr, vrst);
+
+        /* Row 2: Net circulation & vortex count */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     vt_row + 2, vt_col, vbdr, vbg);
+        p += sprintf(p, " \033[38;2;160;120;200mnet \xce\x93:");
+        if (vort_net > 0.01f)
+            p += sprintf(p, "\033[38;2;240;100;80m%+.2f", vort_net);
+        else if (vort_net < -0.01f)
+            p += sprintf(p, "\033[38;2;80;140;240m%+.2f", vort_net);
+        else
+            p += sprintf(p, "\033[38;2;120;120;130m%+.2f", vort_net);
+        p += sprintf(p, "\033[38;2;120;100;150m  vortices:");
+        p += sprintf(p, "\033[38;2;220;200;255m%d", vort_n_vortices);
+        p += sprintf(p, "%s", vbg);
+        { int used = 34; for (int i = used; i < vt_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", vbdr, vrst);
+
+        /* Row 3: Color legend */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     vt_row + 3, vt_col, vbdr, vbg);
+        p += sprintf(p, " ");
+        float legend_max = vort_max > 0.01f ? vort_max : 1.0f;
+        for (int i = 0; i < 30; i++) {
+            float a = (i - 15) / 15.0f * legend_max;
+            RGB c = vort_to_rgb(a, legend_max);
+            p += sprintf(p, "\033[38;2;%d;%d;%dm\xe2\x96\x88", c.r, c.g, c.b);
+        }
+        p += sprintf(p, "%s", vbg);
+        { int used = 31; for (int i = used; i < vt_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", vbdr, vrst);
+
+        /* Row 4: Label for legend */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     vt_row + 4, vt_col, vbdr, vbg);
+        p += sprintf(p, " \033[38;2;80;140;240m\xe2\x86\xbb CW");
+        p += sprintf(p, "\033[38;2;100;100;120m    irrotational    ");
+        p += sprintf(p, "\033[38;2;240;100;80mCCW \xe2\x86\xba");
+        p += sprintf(p, "%s", vbg);
+        { int used = 33; for (int i = used; i < vt_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", vbdr, vrst);
+
+        /* Row 5: Max |ω| sparkline */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     vt_row + 5, vt_col, vbdr, vbg);
+        p += sprintf(p, " \033[38;2;100;80;140m\xcf\x89 ");
+        if (vort_hist_count > 1) {
+            const char *spark_chars[] = {"\xe2\x96\x81","\xe2\x96\x82","\xe2\x96\x83",
+                                         "\xe2\x96\x84","\xe2\x96\x85","\xe2\x96\x86",
+                                         "\xe2\x96\x87","\xe2\x96\x88"};
+            int n = vort_hist_count < 30 ? vort_hist_count : 30;
+            float hmax = 0.001f;
+            for (int i = 0; i < n; i++) {
+                int idx = (vort_hist_idx - n + i + VORT_HIST_LEN) % VORT_HIST_LEN;
+                if (vort_hist_max[idx] > hmax) hmax = vort_hist_max[idx];
+            }
+            for (int i = 0; i < n; i++) {
+                int idx = (vort_hist_idx - n + i + VORT_HIST_LEN) % VORT_HIST_LEN;
+                float v = vort_hist_max[idx] / hmax;
+                int lvl = (int)(v * 7.0f);
+                if (lvl > 7) lvl = 7;
+                if (lvl < 0) lvl = 0;
+                if (v > 0.6f) p += sprintf(p, "\033[38;2;200;140;255m%s", spark_chars[lvl]);
+                else if (v > 0.2f) p += sprintf(p, "\033[38;2;120;80;180m%s", spark_chars[lvl]);
+                else p += sprintf(p, "\033[38;2;50;30;70m%s", spark_chars[lvl]);
+            }
+        }
+        p += sprintf(p, "%s", vbg);
+        { int used = 2 + (vort_hist_count < 30 ? vort_hist_count : 30);
+          for (int i = used; i < vt_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", vbdr, vrst);
+
+        /* Row 6: Toggle hint */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     vt_row + 6, vt_col, vbdr, vbg);
+        p += sprintf(p, " \033[38;2;80;60;100m[*]toggle  vorticity detection field");
+        { int used = 38; for (int i = used; i < vt_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", vbdr, vrst);
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", vt_row + 7, vt_col, vbdr);
+        for (int i = 0; i < vt_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", vrst);
+    }
+
     /* ── Wave Mechanics overlay panel ────────────────────────────────────── */
     if (wave_mode) {
         int wv_w = 44;
@@ -10396,6 +10766,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (kc_mode)        wv_row += 9;
         if (corr_mode)      wv_row += 9;
         if (eprod_mode)     wv_row += 9;
+        if (vort_mode)      wv_row += 9;
         if (wv_col < 1) wv_col = 1;
 
         const char *wbdr = "\033[38;2;40;180;200;48;2;4;12;14m";
@@ -10770,6 +11141,22 @@ static void render(int running, int speed_ms, int draw_mode) {
                 p += sprintf(p, "\033[38;2;160;200;220m%+.3f", wv);
             else
                 p += sprintf(p, "\033[38;2;80;80;90m%+.3f", wv);
+            p += sprintf(p, "%s", pbg);
+            PROBE_PAD(32);
+        }
+        PROBE_ROW_END();
+
+        /* Row 12e: Vorticity */
+        PROBE_ROW_START();
+        {
+            float vw = vort_grid[py][px];
+            p += sprintf(p, " %sVorticity:%s   ", plbl, prst);
+            if (vw < -0.05f) p += sprintf(p, "\033[38;2;80;140;240m");
+            else if (vw > 0.05f) p += sprintf(p, "\033[38;2;240;100;80m");
+            else p += sprintf(p, "\033[38;2;100;100;110m");
+            p += sprintf(p, "%+.3f", vw);
+            p += sprintf(p, " %s%s%s", pdim,
+                         vw > 0.1f ? "CCW" : vw < -0.1f ? "CW" : "irrot.", prst);
             p += sprintf(p, "%s", pbg);
             PROBE_PAD(32);
         }
@@ -11505,6 +11892,12 @@ int main(int argc, char **argv) {
                 wave_compute(); /* compute on toggle-on */
             }
         }
+        else if (key == '*') {
+            vort_mode = !vort_mode;
+            if (vort_mode) {
+                vort_compute(); /* compute on toggle-on */
+            }
+        }
         else if (key == '?') {
             if (probe_mode > 0) {
                 probe_mode = 0; /* toggle off */
@@ -12020,6 +12413,11 @@ int main(int argc, char **argv) {
         /* Auto-refresh entropy production rate every 2 generations (needs frequent updates) */
         if (eprod_mode && eprod_stale && (generation % 2 == 0 || !running)) {
             eprod_compute();
+        }
+
+        /* Auto-refresh vorticity every 2 generations (needs temporal differencing) */
+        if (vort_mode && vort_stale && (generation % 2 == 0 || !running)) {
+            vort_compute();
         }
 
         /* Auto-refresh wave mechanics every generation (continuous propagation) */

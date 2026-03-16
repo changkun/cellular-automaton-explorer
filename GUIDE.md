@@ -24,6 +24,10 @@ how the implementation works, and where to read more.
 - [Renormalization Group Flow](#renormalization-group-flow)
 - [Kolmogorov Complexity](#kolmogorov-complexity)
 - [Temperature Field](#temperature-field)
+- [Spatial Correlation Length](#spatial-correlation-length)
+- [Entropy Production Rate](#entropy-production-rate)
+- [Wave Mechanics](#wave-mechanics)
+- [Vorticity Detection](#vorticity-detection)
 - [Dual-Species Ecosystem](#dual-species-ecosystem)
 - [Genetic Rule Explorer](#genetic-rule-explorer)
 - [References](#references)
@@ -1331,6 +1335,180 @@ are equivalent to interacting particle systems in probability theory (Liggett,
 1985). The Ising model, which the temperature field emulates, was solved exactly
 in 2D by Onsager (1944) and exhibits one of the best-understood critical phase
 transitions in physics.
+
+## Spatial Correlation Length
+
+**Toggle: `&`**
+
+The spatial correlation length ξ quantifies how far spatial order extends in the
+automaton. It is derived from the two-point correlation function C(r), which
+measures the statistical relationship between cell states separated by distance r.
+
+### Mathematical framework
+
+The two-point correlation function is:
+
+    C(r) = ⟨s(x) · s(x+r)⟩ − ⟨s(x)⟩²
+
+where s(x) ∈ {0, 1} is the cell state and the average is taken over all cell
+pairs at separation r. For systems with exponential decay of correlations:
+
+    C(r) ~ exp(−r / ξ)
+
+The correlation length ξ is extracted by fitting ln(C(r)) vs r via linear
+regression: the negative reciprocal of the slope gives ξ.
+
+### What it reveals
+
+- **Disordered phase** (ξ < 2): Cells are essentially independent — random soup
+- **Short-range order** (ξ ≈ 2–5): Local structure exists but doesn't propagate far
+- **Near-critical** (ξ ≈ 5–15): Long-range correlations emerging, power-law-like
+  decay — the system is near a phase transition
+- **Long-range order** (ξ > 15): Global structure — the entire grid is correlated
+
+The per-cell heatmap shows local correlation strength from uncorrelated (violet)
+to strongly correlated (white).
+
+### Further reading
+
+Two-point correlation functions originate in statistical mechanics, where they
+characterize phases and phase transitions. The divergence of ξ at criticality
+is a universal signature shared by Ising models, percolation, and cellular
+automata alike.
+
+---
+
+## Entropy Production Rate
+
+**Toggle: `=`**
+
+The entropy production rate dS/dt measures how local Shannon entropy changes
+over time, revealing where order is being created or destroyed in the automaton.
+
+### Mathematical framework
+
+Local Shannon entropy at time t:
+
+    S(x, t) = −Σ p_i · log₂(p_i)
+
+where p_i are the probabilities of each state in the local neighborhood.
+The entropy production rate is the temporal derivative:
+
+    dS/dt(x, t) = S(x, t) − S(x, t−1)
+
+smoothed with an exponential moving average (α = 0.3) for stability.
+
+### What it reveals
+
+- **Blue regions** (dS/dt < 0): Entropy decreasing — self-organization in
+  progress. Gliders leaving trails of order, oscillators settling into rhythm.
+- **Gray regions** (dS/dt ≈ 0): Thermodynamic equilibrium — stable patterns.
+- **Red regions** (dS/dt > 0): Entropy increasing — dissolution and disorder.
+  Collision debris, dying structures.
+
+This is the first overlay capturing a temporal thermodynamic quantity rather
+than a spatial snapshot, implementing the second law of thermodynamics locally.
+
+### Further reading
+
+Entropy production in dissipative systems is central to non-equilibrium
+thermodynamics (Prigogine, 1967). In CAs, local entropy production identifies
+the arrow of time and distinguishes self-organizing from dissolving regions.
+
+---
+
+## Wave Mechanics
+
+**Toggle: `~`**
+
+The wave mechanics overlay treats cell births and deaths as impulse sources
+that propagate ripples via a damped 2D wave equation, revealing interference
+patterns and information propagation across the automaton.
+
+### Mathematical framework
+
+The damped 2D wave equation:
+
+    ∂²u/∂t² = c² ∇²u − γ ∂u/∂t + S(x, y, t)
+
+Discretized using velocity Verlet integration with 5-point Laplacian stencil:
+
+    v(t+1) = γ · (v(t) + c² · ∇²u) + impulse
+    u(t+1) = u(t) + v(t+1)
+
+Parameters: damping γ = 0.96, wave speed c² = 0.25 (stable for 2D lattice).
+Soft clamping at ±2.0 prevents runaway amplitudes.
+
+Source function: births emit +0.5, deaths emit −0.5 impulses.
+
+### What it reveals
+
+- **Standing waves** form near oscillators — constructive interference creates
+  bright persistent nodes
+- **Expanding wavefronts** trace the boundary of chaos as patterns evolve
+- **Interference patterns** appear at collision boundaries between active regions
+- **Information speed**: Ripples propagate at c ≈ 0.5 cells/gen, distinct from
+  the GoL's own information speed of 1 cell/gen
+
+### Further reading
+
+The wave equation is fundamental to physics from acoustics to quantum mechanics.
+Treating a discrete CA as a source for a continuous wave field bridges the gap
+between discrete dynamics and continuum physics, similar to approaches in
+lattice gas automata (Hardy, Pomeau, de Pazzis, 1973).
+
+---
+
+## Vorticity Detection
+
+**Toggle: `*`**
+
+The vorticity overlay computes the discrete curl of a velocity-like field
+derived from temporal density changes, detecting rotational structures —
+vortices, spirals, and eddies — in the automaton dynamics.
+
+### Mathematical framework
+
+**Step 1 — Velocity estimation**: A local velocity field is constructed from
+the activity-weighted center-of-mass shift in a 5×5 neighborhood between
+frames (2-frame temporal differencing for smoother signal):
+
+    vx(x,y) = Σ dx · Δactivity(x+dx, y+dy) / |dist|
+    vy(x,y) = Σ dy · Δactivity(x+dx, y+dy) / |dist|
+
+where Δactivity = activity(t) − activity(t−2) and the sum runs over the
+5×5 neighborhood excluding the center, normalized by total weight.
+
+**Step 2 — Discrete curl**: Vorticity is the z-component of the curl:
+
+    ω = ∂vy/∂x − ∂vx/∂y
+
+computed via central differences:
+
+    ω(x,y) = (vy(x+1,y) − vy(x−1,y))/2 − (vx(x,y+1) − vx(x,y−1))/2
+
+**Step 3 — Vortex detection**: Vortex centers are identified as local maxima
+of |ω| exceeding an adaptive threshold (35% of max |ω|, floor 0.02) within
+5×5 neighborhoods.
+
+### What it reveals
+
+- **Clockwise rotation** (ω < 0, blue): Material flowing in CW direction
+- **Counterclockwise rotation** (ω > 0, red): Material flowing in CCW direction
+- **Irrotational regions** (ω ≈ 0, dark): No rotational component
+- **Net circulation** Γ = Σω measures global rotational asymmetry
+- **Spiral gliders** produce distinct rotational signatures
+- **Oscillator halos** show alternating CW/CCW vorticity rings
+
+### Further reading
+
+Vorticity is fundamental to fluid dynamics and turbulence theory. The curl
+operator was introduced by Stokes (1849) and formalized in vector calculus by
+Gibbs and Heaviside. In 2D flows, the Kelvin circulation theorem relates net
+vorticity to boundary flows. The application to cellular automata connects
+to lattice Boltzmann methods and discrete fluid dynamics.
+
+---
 
 ## Dual-Species Ecosystem
 

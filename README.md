@@ -1,7 +1,7 @@
 # Life — Cellular Automaton Explorer
 
 A fully interactive, zero-dependency cellular automaton explorer for the terminal.
-10,000+ lines of pure C. No libraries. No frameworks. Just ANSI escape codes and `math.h`.
+12,000+ lines of pure C. No libraries. No frameworks. Just ANSI escape codes and `math.h`.
 
 Supports Conway's Game of Life and 9 other Life-like rulesets, 20+ scientific
 analysis overlays, time-travel replay, multi-rule zones, wormhole portals,
@@ -42,6 +42,9 @@ your terminal.
   - [Renormalization Group Flow](#renormalization-group-flow)
   - [Kolmogorov Complexity](#kolmogorov-complexity)
   - [Spatial Correlation Length](#spatial-correlation-length)
+  - [Entropy Production Rate](#entropy-production-rate)
+  - [Wave Mechanics](#wave-mechanics)
+  - [Vorticity Detection](#vorticity-detection)
   - [Cell Probe Inspector](#cell-probe-inspector)
 - [Visualization](#visualization)
   - [Heatmap & Ghost Trails](#heatmap--ghost-trails)
@@ -439,11 +442,33 @@ near-critical (large-scale structure). Per-cell heatmap: violet = uncorrelated,
 cyan = moderate, white = strongly correlated. Panel shows ξ, C(r) sparkline,
 and phase classification.
 
+### Entropy Production Rate
+
+Toggle: `=`. Local time-derivative of Shannon entropy (dS/dt). Blue = entropy
+decreasing (self-organization), gray = equilibrium, red = entropy increasing
+(dissolution). EMA-smoothed. Stats panel with global dS/dt, ordering/disordering
+fractions, thermodynamic phase classification.
+
+### Wave Mechanics
+
+Toggle: `~`. Treats cell births/deaths as impulse sources propagating via a
+damped 2D wave equation. Cyan = positive amplitude, dark = zero, orange =
+negative. Reveals standing waves near oscillators, expanding wavefronts at
+chaos boundaries, and interference patterns between active regions.
+
+### Vorticity Detection
+
+Toggle: `*`. Computes the discrete curl of a velocity field estimated from
+temporal density changes. Blue = clockwise rotation, dark = irrotational,
+red = counterclockwise. Detects vortex centers as local maxima of |ω|. Stats
+panel with max/mean vorticity, net circulation (Γ), vortex count, and sparkline.
+
 ### Cell Probe Inspector
 
-Toggle: `?`. Click any cell to see all 15+ metrics at once in a unified panel:
+Toggle: `?`. Click any cell to see all 18+ metrics at once in a unified panel:
 entropy, temperature, Lyapunov, Fourier, fractal, surprisal, mutual info,
-Kolmogorov, correlation, complexity, frequency, flow, RG, topology.
+Kolmogorov, correlation, complexity, frequency, flow, RG, topology, entropy
+production, wave amplitude, vorticity.
 
 ## Visualization
 

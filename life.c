@@ -134,6 +134,9 @@
  *   Ctrl-F      Toggle mean field deviation (where correlations beat density)
  *                 Compares actual CA dynamics to mean-field theory predictions
  *                 Teal=MF accurate, amber=deviating, orange=correlated
+ *   Ctrl-T      Toggle spectral gap estimator (Markov mixing rate per cell)
+ *                 Estimates λ₂ of local transition matrix from observation
+ *                 Indigo=critical(slow), teal=moderate, lime=fast mixing
  *   Ctrl-E      Export current grid as RLE file (auto-numbered export_NNN.rle)
  *   Arrow keys  Pan viewport across the full 400×200 grid
  *   0           Re-center viewport on grid center
@@ -1056,7 +1059,7 @@ static int   probe_y = -1;            /* selected cell y */
    Toggle with '\\' key. TAB cycles the right panel, '`' cycles the left. */
 
 /* Overlay table: ordered list of analysis overlays for cycling */
-#define N_SPLIT_OVERLAYS 39
+#define N_SPLIT_OVERLAYS 40
 typedef struct {
     const char *name;   /* short display name */
     char key;           /* toggle key character */
@@ -1102,6 +1105,7 @@ static const SplitOverlayInfo split_overlay_table[N_SPLIT_OVERLAYS] = {
     { "TopoDefect",   'D'-64 },  /* 36: Ctrl-D */
     { "MeanField",    'F'-64 },  /* 37: Ctrl-F */
     { "RuleInfer",    'R'-64 },  /* 38: Ctrl-R */
+    { "SpectGap",     'T'-64 },  /* 39: Ctrl-T */
 };
 
 static int split_mode = 0;         /* 0=off, 1=on */
@@ -1731,6 +1735,72 @@ static void ri_reset(void) {
     memset(ri_hist_samples, 0, sizeof(ri_hist_samples));
 }
 
+/* ── Spectral Gap Estimator ────────────────────────────────────────────────── */
+/* Estimates the spectral gap (1 - |λ₂|) of the local 2×2 Markov transition
+   matrix per cell.  For each cell, tracks how often it transitions between
+   alive↔dead states using exponential-smoothed counts, then computes the
+   second eigenvalue of the transition matrix T:
+     T = [[P(dead→dead), P(alive→dead)],
+          [P(dead→alive), P(alive→alive)]]
+   For a 2×2 stochastic matrix, λ₂ = 1 - P(dead→alive) - P(alive→dead).
+   Spectral gap = 1 - |λ₂| ∈ [0,1].  Small gap → slow mixing (near criticality).
+   Large gap → fast mixing (rapid equilibration).
+   Ghost code = 40.  Toggle with Ctrl-T key. */
+
+#define SG2_HIST_LEN 64
+#define SG2_MIN_OBS 8   /* minimum transitions before estimating gap */
+#define SG2_ALPHA 0.98f  /* exponential smoothing factor */
+
+static int   sg2_mode = 0;
+static int   sg2_stale = 1;
+
+/* Per-cell transition counts (exponential-smoothed) */
+static float sg2_dd[MAX_H][MAX_W];   /* dead→dead count */
+static float sg2_da[MAX_H][MAX_W];   /* dead→alive count */
+static float sg2_ad[MAX_H][MAX_W];   /* alive→dead count */
+static float sg2_aa[MAX_H][MAX_W];   /* alive→alive count */
+
+/* Per-cell spectral gap result */
+static float sg2_gap[MAX_H][MAX_W];
+
+/* Previous state for transition detection */
+static unsigned char sg2_prev[MAX_H][MAX_W];
+static int sg2_has_prev = 0;
+
+/* Global statistics */
+static float sg2_mean_gap = 0.0f;
+static float sg2_min_gap = 1.0f;
+static float sg2_max_gap = 0.0f;
+static int   sg2_critical_count = 0;  /* cells with gap < 0.1 */
+static int   sg2_fast_count = 0;      /* cells with gap > 0.8 */
+
+/* Sparkline history */
+static float sg2_hist_gap[SG2_HIST_LEN];
+static float sg2_hist_crit[SG2_HIST_LEN];
+static int   sg2_hist_idx = 0;
+static int   sg2_hist_count = 0;
+
+static void sg2_compute(void);
+static void sg2_reset(void) {
+    sg2_stale = 1;
+    sg2_has_prev = 0;
+    sg2_mean_gap = 0.0f;
+    sg2_min_gap = 1.0f;
+    sg2_max_gap = 0.0f;
+    sg2_critical_count = 0;
+    sg2_fast_count = 0;
+    sg2_hist_idx = 0;
+    sg2_hist_count = 0;
+    memset(sg2_dd, 0, sizeof(sg2_dd));
+    memset(sg2_da, 0, sizeof(sg2_da));
+    memset(sg2_ad, 0, sizeof(sg2_ad));
+    memset(sg2_aa, 0, sizeof(sg2_aa));
+    memset(sg2_gap, 0, sizeof(sg2_gap));
+    memset(sg2_prev, 0, sizeof(sg2_prev));
+    memset(sg2_hist_gap, 0, sizeof(sg2_hist_gap));
+    memset(sg2_hist_crit, 0, sizeof(sg2_hist_crit));
+}
+
 /* ── Cross-Correlation Matrix ──────────────────────────────────────────────── */
 /* Computes pairwise time-lagged cross-correlation across all 16 metric streams
    at lags -8 to +8.  For each pair, identifies the optimal lag (peak |r|),
@@ -1861,6 +1931,7 @@ static void split_set_overlay(int idx) {
     td_mode = 0;
     mf_mode = 0;
     ri_mode = 0;
+    sg2_mode = 0;
 
     switch (idx) {
         case  0: break;
@@ -1902,6 +1973,7 @@ static void split_set_overlay(int idx) {
         case 36: td_mode = 1; break;
         case 37: mf_mode = 1; break;
         case 38: ri_mode = 1; break;
+        case 39: sg2_mode = 1; break;
     }
 }
 
@@ -1944,6 +2016,7 @@ static int split_detect_current(void) {
     if (td_mode) return 36;
     if (mf_mode) return 37;
     if (ri_mode) return 38;
+    if (sg2_mode) return 39;
     return 0;
 }
 
@@ -3305,6 +3378,7 @@ static void grid_step(void) {
     td_stale = 1;
     mf_stale = 1;
     ri_stale = 1;
+    sg2_stale = 1;
 
     /* Always record frames for surprise field (cheap memcpy) */
     surp_record_frame();
@@ -4202,6 +4276,11 @@ static void demo_reset_overlays(void) {
     ecosystem_mode = 0;
     split_mode = 0;
     kymo_mode = 0;
+    sg_mode = 0;
+    td_mode = 0;
+    mf_mode = 0;
+    ri_mode = 0;
+    sg2_mode = 0;
 }
 
 static void demo_setup_scene(int idx) {
@@ -9063,6 +9142,97 @@ static void ri_compute(void) {
     }
 }
 
+/* ── Spectral Gap Estimator computation ─────────────────────────────────────── */
+static void sg2_compute(void) {
+    sg2_stale = 0;
+
+    /* Phase 1: Record transitions from previous state */
+    if (sg2_has_prev) {
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                int was_alive = sg2_prev[y][x] > 0;
+                int is_alive = grid[y][x] > 0;
+
+                /* Exponential smoothing: decay old counts, add new observation */
+                sg2_dd[y][x] *= SG2_ALPHA;
+                sg2_da[y][x] *= SG2_ALPHA;
+                sg2_ad[y][x] *= SG2_ALPHA;
+                sg2_aa[y][x] *= SG2_ALPHA;
+
+                if (!was_alive && !is_alive) sg2_dd[y][x] += 1.0f;
+                else if (!was_alive && is_alive) sg2_da[y][x] += 1.0f;
+                else if (was_alive && !is_alive) sg2_ad[y][x] += 1.0f;
+                else sg2_aa[y][x] += 1.0f;
+            }
+        }
+    }
+
+    /* Phase 2: Snapshot current state */
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++)
+            sg2_prev[y][x] = grid[y][x];
+    sg2_has_prev = 1;
+
+    /* Phase 3: Compute spectral gap per cell */
+    float sum_gap = 0.0f;
+    int count = 0;
+    sg2_min_gap = 1.0f;
+    sg2_max_gap = 0.0f;
+    sg2_critical_count = 0;
+    sg2_fast_count = 0;
+
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            float dd = sg2_dd[y][x];
+            float da = sg2_da[y][x];
+            float ad = sg2_ad[y][x];
+            float aa = sg2_aa[y][x];
+
+            float from_dead = dd + da;
+            float from_alive = ad + aa;
+
+            if (from_dead < SG2_MIN_OBS && from_alive < SG2_MIN_OBS) {
+                sg2_gap[y][x] = -1.0f; /* insufficient data */
+                continue;
+            }
+
+            /* Transition probabilities */
+            float p_da = (from_dead > 0.5f) ? da / from_dead : 0.0f;   /* P(dead→alive) = birth rate */
+            float p_ad = (from_alive > 0.5f) ? ad / from_alive : 0.0f; /* P(alive→dead) = death rate */
+
+            /* For a 2×2 stochastic matrix:
+               T = [[1-p_da, p_ad],
+                    [p_da, 1-p_ad]]
+               Eigenvalues: λ₁=1, λ₂ = 1 - p_da - p_ad
+               Spectral gap = 1 - |λ₂| = min(p_da + p_ad, 2 - p_da - p_ad) */
+            float lambda2 = 1.0f - p_da - p_ad;
+            float gap = 1.0f - fabsf(lambda2);
+
+            /* Clamp */
+            if (gap < 0.0f) gap = 0.0f;
+            if (gap > 1.0f) gap = 1.0f;
+
+            sg2_gap[y][x] = gap;
+            sum_gap += gap;
+            count++;
+
+            if (gap < sg2_min_gap) sg2_min_gap = gap;
+            if (gap > sg2_max_gap) sg2_max_gap = gap;
+            if (gap < 0.1f) sg2_critical_count++;
+            if (gap > 0.8f) sg2_fast_count++;
+        }
+    }
+
+    sg2_mean_gap = (count > 0) ? sum_gap / (float)count : 0.0f;
+
+    /* Sparkline history */
+    sg2_hist_gap[sg2_hist_idx] = sg2_mean_gap;
+    sg2_hist_crit[sg2_hist_idx] = (count > 0) ?
+        (float)sg2_critical_count / (float)count : 0.0f;
+    sg2_hist_idx = (sg2_hist_idx + 1) % SG2_HIST_LEN;
+    if (sg2_hist_count < SG2_HIST_LEN) sg2_hist_count++;
+}
+
 /* ── Causal Emergence computation ──────────────────────────────────────────── */
 /* Color mapping: scale 0 (micro best) = cool blue,
    scale 1 (2x2) = green, scale 2 (4x4) = warm orange,
@@ -10358,6 +10528,7 @@ static void split_ensure_computed(int idx) {
         case 36: if (td_stale) td_compute(); break;
         case 37: if (mf_stale) mf_compute(); break;
         case 38: if (ri_stale) ri_compute(); break;
+        case 39: if (sg2_stale) sg2_compute(); break;
         default: break;
     }
 }
@@ -12312,6 +12483,57 @@ static int cell_color(int x, int y, RGB *out) {
             }
             out->r = r; out->g = g; out->b = b;
             return grid[y][x] ? 1 : 39; /* 39 = rule inference ghost */
+        }
+        return 0;
+    }
+
+    /* Spectral Gap Estimator overlay: mixing rate heatmap */
+    if (sg2_mode) {
+        float gap = sg2_gap[y][x];
+        if (grid[y][x] || gap >= 0.0f) {
+            unsigned char r, g, b;
+            if (gap < 0.0f) {
+                /* Insufficient data: dim gray */
+                r = 12; g = 12; b = 18;
+            } else if (gap < 0.1f) {
+                /* Near-critical: deep indigo → violet (slow mixing) */
+                float t = gap / 0.1f;
+                r = (unsigned char)(20 + 60 * t);
+                g = (unsigned char)(5 + 10 * t);
+                b = (unsigned char)(40 + 80 * t);
+            } else if (gap < 0.3f) {
+                /* Slow: violet → teal (moderate mixing) */
+                float t = (gap - 0.1f) / 0.2f;
+                r = (unsigned char)(80 - 60 * t);
+                g = (unsigned char)(15 + 100 * t);
+                b = (unsigned char)(120 + 20 * t);
+            } else if (gap < 0.6f) {
+                /* Moderate: teal → green-lime (healthy mixing) */
+                float t = (gap - 0.3f) / 0.3f;
+                r = (unsigned char)(20 + 60 * t);
+                g = (unsigned char)(115 + 100 * t);
+                b = (unsigned char)(140 - 100 * t);
+            } else if (gap < 0.85f) {
+                /* Fast: lime → bright yellow (rapid equilibration) */
+                float t = (gap - 0.6f) / 0.25f;
+                r = (unsigned char)(80 + 140 * t);
+                g = (unsigned char)(215 + 30 * t);
+                b = (unsigned char)(40 - 10 * t);
+            } else {
+                /* Maximum: bright yellow-white (instant mixing) */
+                float t = (gap - 0.85f) / 0.15f;
+                if (t > 1.0f) t = 1.0f;
+                r = (unsigned char)(220 + 35 * t);
+                g = (unsigned char)(245 + 10 * t);
+                b = (unsigned char)(30 + 200 * t);
+            }
+            if (grid[y][x]) {
+                r = (unsigned char)(r < 200 ? r + 55 : 255);
+                g = (unsigned char)(g < 200 ? g + 55 : 255);
+                b = (unsigned char)(b < 200 ? b + 55 : 255);
+            }
+            out->r = r; out->g = g; out->b = b;
+            return grid[y][x] ? 1 : 40; /* 40 = spectral gap ghost */
         }
         return 0;
     }
@@ -18728,6 +18950,170 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", rirst);
     }
 
+    /* ── Spectral Gap Estimator overlay panel ─────────────────────────── */
+    if (sg2_mode) {
+        int sg2_pw = 48;
+        int sg2_col = term_cols - sg2_pw - 2;
+        int sg2_row = 3;
+        /* Stack below other panels */
+        if (entropy_mode)   sg2_row += 8;
+        if (temp_mode)      sg2_row += 9;
+        if (lyapunov_mode)  sg2_row += 8;
+        if (fourier_mode)   sg2_row += 18;
+        if (fractal_mode)   sg2_row += 11;
+        if (wolfram_mode)   sg2_row += 14;
+        if (flow_mode)      sg2_row += 9;
+        if (attractor_mode) sg2_row += 8;
+        if (cone_mode >= 1) sg2_row += 8;
+        if (surp_mode)      sg2_row += 8;
+        if (mi_mode)        sg2_row += 12;
+        if (cplx_mode)      sg2_row += 11;
+        if (topo_mode)      sg2_row += 11;
+        if (rg_mode)        sg2_row += 11;
+        if (kc_mode)        sg2_row += 9;
+        if (corr_mode)      sg2_row += 9;
+        if (eprod_mode)     sg2_row += 9;
+        if (vort_mode)      sg2_row += 9;
+        if (wave_mode)      sg2_row += 9;
+        if (ergo_mode)      sg2_row += 10;
+        if (coh_mode)       sg2_row += 8;
+        if (ce_mode)        sg2_row += 9;
+        if (ew_mode)        sg2_row += 10;
+        if (hr_mode)        sg2_row += 10;
+        if (rd_mode)        sg2_row += 13;
+        if (xc_mode && xc_count >= 20) sg2_row += 28;
+        if (fi_mode && fi_count >= 16)  sg2_row += 12;
+        if (sg_mode)        sg2_row += 12;
+        if (td_mode)        sg2_row += 10;
+        if (mf_mode)        sg2_row += 10;
+        if (ri_mode)        sg2_row += 10;
+        if (sg2_col < 1) sg2_col = 1;
+
+        const char *sgbdr = "\033[38;2;100;140;220;48;2;8;10;18m";  /* indigo border */
+        const char *sgbg  = "\033[48;2;8;10;18m";
+        const char *sgrst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 \xe2\x9a\xa1 Spectral Gap ",
+                     sg2_row, sg2_col, sgbdr);
+        for (int i = 20; i < sg2_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", sgrst);
+
+        /* Row 1: Mean gap + classification */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     sg2_row + 1, sg2_col, sgbdr, sgbg);
+        {
+            const char *class_str, *class_clr;
+            if (sg2_mean_gap < 0.15f) {
+                class_str = "CRITICAL"; class_clr = "\033[38;2;255;60;80m";
+            } else if (sg2_mean_gap < 0.35f) {
+                class_str = "SLOW"; class_clr = "\033[38;2;180;80;200m";
+            } else if (sg2_mean_gap < 0.6f) {
+                class_str = "MODERATE"; class_clr = "\033[38;2;60;200;180m";
+            } else if (sg2_mean_gap < 0.85f) {
+                class_str = "FAST"; class_clr = "\033[38;2;140;230;60m";
+            } else {
+                class_str = "INSTANT"; class_clr = "\033[38;2;255;255;200m";
+            }
+            int n = sprintf(p, " \033[38;2;140;170;220m\xce\xbb\xe2\x82\x82 gap: %s%.3f %s",
+                            class_clr, sg2_mean_gap, class_str);
+            p += n;
+            int used = 30;
+            for (int i = used; i < sg2_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", sgbdr, sgrst);
+
+        /* Row 2: Min/max range */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     sg2_row + 2, sg2_col, sgbdr, sgbg);
+        {
+            int n = sprintf(p, " \033[38;2;100;130;180mRange: %.3f \xe2\x80\x93 %.3f",
+                            sg2_min_gap, sg2_max_gap);
+            p += n;
+            int used = 24;
+            for (int i = used; i < sg2_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", sgbdr, sgrst);
+
+        /* Row 3: Critical/fast cell counts */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     sg2_row + 3, sg2_col, sgbdr, sgbg);
+        {
+            float crit_pct = (H * W > 0) ? 100.0f * sg2_critical_count / (float)(H * W) : 0.0f;
+            float fast_pct = (H * W > 0) ? 100.0f * sg2_fast_count / (float)(H * W) : 0.0f;
+            int n = sprintf(p, " \033[38;2;200;80;120mCrit:%.1f%%"
+                               " \033[38;2;140;230;80mFast:%.1f%%",
+                            crit_pct, fast_pct);
+            p += n;
+            int used = 26;
+            for (int i = used; i < sg2_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", sgbdr, sgrst);
+
+        /* Row 4: Separator */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     sg2_row + 4, sg2_col, sgbdr, sgbg);
+        p += sprintf(p, " \033[38;2;40;50;80m");
+        for (int i = 1; i < sg2_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", sgbdr, sgrst);
+
+        /* Row 5: Color scale legend */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     sg2_row + 5, sg2_col, sgbdr, sgbg);
+        {
+            int n = sprintf(p, " \033[38;2;60;15;100m\xe2\x96\x88"
+                               "\033[38;2;40;80;140m\xe2\x96\x88"
+                               "\033[38;2;50;170;100m\xe2\x96\x88"
+                               "\033[38;2;180;230;40m\xe2\x96\x88"
+                               "\033[38;2;240;250;180m\xe2\x96\x88"
+                               "\033[38;2;100;130;180m slow\xe2\x86\x90 \xe2\x86\x92" "fast [^T]");
+            p += n;
+            int used = 30;
+            for (int i = used; i < sg2_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", sgbdr, sgrst);
+
+        /* Rows 6-7: Sparklines — mean gap and critical fraction */
+        for (int sp = 0; sp < 2; sp++) {
+            p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                         sg2_row + 6 + sp, sg2_col, sgbdr, sgbg);
+            const char *spark_blocks[] = {"\xe2\x96\x81","\xe2\x96\x82","\xe2\x96\x83",
+                                          "\xe2\x96\x84","\xe2\x96\x85","\xe2\x96\x86",
+                                          "\xe2\x96\x87","\xe2\x96\x88"};
+            float *hist = (sp == 0) ? sg2_hist_gap : sg2_hist_crit;
+            const char *label = (sp == 0) ? "Gap" : "Crt";
+            const char *clr = (sp == 0) ? "\033[38;2;100;180;220m" : "\033[38;2;200;100;140m";
+            int n = sprintf(p, " \033[38;2;60;80;100m%-3s%s", label, clr);
+            p += n;
+            int spark_w = sg2_pw - 7;
+            for (int i = 0; i < spark_w && i < SG2_HIST_LEN; i++) {
+                int idx = (sg2_hist_idx - sg2_hist_count + i + SG2_HIST_LEN) % SG2_HIST_LEN;
+                if (i >= sg2_hist_count) {
+                    *p++ = ' ';
+                } else {
+                    float v = hist[idx];
+                    if (v < 0.0f) v = 0.0f;
+                    if (v > 1.0f) v = 1.0f;
+                    int bi = (int)(v * 7.0f);
+                    if (bi > 7) bi = 7;
+                    const char *blk = spark_blocks[bi];
+                    while (*blk) *p++ = *blk++;
+                }
+            }
+            int used = spark_w + 5;
+            for (int i = used; i < sg2_pw - 1; i++) *p++ = ' ';
+            p += sprintf(p, "%s\xe2\x94\x82%s", sgbdr, sgrst);
+        }
+
+        /* Bottom border */
+        int sg2_bottom = sg2_row + 8;
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", sg2_bottom, sg2_col, sgbdr);
+        for (int i = 0; i < sg2_pw; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", sgrst);
+    }
+
     /* ── Percolation Analysis overlay panel ─────────────────────────────── */
     if (perc_mode) {
         int pc_w = 46;
@@ -18760,6 +19146,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (rd_mode)        pc_row += 13;
         if (xc_mode && xc_count >= 20) pc_row += 28;
         if (fi_mode && fi_count >= 16) pc_row += 11;
+        if (sg2_mode)       pc_row += 9;
         if (pc_col < 1) pc_col = 1;
 
         const char *pcbdr = "\033[38;2;255;200;40;48;2;14;12;6m";
@@ -22082,6 +22469,19 @@ int main(int argc, char **argv) {
                     printf("\033[2J"); fflush(stdout);
                 } else {
                     flash_set("Rule Inference off");
+                    printf("\033[2J"); fflush(stdout);
+                }
+            }
+        }
+        else if (key == 20) { /* Ctrl-T: Spectral Gap Estimator */
+            if (!ecosystem_mode) {
+                sg2_mode = !sg2_mode;
+                if (sg2_mode) {
+                    sg2_reset();
+                    flash_set("Spectral Gap: mixing rate from Markov transition matrix [^T]exit");
+                    printf("\033[2J"); fflush(stdout);
+                } else {
+                    flash_set("Spectral Gap off");
                     printf("\033[2J"); fflush(stdout);
                 }
             }

@@ -1,8 +1,36 @@
 # Changelog
 
 Development history organized by round. Each round adds one or two major
-features. The project grew from ~790 lines (Round 1) to ~22,250 lines
-(Round 71).
+features. The project grew from ~790 lines (Round 1) to ~23,040 lines
+(Round 73).
+
+## Round 73 — Spectral Gap Estimator Overlay
+
+Adds the **spectral gap** — the canonical Markov chain mixing rate — as a
+per-cell diagnostic. Press `Ctrl-T` to estimate λ₂ of the local 2×2
+transition matrix from exponential-smoothed observation of alive↔dead
+transitions. For each cell, tracks four transition counts (dead→dead,
+dead→alive, alive→dead, alive→alive) with α=0.98 smoothing, computes
+P(birth) and P(death), then analytically derives the second eigenvalue:
+λ₂ = 1 - P(dead→alive) - P(alive→dead). Spectral gap = 1 - |λ₂|.
+Small gap → slow mixing, near criticality; large gap → fast equilibration.
+Color scheme: deep indigo (critical, gap≈0) → violet → teal (moderate) →
+lime-green (healthy) → yellow-white (instant mixing). Sidebar panel shows
+mean gap with interpretive classification (CRITICAL/SLOW/MODERATE/FAST/
+INSTANT), min–max range, critical/fast cell fractions, color legend, and
+dual sparklines (gap + critical fraction history). Ghost layer #40. The
+spectral gap unifies Early Warning (critical slowing down = gap→0),
+Correlation Length (diverges as gap→0), Mean Field Deviation (non-MF
+regions often have small gaps), and Fisher Information (peak at small
+gaps) into a single diagnostic number. 40th analysis overlay. +200 lines.
+
+## Round 72 — Rule Inference Engine Overlay
+
+Adds an overlay that watches the CA's dynamics and reconstructs birth/
+survival rules from observation alone — the simulation performing
+empirical science on its own behavior. Press `Ctrl-R`. Per-cell
+transition tracking with periodic 3/4 decay for adaptation to mutations.
++593 lines.
 
 ## Round 71 — Mean Field Deviation Overlay
 

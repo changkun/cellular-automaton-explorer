@@ -1,8 +1,22 @@
 # Changelog
 
 Development history organized by round. Each round adds one or two major
-features. The project grew from ~790 lines (Round 1) to ~17,700 lines
-(Round 62).
+features. The project grew from ~790 lines (Round 1) to ~18,200 lines
+(Round 63).
+
+## Round 63 — Causal Emergence Overlay
+
+Erik Hoel's causal emergence framework applied to the cellular automaton grid.
+Press `)` to visualize Effective Information (EI) at multiple coarse-graining
+scales (1×1, 2×2, 4×4, 8×8). For each block at each scale, builds transition
+probability matrices from the last 32 timeline frames, quantizes alive-counts
+into 16 bins, and computes EI = determinism − degeneracy. Each cell is colored
+by the scale at which EI peaks: cool blue (micro-level dominant, no emergence)
+→ green (2×2) → warm orange (4×4) → bright red/white (8×8 macro-level, strong
+emergence). Sidebar shows global EI, emergence fraction, per-scale EI bar
+chart, color legend, and sparkline history. Extends the R60-62 meta-analysis
+arc to answer "at what scale does the automaton's causal structure live?" —
+a fundamentally new analytical dimension. 31st analysis overlay.
 
 ## Round 62 — Spatial Coherence Overlay
 

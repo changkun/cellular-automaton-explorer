@@ -30,6 +30,7 @@ how the implementation works, and where to read more.
 - [Vorticity Detection](#vorticity-detection)
 - [Dual-Species Ecosystem](#dual-species-ecosystem)
 - [Genetic Rule Explorer](#genetic-rule-explorer)
+- [Causal Emergence](#causal-emergence)
 - [References](#references)
 
 ---
@@ -1699,6 +1700,122 @@ was pioneered by Mitchell, Crutchfield, and Hraber (1994), who evolved rules
 for density classification tasks. The fitness function used here favors
 "interesting" behavior in the Wolfram Class IV sense — rules that produce
 sustained complex dynamics without dying out or filling the grid.
+
+---
+
+## Causal Emergence
+
+**Key:** `)` — **Overlay index:** 29
+
+### What it measures
+
+Causal emergence quantifies whether the causal structure of a dynamical
+system becomes *stronger* when viewed at a coarser spatial scale. A system
+exhibits causal emergence when macro-level descriptions (coarse-grained
+blocks) have higher Effective Information (EI) than micro-level descriptions
+(individual cells). This overlay computes EI at four scales and highlights
+regions where coarse-graining increases causal power.
+
+### Why it matters
+
+Most analysis overlays in this explorer operate at the single-cell (micro)
+level. But many of the most interesting phenomena in cellular automata — gliders,
+oscillators, collisions — are inherently *macro-level* structures. Causal
+emergence answers a precise question: at what spatial scale does the automaton's
+dynamics become most deterministic and least degenerate? Regions where
+coarse-graining improves EI are regions of genuine emergence — the macro-level
+description is not merely convenient but causally more powerful than the
+micro-level one.
+
+### Formal description
+
+**Effective Information** is defined as:
+
+EI = Determinism − Degeneracy
+
+For a transition probability matrix **T** of size *n* × *n*:
+
+- **Determinism** = log₂(n) − H_row, where H_row is the average row entropy:
+  H_row = (1/n) Σᵢ H(T[i, :]) = (1/n) Σᵢ (−Σⱼ T[i,j] log₂ T[i,j])
+
+  High determinism means each cause (source state) maps precisely to a small
+  number of effects (destination states).
+
+- **Degeneracy** = H(column marginal), the entropy of the stationary
+  distribution of effects:
+  H(col) = −Σⱼ p(j) log₂ p(j), where p(j) = (1/n) Σᵢ T[i,j]
+
+  Low degeneracy means effects are spread across many states rather than
+  concentrated on a few.
+
+EI is maximized when the system is both highly deterministic (each cause
+leads to one effect) and non-degenerate (all effects are reachable).
+
+### Coarse-graining procedure
+
+The grid is divided into non-overlapping blocks at four scales:
+
+| Scale | Block size | Macro-state encoding |
+|-------|-----------|---------------------|
+| 0 (micro) | 1×1 | Binary: alive/dead |
+| 1 | 2×2 | Alive count → 16 bins |
+| 2 | 4×4 | Alive count → 16 bins |
+| 3 | 8×8 | Alive count → 16 bins |
+
+At each scale, the alive-count within each block is quantized into one of
+CE_BLOCK_STATES=16 bins. Transition matrices are built from CE_DEPTH=32
+consecutive timeline frames: for each block, the transition from its state at
+frame *t* to its state at frame *t+1* increments the corresponding entry in
+the matrix.
+
+### Implementation
+
+1. For each scale *s* ∈ {0, 1, 2, 3}, iterate over all non-overlapping blocks
+2. For each block, extract macro-state transitions from timeline history
+3. Build the *n* × *n* transition count matrix, normalize rows to probabilities
+4. Compute determinism (log₂n minus weighted average row entropy)
+5. Compute degeneracy (entropy of column marginal distribution)
+6. EI = determinism − degeneracy, clamped to ≥ 0
+7. Assign EI to all cells in the block
+8. Per-cell: find which scale has the highest EI — this is the "peak scale"
+9. Color each cell by its peak scale and modulate brightness by EI magnitude
+
+**Refresh rate:** Every 4 generations (leverages timeline buffer).
+
+### Color mapping
+
+| Peak scale | Color | Meaning |
+|-----------|-------|---------|
+| 0 (1×1) | Cool blue | Micro-level dominant — no emergence |
+| 1 (2×2) | Green | Mild emergence at 2×2 |
+| 2 (4×4) | Warm orange | Moderate emergence at 4×4 |
+| 3 (8×8) | Bright red/white | Strong macro-level emergence |
+
+Brightness is proportional to EI magnitude, so dim regions have low
+causal power at all scales, while bright regions have strong causal
+structure at their peak scale.
+
+### Sidebar panel
+
+The overlay sidebar displays:
+- **Global EI**: Average effective information across all cells at peak scale
+- **Emergence fraction**: Percentage of cells where a coarse scale beats micro
+- **Peak scale**: The globally dominant coarse-graining level
+- **Per-scale bar chart**: EI at each of the 4 scales, colored by scale
+- **Color legend**: Continuous gradient from blue through green/orange to red
+- **Sparkline**: 64-sample history of the emergence index over time
+- **Depth info**: Current timeline depth vs. required CE_DEPTH=32
+
+### Further reading
+
+E. P. Hoel, "When the map is better than the territory," *Entropy*,
+vol. 19, no. 5, art. 188, 2017.
+DOI: [10.3390/e19050188](https://doi.org/10.3390/e19050188)
+
+E. P. Hoel, L. Albantakis, and G. Tononi, "Quantifying causal emergence
+shows that macro can beat micro," *Proceedings of the National Academy of
+Sciences*, vol. 110, no. 49, pp. 19790–19795, 2013.
+DOI: [10.1073/pnas.1314922110](https://doi.org/10.1073/pnas.1314922110)
 
 ---
 

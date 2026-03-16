@@ -1041,7 +1041,7 @@ static int   probe_y = -1;            /* selected cell y */
    Toggle with '\\' key. TAB cycles the right panel, '`' cycles the left. */
 
 /* Overlay table: ordered list of analysis overlays for cycling */
-#define N_SPLIT_OVERLAYS 29
+#define N_SPLIT_OVERLAYS 31
 typedef struct {
     const char *name;   /* short display name */
     char key;           /* toggle key character */
@@ -1077,6 +1077,8 @@ static const SplitOverlayInfo split_overlay_table[N_SPLIT_OVERLAYS] = {
     { "Recurrence",   'o'  },  /* 26 */
     { "Particles",    '7'  },  /* 27 */
     { "Coherence",    '`'  },  /* 28 */
+    { "CausalEmrg",   ')'  },  /* 29 */
+    { "PowerSpec",     '6'  },  /* 30 */
 };
 
 static int split_mode = 0;         /* 0=off, 1=on */
@@ -1207,6 +1209,34 @@ static int   coh_hist_count = 0;
 
 static void  coh_compute(void);
 
+/* ── Causal Emergence (Effective Information) ────────────────────────────── */
+/* Erik Hoel's causal emergence framework applied to the grid.  Coarse-grain
+   at 2×2, 4×4, and 8×8 block scales, estimate transition probability matrices
+   from timeline history at each scale, compute effective information
+   (determinism minus degeneracy), and color each region by the scale at which
+   EI peaks.  Regions where coarse-graining *increases* causal power glow warm
+   (true emergence); regions where fine-grained is best stay cool.
+   Toggle with ')' key. */
+
+#define CE_DEPTH    32          /* timeline frames for transition estimation */
+#define CE_NSCALE   3           /* number of coarse-graining scales: 2,4,8 */
+#define CE_HIST_LEN 64          /* sparkline history */
+#define CE_BLOCK_STATES 16      /* max distinct macro-states per block (4-bit) */
+
+static float ce_grid[MAX_H][MAX_W];      /* per-cell: peak EI scale (0=micro, 1=2x2, 2=4x4, 3=8x8) */
+static float ce_ei_grid[MAX_H][MAX_W];   /* per-cell: EI value at peak scale */
+static int   ce_mode = 0;                /* 0=off, 1=on */
+static int   ce_stale = 1;
+static float ce_ei_by_scale[CE_NSCALE + 1]; /* mean EI at each scale (0=1x1,1=2x2,2=4x4,3=8x8) */
+static float ce_emergence_idx = 0.0f;    /* fraction of cells where coarse > micro */
+static int   ce_peak_scale = 0;          /* scale with highest global mean EI */
+static float ce_global_ei = 0.0f;        /* global mean EI across all cells */
+static float ce_hist[CE_HIST_LEN];       /* sparkline of emergence index */
+static int   ce_hist_idx = 0;
+static int   ce_hist_count = 0;
+
+static void  ce_compute(void);
+
 /* ── Anomaly Detector ─────────────────────────────────────────────────────── */
 /* Real-time watchdog that monitors all 16 scalar metrics for statistical
    anomalies.  Maintains running mean and variance (Welford's algorithm) over
@@ -1271,6 +1301,7 @@ static void split_set_overlay(int idx) {
     rp_mode = 0;
     pt_mode = 0;
     coh_mode = 0;
+    ce_mode = 0;
 
     switch (idx) {
         case  0: break;
@@ -1302,7 +1333,8 @@ static void split_set_overlay(int idx) {
         case 26: rp_mode = 1; break;
         case 27: pt_mode = 1; break;
         case 28: coh_mode = 1; break;
-        case 29: ps_mode = 1; break;
+        case 29: ce_mode = 1; break;
+        case 30: ps_mode = 1; break;
     }
 }
 
@@ -1335,7 +1367,8 @@ static int split_detect_current(void) {
     if (rp_mode) return 26;
     if (pt_mode) return 27;
     if (coh_mode) return 28;
-    if (ps_mode) return 29;
+    if (ce_mode) return 29;
+    if (ps_mode) return 30;
     return 0;
 }
 
@@ -2654,6 +2687,7 @@ static void grid_step(void) {
     gd_stale = 1;
     pt_stale = 1;
     coh_stale = 1;
+    ce_stale = 1;
 
     /* Always record frames for surprise field (cheap memcpy) */
     surp_record_frame();
@@ -3525,6 +3559,7 @@ static void demo_reset_overlays(void) {
     rp_mode = 0;
     sa_mode = 0;
     coh_mode = 0;
+    ce_mode = 0;
     fourier_mode = 0;
     fractal_mode = 0;
     wolfram_mode = 0;
@@ -3593,6 +3628,7 @@ static void demo_setup_scene(int idx) {
             case ':': pb_mode = 1; pb_compute(); break;
             case '7': pt_mode = 1; pt_compute(); break;
             case '`': coh_mode = 1; coh_compute(); break;
+            case ')': ce_mode = 1; ce_compute(); break;
             case 'h': heatmap_mode = 1; break;
             case 'g': show_graph = 1; break;
         }
@@ -7027,6 +7063,257 @@ static void coh_compute(void) {
     coh_stale = 0;
 }
 
+/* ── Causal Emergence computation ──────────────────────────────────────────── */
+/* Color mapping: scale 0 (micro best) = cool blue,
+   scale 1 (2x2) = green, scale 2 (4x4) = warm orange,
+   scale 3 (8x8) = bright red/white.  Brightness modulated by EI magnitude. */
+
+static RGB ce_to_rgb(float scale, float ei) {
+    /* scale ∈ [0,3], ei ∈ [0,~1] */
+    float s = scale / 3.0f;  /* normalize to [0,1] */
+    float bright = ei > 1.0f ? 1.0f : (ei < 0.0f ? 0.0f : ei);
+
+    unsigned char r, g, b;
+    if (s < 0.25f) {
+        /* Micro-dominant: cool blue */
+        float u = s / 0.25f;
+        r = (unsigned char)(10 + 20 * u);
+        g = (unsigned char)(30 + 60 * u);
+        b = (unsigned char)(80 + 80 * u);
+    } else if (s < 0.5f) {
+        /* 2x2 emergence: blue -> green */
+        float u = (s - 0.25f) / 0.25f;
+        r = (unsigned char)(30 - 10 * u);
+        g = (unsigned char)(90 + 100 * u);
+        b = (unsigned char)(160 - 100 * u);
+    } else if (s < 0.75f) {
+        /* 4x4 emergence: green -> orange */
+        float u = (s - 0.5f) / 0.25f;
+        r = (unsigned char)(20 + 200 * u);
+        g = (unsigned char)(190 - 40 * u);
+        b = (unsigned char)(60 - 40 * u);
+    } else {
+        /* 8x8 emergence: orange -> bright red/white */
+        float u = (s - 0.75f) / 0.25f;
+        r = (unsigned char)(220 + 35 * u);
+        g = (unsigned char)(150 + 80 * u);
+        b = (unsigned char)(20 + 180 * u);
+    }
+
+    /* Modulate brightness by EI magnitude */
+    float dim = 0.25f + 0.75f * bright;
+    r = (unsigned char)(r * dim);
+    g = (unsigned char)(g * dim);
+    b = (unsigned char)(b * dim);
+
+    return (RGB){r, g, b};
+}
+
+static void ce_compute(void) {
+    /* Need timeline history for transition estimation */
+    int depth = tl_len < CE_DEPTH ? tl_len : CE_DEPTH;
+    if (depth < 6) {
+        memset(ce_grid, 0, sizeof(float) * MAX_H * MAX_W);
+        memset(ce_ei_grid, 0, sizeof(float) * MAX_H * MAX_W);
+        for (int i = 0; i <= CE_NSCALE; i++) ce_ei_by_scale[i] = 0.0f;
+        ce_emergence_idx = 0.0f;
+        ce_peak_scale = 0;
+        ce_global_ei = 0.0f;
+        ce_stale = 0;
+        return;
+    }
+
+    /* Coarse-graining scales: 1x1 (micro), 2x2, 4x4, 8x8 */
+    int block_sizes[CE_NSCALE + 1] = {1, 2, 4, 8};
+
+    /* For each scale, compute EI over each block region.
+       EI = determinism - degeneracy
+       Determinism = average H(effect|cause) [how precisely states map forward]
+       Degeneracy = H(stationary distribution) [how uniformly states are visited]
+
+       For a block: quantize the block's alive-count into CE_BLOCK_STATES bins,
+       build transition counts from consecutive timeline frames, then compute
+       EI = log2(n_states) - H(row) averaged + H(column marginal). */
+
+    double sum_ei[CE_NSCALE + 1];
+    int    count_ei[CE_NSCALE + 1];
+    for (int s = 0; s <= CE_NSCALE; s++) { sum_ei[s] = 0.0; count_ei[s] = 0; }
+
+    /* Temporary per-cell EI at each scale for peak detection */
+    static float ei_at_scale[CE_NSCALE + 1][MAX_H][MAX_W];
+
+    for (int si = 0; si <= CE_NSCALE; si++) {
+        int bs = block_sizes[si];
+        int bh = H / bs;  /* number of blocks vertically */
+        int bw = W / bs;  /* number of blocks horizontally */
+        if (bh < 1 || bw < 1) continue;
+
+        int n_states = CE_BLOCK_STATES;
+
+        for (int by = 0; by < bh; by++) {
+            for (int bx = 0; bx < bw; bx++) {
+                /* Build transition matrix from timeline:
+                   For each pair of consecutive frames, compute the macro-state
+                   of this block at t and t+1, increment T[s_t][s_{t+1}]. */
+                int trans[CE_BLOCK_STATES][CE_BLOCK_STATES];
+                memset(trans, 0, sizeof(trans));
+                int n_trans = 0;
+
+                int prev_state = -1;
+                for (int t = depth - 1; t >= 0; t--) {
+                    TimelineFrame *f = timeline_get(t);
+                    if (!f) continue;
+
+                    /* Count alive cells in this block */
+                    int alive = 0;
+                    int total = bs * bs;
+                    for (int dy = 0; dy < bs && by * bs + dy < H; dy++) {
+                        for (int dx = 0; dx < bs && bx * bs + dx < W; dx++) {
+                            if (f->grid[by * bs + dy][bx * bs + dx] > 0)
+                                alive++;
+                        }
+                    }
+
+                    /* Quantize to macro-state: bin alive count into n_states levels */
+                    int state = (alive * (n_states - 1) + total / 2) / total;
+                    if (state >= n_states) state = n_states - 1;
+
+                    if (prev_state >= 0) {
+                        trans[prev_state][state]++;
+                        n_trans++;
+                    }
+                    prev_state = state;
+                }
+
+                if (n_trans < 3) {
+                    /* Not enough transitions */
+                    for (int dy = 0; dy < bs && by * bs + dy < H; dy++)
+                        for (int dx = 0; dx < bs && bx * bs + dx < W; dx++)
+                            ei_at_scale[si][by * bs + dy][bx * bs + dx] = 0.0f;
+                    continue;
+                }
+
+                /* Compute EI = determinism - degeneracy
+                   Determinism: for each cause state c with transitions,
+                     compute H(effect|cause=c) = Shannon entropy of row c,
+                     then average weighted by row frequency.
+                     Determinism = log2(n_states) - weighted_avg_H_row
+                   Degeneracy: entropy of the column marginal (effect distribution).
+                     Degeneracy = H(effect marginal)
+                   EI = Determinism - Degeneracy + log2(n_states)
+                   Simplified: EI = log2(n) - avg_H_row - H_col_marginal + log2(n)
+                   Actually Hoel's formula: EI = log2(n) - <H(row)> + log2(n) - H(col)
+                   But more precisely: EI = determinism - degeneracy where
+                   determinism = log2(n) - sum_c p(c) H(row_c)
+                   degeneracy = H(column marginal)
+                   So EI = log2(n) - sum_c p(c) H(row_c) - H(col_marginal) */
+
+                float log2_n = log2f((float)n_states);
+
+                /* Row counts and row entropies */
+                int row_total[CE_BLOCK_STATES];
+                memset(row_total, 0, sizeof(row_total));
+                for (int c = 0; c < n_states; c++)
+                    for (int e = 0; e < n_states; e++)
+                        row_total[c] += trans[c][e];
+
+                /* Weighted average row entropy */
+                float determinism = log2_n;
+                {
+                    float avg_h_row = 0.0f;
+                    for (int c = 0; c < n_states; c++) {
+                        if (row_total[c] == 0) continue;
+                        float h_row = 0.0f;
+                        float rt = (float)row_total[c];
+                        for (int e = 0; e < n_states; e++) {
+                            if (trans[c][e] > 0) {
+                                float p = (float)trans[c][e] / rt;
+                                h_row -= p * log2f(p);
+                            }
+                        }
+                        avg_h_row += ((float)row_total[c] / (float)n_trans) * h_row;
+                    }
+                    determinism = log2_n - avg_h_row;
+                }
+
+                /* Column marginal entropy (degeneracy) */
+                float degeneracy;
+                {
+                    int col_total[CE_BLOCK_STATES];
+                    memset(col_total, 0, sizeof(col_total));
+                    for (int e = 0; e < n_states; e++)
+                        for (int c = 0; c < n_states; c++)
+                            col_total[e] += trans[c][e];
+
+                    float h_col = 0.0f;
+                    for (int e = 0; e < n_states; e++) {
+                        if (col_total[e] > 0) {
+                            float p = (float)col_total[e] / (float)n_trans;
+                            h_col -= p * log2f(p);
+                        }
+                    }
+                    degeneracy = h_col;
+                }
+
+                float ei = determinism - degeneracy;
+                if (ei < 0.0f) ei = 0.0f;
+
+                /* Assign EI to all cells in this block */
+                for (int dy = 0; dy < bs && by * bs + dy < H; dy++)
+                    for (int dx = 0; dx < bs && bx * bs + dx < W; dx++)
+                        ei_at_scale[si][by * bs + dy][bx * bs + dx] = ei;
+
+                sum_ei[si] += ei;
+                count_ei[si]++;
+            }
+        }
+    }
+
+    /* Compute mean EI per scale */
+    for (int s = 0; s <= CE_NSCALE; s++) {
+        ce_ei_by_scale[s] = count_ei[s] > 0 ? (float)(sum_ei[s] / count_ei[s]) : 0.0f;
+    }
+
+    /* Find global peak scale */
+    ce_peak_scale = 0;
+    for (int s = 1; s <= CE_NSCALE; s++) {
+        if (ce_ei_by_scale[s] > ce_ei_by_scale[ce_peak_scale])
+            ce_peak_scale = s;
+    }
+
+    /* Per-cell: find which scale has highest EI, record in ce_grid */
+    int n_emerged = 0, n_total = 0;
+    double sum_global = 0.0;
+
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            int best_s = 0;
+            float best_ei = ei_at_scale[0][y][x];
+            for (int s = 1; s <= CE_NSCALE; s++) {
+                if (ei_at_scale[s][y][x] > best_ei) {
+                    best_ei = ei_at_scale[s][y][x];
+                    best_s = s;
+                }
+            }
+            ce_grid[y][x] = (float)best_s;
+            ce_ei_grid[y][x] = best_ei;
+            sum_global += best_ei;
+            n_total++;
+            if (best_s > 0 && best_ei > 0.01f) n_emerged++;
+        }
+    }
+
+    ce_global_ei = n_total > 0 ? (float)(sum_global / n_total) : 0.0f;
+    ce_emergence_idx = n_total > 0 ? (float)n_emerged / (float)n_total : 0.0f;
+
+    /* Record sparkline */
+    ce_hist[ce_hist_idx] = ce_emergence_idx;
+    ce_hist_idx = (ce_hist_idx + 1) % CE_HIST_LEN;
+    if (ce_hist_count < CE_HIST_LEN) ce_hist_count++;
+
+    ce_stale = 0;
+}
+
 /* ── Percolation Analysis computation ──────────────────────────────────────── */
 /* Flood-fill live cells into clusters, find largest, detect spanning. */
 static void perc_compute(void) {
@@ -8063,6 +8350,7 @@ static void split_ensure_computed(int idx) {
         case 26: if (rp_stale && rp_count >= 4) rp_compute(); break;
         case 27: if (pt_stale) pt_compute(); break;
         case 28: if (coh_stale) coh_compute(); break;
+        case 29: if (ce_stale) ce_compute(); break;
         default: break;
     }
 }
@@ -9664,6 +9952,22 @@ static int cell_color(int x, int y, RGB *out) {
         return 0;
     }
 
+    /* Causal emergence overlay: EI peak scale coloring */
+    if (ce_mode) {
+        float ei = ce_ei_grid[y][x];
+        float scale = ce_grid[y][x];
+        if (ei > 0.01f || grid[y][x]) {
+            *out = ce_to_rgb(scale, ei);
+            if (grid[y][x]) {
+                out->r = (unsigned char)(out->r < 200 ? out->r + 55 : 255);
+                out->g = (unsigned char)(out->g < 200 ? out->g + 55 : 255);
+                out->b = (unsigned char)(out->b < 200 ? out->b + 55 : 255);
+            }
+            return grid[y][x] ? 1 : 30; /* 30 = causal emergence ghost */
+        }
+        return 0;
+    }
+
     /* Percolation analysis overlay: cluster connectivity */
     if (perc_mode) {
         unsigned short lbl = perc_label[y][x];
@@ -10164,6 +10468,15 @@ static void render(int running, int speed_ms, int draw_mode) {
         }
     }
 
+    /* Causal emergence indicator */
+    char ce_str[96] = "";
+    if (ce_mode) {
+        const char *sn[] = {"1\xc3\x97" "1","2\xc3\x97" "2","4\xc3\x97" "4","8\xc3\x97" "8"};
+        snprintf(ce_str, sizeof(ce_str),
+                 " \033[38;2;220;160;60m\xe2\x96\xa6\xce\xb5:pk=%s\033[0m",
+                 sn[ce_peak_scale]);
+    }
+
     /* Split-screen indicator */
     char split_str[128] = "";
     if (split_mode) {
@@ -10310,9 +10623,9 @@ static void render(int running, int speed_ms, int draw_mode) {
         snprintf(rule_display, sizeof(rule_display),
                  "\033[95m%s\033[33m(mutant)\033[0m", rule_str);
 
-    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
+    p += sprintf(p, " %s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s  %s  Gen \033[96m%d\033[0m  Pop \033[96m%d\033[0m  "
                      "\033[90m%dms\033[0m",
-                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, gd_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, corr_str, eprod_str, wave_str, pp_str, cm_str, ps_str, rp_str, sa_str, pt_str, ad_str, split_str, kymo_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
+                 state, topo_str, draw_str, heat_str, tracer_str, freq_str, entropy_str, lyapunov_str, fourier_str, fractal_str, wolfram_str, flow_str, census_str, cone_str, gd_str, surp_str, mi_str, cplx_str, topo_str2, rg_str, kc_str, corr_str, eprod_str, wave_str, pp_str, cm_str, ps_str, rp_str, sa_str, pt_str, ad_str, ce_str, split_str, kymo_str, probe_str, gene_str, temp_str, sym_str, zoom_str, map_str, zone_str,
                  portal_str, emit_str, eco_str, stamp_str, rule_display, generation, population, speed_ms);
 
     /* Flash message (save/load feedback) */
@@ -13824,6 +14137,159 @@ static void render(int running, int speed_ms, int draw_mode) {
         p += sprintf(p, "%s", chrst);
     }
 
+    /* ── Causal Emergence overlay panel ────────────────────────────────── */
+    if (ce_mode) {
+        int ce_w = 50;
+        int ce_col = term_cols - ce_w - 2;
+        int ce_row = 3;
+        if (entropy_mode)   ce_row += 8;
+        if (temp_mode)      ce_row += 9;
+        if (lyapunov_mode)  ce_row += 8;
+        if (fourier_mode)   ce_row += 18;
+        if (fractal_mode)   ce_row += 11;
+        if (wolfram_mode)   ce_row += 14;
+        if (flow_mode)      ce_row += 9;
+        if (attractor_mode) ce_row += 8;
+        if (cone_mode >= 1) ce_row += 8;
+        if (surp_mode)      ce_row += 8;
+        if (mi_mode)        ce_row += 12;
+        if (cplx_mode)      ce_row += 11;
+        if (topo_mode)      ce_row += 11;
+        if (rg_mode)        ce_row += 11;
+        if (kc_mode)        ce_row += 9;
+        if (corr_mode)      ce_row += 9;
+        if (eprod_mode)     ce_row += 9;
+        if (vort_mode)      ce_row += 9;
+        if (wave_mode)      ce_row += 9;
+        if (ergo_mode)      ce_row += 10;
+        if (coh_mode)       ce_row += 8;
+        if (ce_mode)        ce_row += 9;
+        if (ce_col < 1) ce_col = 1;
+
+        const char *cebdr = "\033[38;2;220;140;40;48;2;14;8;4m";
+        const char *cebg  = "\033[48;2;14;8;4m";
+        const char *cerst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 \xce\xb5 Causal Emergence ",
+                     ce_row, ce_col, cebdr);
+        for (int i = 22; i < ce_w - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", cerst);
+
+        /* Row 1: Global EI, emergence index, peak scale */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ce_row + 1, ce_col, cebdr, cebg);
+        p += sprintf(p, " \033[38;2;220;160;60mEI=");
+        if (ce_global_ei > 0.5f)
+            p += sprintf(p, "\033[1;38;2;255;200;80m%.3f", ce_global_ei);
+        else if (ce_global_ei > 0.1f)
+            p += sprintf(p, "\033[38;2;200;160;60m%.3f", ce_global_ei);
+        else
+            p += sprintf(p, "\033[38;2;120;80;30m%.3f", ce_global_ei);
+        const char *scale_names[] = {"1\xc3\x97" "1", "2\xc3\x97" "2", "4\xc3\x97" "4", "8\xc3\x97" "8"};
+        p += sprintf(p, "\033[0m%s\033[38;2;160;120;50m  emrg:", cebg);
+        p += sprintf(p, "\033[38;2;220;180;80m%.1f%%", ce_emergence_idx * 100.0f);
+        p += sprintf(p, "\033[38;2;160;120;50m  pk:");
+        p += sprintf(p, "\033[38;2;220;180;80m%s", scale_names[ce_peak_scale]);
+        p += sprintf(p, "%s", cebg);
+        { int used = 42; for (int i = used; i < ce_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", cebdr, cerst);
+
+        /* Row 2: EI per scale bar chart */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ce_row + 2, ce_col, cebdr, cebg);
+        p += sprintf(p, " ");
+        float max_scale_ei = 0.01f;
+        for (int s = 0; s <= CE_NSCALE; s++)
+            if (ce_ei_by_scale[s] > max_scale_ei) max_scale_ei = ce_ei_by_scale[s];
+        for (int s = 0; s <= CE_NSCALE; s++) {
+            p += sprintf(p, "\033[38;2;160;120;50m%s:", scale_names[s]);
+            float frac = ce_ei_by_scale[s] / max_scale_ei;
+            int bar_len = (int)(frac * 8.0f + 0.5f);
+            if (bar_len > 8) bar_len = 8;
+            RGB bc = ce_to_rgb((float)s, ce_ei_by_scale[s]);
+            p += sprintf(p, "\033[38;2;%d;%d;%dm", bc.r, bc.g, bc.b);
+            for (int i = 0; i < bar_len; i++) p += sprintf(p, "\xe2\x96\x88");
+            p += sprintf(p, "%s", cebg);
+            for (int i = bar_len; i < 8; i++) *p++ = ' ';
+            if (s < CE_NSCALE) *p++ = ' ';
+        }
+        { int used = 49; for (int i = used; i < ce_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", cebdr, cerst);
+
+        /* Row 3: Color legend */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ce_row + 3, ce_col, cebdr, cebg);
+        p += sprintf(p, " ");
+        for (int i = 0; i < 36; i++) {
+            float s = (float)i / 35.0f * 3.0f;
+            RGB c = ce_to_rgb(s, 0.7f);
+            p += sprintf(p, "\033[38;2;%d;%d;%dm\xe2\x96\x88", c.r, c.g, c.b);
+        }
+        p += sprintf(p, "%s", cebg);
+        { int used = 37; for (int i = used; i < ce_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", cebdr, cerst);
+
+        /* Row 4: Scale labels */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ce_row + 4, ce_col, cebdr, cebg);
+        p += sprintf(p, " \033[38;2;40;60;120mmicro");
+        { for (int i = 0; i < 9; i++) *p++ = ' '; }
+        p += sprintf(p, "\033[38;2;40;150;60m2\xc3\x97" "2");
+        { for (int i = 0; i < 5; i++) *p++ = ' '; }
+        p += sprintf(p, "\033[38;2;200;140;30m4\xc3\x97" "4");
+        { for (int i = 0; i < 5; i++) *p++ = ' '; }
+        p += sprintf(p, "\033[38;2;240;200;160m8\xc3\x97" "8");
+        p += sprintf(p, "%s", cebg);
+        { int used = 36; for (int i = used; i < ce_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", cebdr, cerst);
+
+        /* Row 5: Sparkline of emergence index */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ce_row + 5, ce_col, cebdr, cebg);
+        p += sprintf(p, " \033[38;2;160;120;50m\xce\xb5:");
+        {
+            const char *spark_chars[] = {"\xe2\x96\x81","\xe2\x96\x82","\xe2\x96\x83",
+                                         "\xe2\x96\x84","\xe2\x96\x85","\xe2\x96\x86",
+                                         "\xe2\x96\x87","\xe2\x96\x88"};
+            int slen = ce_hist_count < 38 ? ce_hist_count : 38;
+            for (int i = 0; i < slen; i++) {
+                int idx = (ce_hist_idx - slen + i + CE_HIST_LEN) % CE_HIST_LEN;
+                float v = ce_hist[idx];
+                if (v < 0.0f) v = 0.0f;
+                if (v > 1.0f) v = 1.0f;
+                int si = (int)(v * 7.99f);
+                if (si > 7) si = 7;
+                /* Warm gradient for sparkline */
+                unsigned char sr = (unsigned char)(120 + 135 * v);
+                unsigned char sg = (unsigned char)(60 + 120 * v);
+                unsigned char sb = (unsigned char)(10 + 40 * v);
+                p += sprintf(p, "\033[38;2;%d;%d;%dm%s", sr, sg, sb, spark_chars[si]);
+            }
+        }
+        p += sprintf(p, "%s", cebg);
+        { int used = 3 + (ce_hist_count < 38 ? ce_hist_count : 38);
+          for (int i = used; i < ce_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", cebdr, cerst);
+
+        /* Row 6: Depth info */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     ce_row + 6, ce_col, cebdr, cebg);
+        int ce_depth_now = tl_len < CE_DEPTH ? tl_len : CE_DEPTH;
+        p += sprintf(p, " \033[38;2;160;120;50mdepth:%d/%d  scales:1,2,4,8",
+                     ce_depth_now, CE_DEPTH);
+        p += sprintf(p, "%s", cebg);
+        { int used = 30; for (int i = used; i < ce_w - 1; i++) *p++ = ' '; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", cebdr, cerst);
+
+        /* Bottom border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", ce_row + 7, ce_col, cebdr);
+        for (int i = 0; i < ce_w; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", cerst);
+    }
+
     /* ── Percolation Analysis overlay panel ─────────────────────────────── */
     if (perc_mode) {
         int pc_w = 46;
@@ -13850,6 +14316,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (wave_mode)      pc_row += 9;
         if (ergo_mode)      pc_row += 10;
         if (coh_mode)       pc_row += 8;
+        if (ce_mode)        pc_row += 9;
         if (pc_col < 1) pc_col = 1;
 
         const char *pcbdr = "\033[38;2;255;200;40;48;2;14;12;6m";
@@ -14027,6 +14494,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (wave_mode)      is_row += 9;
         if (ergo_mode)      is_row += 10;
         if (coh_mode)       is_row += 8;
+        if (ce_mode)        is_row += 9;
         if (perc_mode)      is_row += 10;
         if (is_col < 1) is_col = 1;
 
@@ -14196,6 +14664,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (wave_mode)      pb_row += 9;
         if (ergo_mode)      pb_row += 10;
         if (coh_mode)       pb_row += 8;
+        if (ce_mode)        pb_row += 9;
         if (perc_mode)      pb_row += 10;
         if (ising_mode)     pb_row += 10;
         if (pb_col < 1) pb_col = 1;
@@ -14408,6 +14877,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (wave_mode)      gd_row_p += 9;
         if (ergo_mode)      gd_row_p += 10;
         if (coh_mode)       gd_row_p += 8;
+        if (ce_mode)        gd_row_p += 9;
         if (perc_mode)      gd_row_p += 10;
         if (ising_mode)     gd_row_p += 10;
         if (pb_mode)        gd_row_p += 14;
@@ -14542,6 +15012,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (wave_mode)     pp_row += 8;
         if (ergo_mode)     pp_row += 10;
         if (coh_mode)      pp_row += 8;
+        if (ce_mode)       pp_row += 9;
         if (perc_mode)     pp_row += 10;
         if (ising_mode)    pp_row += 10;
         if (pb_mode)       pp_row += 14;
@@ -14762,6 +15233,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (wave_mode)     cm_row += 8;
         if (ergo_mode)     cm_row += 10;
         if (coh_mode)      cm_row += 8;
+        if (ce_mode)       cm_row += 9;
         if (perc_mode)     cm_row += 10;
         if (ising_mode)    cm_row += 10;
         if (pb_mode)       cm_row += 14;
@@ -14966,6 +15438,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (wave_mode)      ps_row_p += 8;
         if (ergo_mode)      ps_row_p += 10;
         if (coh_mode)       ps_row_p += 8;
+        if (ce_mode)        ps_row_p += 9;
         if (perc_mode)      ps_row_p += 10;
         if (ising_mode)     ps_row_p += 10;
         if (pb_mode)        ps_row_p += 14;
@@ -15205,6 +15678,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (wave_mode)      rp_row_p += 8;
         if (ergo_mode)      rp_row_p += 10;
         if (coh_mode)       rp_row_p += 8;
+        if (ce_mode)        rp_row_p += 9;
         if (perc_mode)      rp_row_p += 10;
         if (ising_mode)     rp_row_p += 10;
         if (pb_mode)        rp_row_p += 14;
@@ -15406,6 +15880,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (wave_mode)      sa_row_p += 8;
         if (ergo_mode)      sa_row_p += 10;
         if (coh_mode)       sa_row_p += 8;
+        if (ce_mode)        sa_row_p += 9;
         if (perc_mode)      sa_row_p += 10;
         if (ising_mode)     sa_row_p += 10;
         if (pb_mode)        sa_row_p += 14;
@@ -15632,6 +16107,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (wave_mode)      pt_row_p += 8;
         if (ergo_mode)      pt_row_p += 10;
         if (coh_mode)       pt_row_p += 8;
+        if (ce_mode)        pt_row_p += 9;
         if (perc_mode)      pt_row_p += 10;
         if (ising_mode)     pt_row_p += 10;
         if (pb_mode)        pt_row_p += 14;
@@ -16999,6 +17475,18 @@ int main(int argc, char **argv) {
                 printf("\033[2J"); fflush(stdout);
             }
         }
+        else if (key == ')') {
+            ce_mode = !ce_mode;
+            if (ce_mode) {
+                ce_stale = 1;
+                ce_compute();
+                flash_set("Causal Emergence: EI peak scale [)]exit");
+                printf("\033[2J"); fflush(stdout);
+            } else {
+                flash_set("Causal Emergence off");
+                printf("\033[2J"); fflush(stdout);
+            }
+        }
         else if (key == '?') {
             if (probe_mode > 0) {
                 probe_mode = 0; /* toggle off */
@@ -17629,6 +18117,11 @@ int main(int argc, char **argv) {
         /* Auto-refresh spatial coherence every 4 generations (uses timeline) */
         if (coh_mode && coh_stale && (generation % 4 == 0 || !running)) {
             coh_compute();
+        }
+
+        /* Auto-refresh causal emergence every 4 generations (uses timeline) */
+        if (ce_mode && ce_stale && (generation % 4 == 0 || !running)) {
+            ce_compute();
         }
 
         /* Phase portrait: record metric pair every 2 generations */

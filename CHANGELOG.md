@@ -1,8 +1,59 @@
 # Changelog
 
 Development history organized by round. Each round adds one or two major
-features. The project grew from ~790 lines (Round 1) to ~24,000 lines
-(Round 75).
+features. The project grew from ~790 lines (Round 1) to ~26,000 lines
+(Round 80).
+
+## Round 80 — Radial Distribution Function g(r) Overlay
+
+Adds the **radial distribution function g(r)** — the foundational pair
+correlation diagnostic from condensed matter physics. Press `Ctrl-B` to
+measure the probability of finding a live cell at distance *r* from any
+other live cell, normalized against a uniform random distribution.
+g(r)>1 indicates clustering, g(r)<1 depletion, g(r)≈1 gas-like
+randomness. Uses reservoir sampling (up to 800 center cells) for
+O(N·R) performance. Per-cell heatmap shows local pair correlation
+contribution (ocean blue → teal → green → gold). Phase classification:
+GAS (flat g≈1), LIQUID (damped oscillations), CRYSTAL (sharp peaks at
+r, 2r), AMORPHOUS (weak structure). Sidebar panel with density ρ, phase
+label, peak positions/heights, crystalline order parameter, 3-row g(r)
+bar chart with g=1 reference line, and order parameter sparkline.
+Ghost layer #45. Overlay #45. Recomputes every 4 generations. Also
+includes minor code style fixes (splitting compound `if` statements
+onto separate lines) and removal of an unused variable for zero-warning
+builds. +590 lines.
+
+## Round 79 — Interactive Help Overlay
+
+Adds a **keybinding reference overlay** toggled with `H`. Displays all
+keybindings organized by category (general, overlays, Ctrl overlays) in a
+scrollable panel. Categorized and searchable from within the simulation.
+
+## Round 78 — Fisher Information Field Overlay
+
+Adds the **Fisher information field** — a sensitivity diagnostic that
+measures how strongly each cell's local metric distribution shifts over
+time. Press `Ctrl-X` to compute Fisher information via KL-divergence of
+consecutive time-windowed histograms per metric tile. Highlights phase
+boundaries and transition-sensitive regions. Sidebar shows top-ranked
+sensitive metrics, bar chart, and sparkline history.
+
+## Round 77 — Multifractal Singularity Spectrum Overlay
+
+Adds the **multifractal singularity spectrum** — local Hölder exponent
+analysis measuring the pointwise regularity of the density field. Press
+`Ctrl-W` to compute α(x) = local scaling exponent via box-counting at
+multiple scales, then build the f(α) spectrum. Reveals multifractal
+structure in GoL patterns, distinguishing monofractal (narrow f(α)) from
+rich multifractal (wide f(α)) behavior.
+
+## Round 76 — Poincaré Recurrence Time Map Overlay
+
+Adds the **Poincaré recurrence time map** — an ergodic dynamics diagnostic
+that measures how long each cell takes to return to a previously visited
+local state. Press `Ctrl-Y` to track 5×5 neighborhood hashes over time
+and compute first-return times. Classifies dynamics as PERIODIC (fast
+recurrence), QUASI-PERIODIC, ERGODIC, or TRANSIENT (no return observed).
 
 ## Round 75 — Interface Roughness Analyzer Overlay
 

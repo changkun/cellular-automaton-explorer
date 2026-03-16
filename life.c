@@ -1069,7 +1069,7 @@ static int   probe_y = -1;            /* selected cell y */
    Toggle with '\\' key. TAB cycles the right panel, '`' cycles the left. */
 
 /* Overlay table: ordered list of analysis overlays for cycling */
-#define N_SPLIT_OVERLAYS 45
+#define N_SPLIT_OVERLAYS 46
 typedef struct {
     const char *name;   /* short display name */
     char key;           /* toggle key character */
@@ -1121,12 +1121,13 @@ static const SplitOverlayInfo split_overlay_table[N_SPLIT_OVERLAYS] = {
     { "Recurrence",   'Y'-64 },  /* 42: Ctrl-Y */
     { "MultiFrac",    'W'-64 },  /* 43: Ctrl-W */
     { "FisherInfo",   'X'-64 },  /* 44: Ctrl-X */
+    { "RadialDist",   'B'-64 },  /* 45: Ctrl-B */
 };
 
 static int split_mode = 0;         /* 0=off, 1=on */
 static int split_left = 2;         /* overlay index for left panel (default: Entropy) */
 static int split_right = 16;       /* overlay index for right panel (default: Vorticity) */
-static int split_active = -1;      /* runtime: which overlay to force in cell_color (-1=normal) */
+static int split_active __attribute__((unused)) = -1; /* runtime: which overlay to force in cell_color (-1=normal) */
 
 /* Forward declarations — defined after all overlay mode vars are declared */
 static void split_set_overlay(int idx);
@@ -1197,7 +1198,7 @@ typedef struct {
 
 static int   pt_mode = 0;           /* 0=off, 1=on */
 static int   pt_stale = 1;          /* 1=needs recomputation */
-static PTParticle pt_particles[PT_MAX_PARTICLES];
+static PTParticle pt_particles[PT_MAX_PARTICLES] __attribute__((unused));
 static int   pt_n_particles = 0;    /* active count */
 
 /* Per-cell velocity field for rendering */
@@ -1477,6 +1478,64 @@ static void fi_reset(void) {
     memset(fi_grid, 0, sizeof(float) * MAX_H * MAX_W);
     memset(fi_metric, 0, sizeof(fi_metric));
     memset(fi_hist, 0, sizeof(fi_hist));
+}
+
+/* ── Radial Distribution Function ─────────────────────────────────────────── */
+/* Classic pair correlation function g(r) from condensed matter physics.
+   Measures probability of finding a live cell at distance r from any other
+   live cell, normalized against a uniform random distribution.
+   g(r) > 1 → clustering at distance r, g(r) < 1 → depletion, g(r) ≈ 1 → gas.
+   Reveals crystalline ordering (sharp peaks), liquid structure (damped
+   oscillations), or gas-like randomness (flat g(r)≈1).
+   Per-cell heatmap shows local g(r) contribution; sidebar displays full g(r)
+   curve, peak positions, and phase classification (gas/liquid/crystal/amorphous).
+   Toggle with Ctrl-B key. */
+
+#define RDF_MAX_R    40      /* max radial distance to measure */
+#define RDF_NBINS    40      /* one bin per unit distance */
+#define RDF_HIST_LEN 64      /* sparkline history */
+#define RDF_SAMPLE   800     /* max center cells to sample (for O(N·R) perf) */
+
+static int   rdf_mode = 0;           /* 0=off, 1=on */
+static int   rdf_stale = 1;
+
+/* g(r) histogram: rdf_gr[bin] = g(r) for r in [bin, bin+1) */
+static float rdf_gr[RDF_NBINS];
+
+/* Per-cell local pair density (how many neighbors at characteristic distances) */
+static float rdf_grid[MAX_H][MAX_W];
+
+/* Global aggregates */
+static float rdf_peak1_r = 0.0f;     /* position of first peak in g(r) */
+static float rdf_peak1_val = 0.0f;   /* height of first peak */
+static float rdf_peak2_r = 0.0f;     /* position of second peak */
+static float rdf_peak2_val = 0.0f;   /* height of second peak */
+static float rdf_mean_gr = 1.0f;     /* mean g(r) across all bins */
+static float rdf_order_param = 0.0f; /* crystalline order parameter: peak sharpness */
+static int   rdf_phase = 0;          /* 0=gas, 1=liquid, 2=crystal, 3=amorphous */
+static float rdf_density = 0.0f;     /* global live cell density */
+
+/* Sparkline history of order parameter */
+static float rdf_hist[RDF_HIST_LEN];
+static int   rdf_hist_idx = 0;
+static int   rdf_hist_count = 0;
+
+static void rdf_compute(void);
+static void rdf_reset(void) {
+    rdf_stale = 1;
+    rdf_peak1_r = 0.0f;
+    rdf_peak1_val = 0.0f;
+    rdf_peak2_r = 0.0f;
+    rdf_peak2_val = 0.0f;
+    rdf_mean_gr = 1.0f;
+    rdf_order_param = 0.0f;
+    rdf_phase = 0;
+    rdf_density = 0.0f;
+    rdf_hist_idx = 0;
+    rdf_hist_count = 0;
+    memset(rdf_gr, 0, sizeof(rdf_gr));
+    memset(rdf_grid, 0, sizeof(float) * MAX_H * MAX_W);
+    memset(rdf_hist, 0, sizeof(rdf_hist));
 }
 
 /* ── Symmetry Group Detection ─────────────────────────────────────────────── */
@@ -2184,6 +2243,7 @@ static void split_set_overlay(int idx) {
     hr_mode = 0;
     xc_mode = 0;
     fi_mode = 0;
+    rdf_mode = 0;
     sg_mode = 0;
     td_mode = 0;
     mf_mode = 0;
@@ -2240,6 +2300,7 @@ static void split_set_overlay(int idx) {
         case 42: pr_mode = 1; break;
         case 43: mfs_mode = 1; break;
         case 44: fi_mode = 1; break;
+        case 45: rdf_mode = 1; break;
     }
 }
 
@@ -2288,6 +2349,7 @@ static int split_detect_current(void) {
     if (pr_mode) return 42;
     if (mfs_mode) return 43;
     if (fi_mode) return 44;
+    if (rdf_mode) return 45;
     return 0;
 }
 
@@ -3645,6 +3707,7 @@ static void grid_step(void) {
     ce_stale = 1;
     ew_stale = 1;
     fi_stale = 1;
+    rdf_stale = 1;
     sg_stale = 1;
     td_stale = 1;
     mf_stale = 1;
@@ -4530,6 +4593,7 @@ static void demo_reset_overlays(void) {
     hr_mode = 0;
     xc_mode = 0;
     fi_mode = 0;
+    rdf_mode = 0;
     fourier_mode = 0;
     fractal_mode = 0;
     wolfram_mode = 0;
@@ -8688,13 +8752,15 @@ static void fi_compute(void) {
             for (int k = 0; k < half; k++) {
                 int idx = (fi_head - n + k + FI_WINDOW) % FI_WINDOW;
                 int bin = (int)((fi_buf[idx][m] - vmin) / range * (FI_NBINS - 1));
-                if (bin < 0) bin = 0; if (bin >= FI_NBINS) bin = FI_NBINS - 1;
+                if (bin < 0) bin = 0;
+                if (bin >= FI_NBINS) bin = FI_NBINS - 1;
                 hist1[bin] += 1.0f;
             }
             for (int k = half; k < n; k++) {
                 int idx = (fi_head - n + k + FI_WINDOW) % FI_WINDOW;
                 int bin = (int)((fi_buf[idx][m] - vmin) / range * (FI_NBINS - 1));
-                if (bin < 0) bin = 0; if (bin >= FI_NBINS) bin = FI_NBINS - 1;
+                if (bin < 0) bin = 0;
+                if (bin >= FI_NBINS) bin = FI_NBINS - 1;
                 hist2[bin] += 1.0f;
             }
             /* Normalize to probabilities */
@@ -8831,6 +8897,189 @@ static void fi_compute(void) {
     fi_hist[fi_hist_idx] = fi_global;
     fi_hist_idx = (fi_hist_idx + 1) % FI_HIST_LEN;
     if (fi_hist_count < FI_HIST_LEN) fi_hist_count++;
+}
+
+/* ── Radial Distribution Function computation ──────────────────────────────── */
+static void rdf_compute(void) {
+    rdf_stale = 0;
+
+    /* Count live cells and collect their positions (up to RDF_SAMPLE for centers) */
+    int live_count = 0;
+    int cx[RDF_SAMPLE], cy[RDF_SAMPLE];  /* center cell positions */
+    int n_centers = 0;
+
+    /* First pass: count all live cells */
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++)
+            if (grid[y][x]) live_count++;
+
+    rdf_density = (float)live_count / (H * W);
+    if (live_count < 4) {
+        memset(rdf_gr, 0, sizeof(rdf_gr));
+        memset(rdf_grid, 0, sizeof(float) * H * W);
+        rdf_peak1_r = 0; rdf_peak1_val = 0;
+        rdf_peak2_r = 0; rdf_peak2_val = 0;
+        rdf_mean_gr = 0; rdf_order_param = 0;
+        rdf_phase = 0;
+        return;
+    }
+
+    /* Reservoir sampling: select up to RDF_SAMPLE center cells uniformly */
+    {
+        unsigned int rseed = (unsigned int)(generation * 31337 + 12345);
+        int seen = 0;
+        for (int y = 0; y < H && n_centers < RDF_SAMPLE; y++) {
+            for (int x = 0; x < W; x++) {
+                if (!grid[y][x]) continue;
+                seen++;
+                if (n_centers < RDF_SAMPLE) {
+                    cx[n_centers] = x;
+                    cy[n_centers] = y;
+                    n_centers++;
+                } else {
+                    /* Reservoir replacement */
+                    rseed = rseed * 1103515245 + 12345;
+                    int j = (int)(rseed % (unsigned int)seen);
+                    if (j < RDF_SAMPLE) {
+                        cx[j] = x;
+                        cy[j] = y;
+                    }
+                }
+            }
+        }
+    }
+
+    /* Compute g(r): for each center cell, count live neighbors in annular shells */
+    double raw_counts[RDF_NBINS];
+    memset(raw_counts, 0, sizeof(raw_counts));
+
+    for (int i = 0; i < n_centers; i++) {
+        int x0 = cx[i], y0 = cy[i];
+        for (int dy = -RDF_MAX_R; dy <= RDF_MAX_R; dy++) {
+            int ny = y0 + dy;
+            if (ny < 0 || ny >= H) continue;
+            for (int dx = -RDF_MAX_R; dx <= RDF_MAX_R; dx++) {
+                if (dx == 0 && dy == 0) continue;
+                int nx = x0 + dx;
+                if (nx < 0 || nx >= W) continue;
+                float r = sqrtf((float)(dx*dx + dy*dy));
+                int bin = (int)r;
+                if (bin >= RDF_NBINS) continue;
+                if (grid[ny][nx])
+                    raw_counts[bin] += 1.0;
+            }
+        }
+    }
+
+    /* Normalize by ideal gas expectation: ρ × (area of annular shell) × n_centers
+       Shell area at distance r ≈ π((r+1)² - r²) = π(2r + 1) */
+    float rho = rdf_density;
+    for (int b = 0; b < RDF_NBINS; b++) {
+        float shell_area = 3.14159265f * (2.0f * b + 1.0f);  /* π((b+1)² - b²) */
+        float expected = rho * shell_area * n_centers;
+        if (expected > 0.5f)
+            rdf_gr[b] = (float)(raw_counts[b] / expected);
+        else
+            rdf_gr[b] = 0.0f;
+    }
+    /* Bin 0 (r < 1) contains only adjacent cells — normalize carefully */
+    if (rdf_gr[0] > 10.0f) rdf_gr[0] = 10.0f;
+
+    /* Find first and second peaks (skip bin 0) */
+    rdf_peak1_r = 0; rdf_peak1_val = 0;
+    rdf_peak2_r = 0; rdf_peak2_val = 0;
+    for (int b = 1; b < RDF_NBINS - 1; b++) {
+        if (rdf_gr[b] > rdf_gr[b-1] && rdf_gr[b] > rdf_gr[b+1] && rdf_gr[b] > 1.05f) {
+            if (rdf_gr[b] > rdf_peak1_val) {
+                /* Shift old peak1 to peak2 */
+                rdf_peak2_r = rdf_peak1_r;
+                rdf_peak2_val = rdf_peak1_val;
+                rdf_peak1_r = (float)b + 0.5f;
+                rdf_peak1_val = rdf_gr[b];
+            } else if (rdf_gr[b] > rdf_peak2_val) {
+                rdf_peak2_r = (float)b + 0.5f;
+                rdf_peak2_val = rdf_gr[b];
+            }
+        }
+    }
+
+    /* Mean g(r) for bins 2..NBINS-1 (skip near-field) */
+    float gr_sum = 0.0f;
+    int gr_cnt = 0;
+    for (int b = 2; b < RDF_NBINS; b++) {
+        gr_sum += rdf_gr[b];
+        gr_cnt++;
+    }
+    rdf_mean_gr = (gr_cnt > 0) ? gr_sum / gr_cnt : 1.0f;
+
+    /* Order parameter: variance of g(r) from 1.0 — high variance = ordered */
+    float var_sum = 0.0f;
+    for (int b = 2; b < RDF_NBINS; b++) {
+        float dev = rdf_gr[b] - 1.0f;
+        var_sum += dev * dev;
+    }
+    rdf_order_param = (gr_cnt > 0) ? var_sum / gr_cnt : 0.0f;
+    /* Compress to [0,1] */
+    rdf_order_param = 1.0f - 1.0f / (1.0f + rdf_order_param * 5.0f);
+
+    /* Phase classification */
+    if (rdf_peak1_val < 1.1f && rdf_order_param < 0.1f) {
+        rdf_phase = 0;  /* gas: flat g(r) ≈ 1 */
+    } else if (rdf_peak1_val > 2.0f && rdf_peak2_val > 1.5f &&
+               rdf_peak2_r > 0 && fabsf(rdf_peak2_r / rdf_peak1_r - 2.0f) < 0.5f) {
+        rdf_phase = 2;  /* crystal: sharp peaks at r, 2r, ... */
+    } else if (rdf_peak1_val > 1.3f) {
+        rdf_phase = 1;  /* liquid: damped oscillations */
+    } else {
+        rdf_phase = 3;  /* amorphous: weak structure */
+    }
+
+    /* Per-cell contribution: how well-surrounded is each live cell at characteristic distances?
+       Use g(r) weighted neighbor count within radius RDF_MAX_R/2 */
+    {
+        float max_val = 0.0f;
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                if (!grid[y][x]) {
+                    rdf_grid[y][x] = 0.0f;
+                    continue;
+                }
+                /* Count neighbors weighted by g(r) deviation from 1 */
+                float score = 0.0f;
+                int R = RDF_MAX_R / 2;
+                for (int dy = -R; dy <= R; dy++) {
+                    int ny = y + dy;
+                    if (ny < 0 || ny >= H) continue;
+                    for (int dx = -R; dx <= R; dx++) {
+                        if (dx == 0 && dy == 0) continue;
+                        int nx = x + dx;
+                        if (nx < 0 || nx >= W) continue;
+                        if (!grid[ny][nx]) continue;
+                        float r = sqrtf((float)(dx*dx + dy*dy));
+                        int bin = (int)r;
+                        if (bin >= RDF_NBINS) continue;
+                        /* Weight by how much g(r) at this distance deviates from random */
+                        float weight = rdf_gr[bin] - 1.0f;
+                        if (weight > 0.0f) score += weight;
+                    }
+                }
+                rdf_grid[y][x] = score;
+                if (score > max_val) max_val = score;
+            }
+        }
+        /* Normalize to [0,1] */
+        if (max_val > 0.01f) {
+            float inv = 1.0f / max_val;
+            for (int y = 0; y < H; y++)
+                for (int x = 0; x < W; x++)
+                    rdf_grid[y][x] *= inv;
+        }
+    }
+
+    /* Sparkline */
+    rdf_hist[rdf_hist_idx] = rdf_order_param;
+    rdf_hist_idx = (rdf_hist_idx + 1) % RDF_HIST_LEN;
+    if (rdf_hist_count < RDF_HIST_LEN) rdf_hist_count++;
 }
 
 /* ── Symmetry Group Detection computation ──────────────────────────────────── */
@@ -11523,6 +11772,7 @@ static void split_ensure_computed(int idx) {
         case 42: if (pr_stale) pr_compute(); break;
         case 43: if (mfs_stale) mfs_compute(); break;
         case 44: if (fi_stale) fi_compute(); break;
+        case 45: if (rdf_stale) rdf_compute(); break;
         default: break;
     }
 }
@@ -12632,6 +12882,7 @@ static void render_help_overlay(char **pp) {
         {"Ctrl-U",   "Order parameter susceptibility"},
         {"Ctrl-V",   "Interface roughness (KPZ)"},
         {"Ctrl-W",   "Multifractal singularity spectrum"},
+        {"Ctrl-B",   "Radial distribution function g(r)"},
         {"Ctrl-X",   "Fisher information field"},
         {"Ctrl-Y",   "Poincare recurrence time map"},
     };
@@ -12693,7 +12944,7 @@ static void render_help_overlay(char **pp) {
     const char *dim_clr = "\033[38;2;80;80;100m";    /* scroll hints: dim */
     const char *title_clr = "\033[38;2;255;255;255m"; /* title: white */
 
-    int right_col = col0 + pw + 1;
+
 
     /* Top border */
     p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 %sKeybinding Reference%s ",
@@ -14041,6 +14292,56 @@ static int cell_color(int x, int y, RGB *out) {
             }
             out->r = r; out->g = g; out->b = b;
             return grid[y][x] ? 1 : 35; /* 35 = fisher ghost */
+        }
+        return 0;
+    }
+
+    /* Radial Distribution Function overlay: pair correlation structure */
+    if (rdf_mode) {
+        float v = rdf_grid[y][x];
+        if (grid[y][x] || v > 0.02f) {
+            /* Color scheme: ocean blue (uncorrelated) → teal → green → gold (strongly correlated)
+               Represents how well this cell participates in characteristic spacing patterns */
+            unsigned char r, g, b;
+            if (v < 0.15f) {
+                /* Deep ocean: low pair correlation contribution */
+                float t = v / 0.15f;
+                r = (unsigned char)(5 + 10 * t);
+                g = (unsigned char)(15 + 40 * t);
+                b = (unsigned char)(40 + 80 * t);
+            } else if (v < 0.35f) {
+                /* Teal: moderate structure */
+                float t = (v - 0.15f) / 0.2f;
+                r = (unsigned char)(15 + 20 * t);
+                g = (unsigned char)(55 + 100 * t);
+                b = (unsigned char)(120 + 40 * t);
+            } else if (v < 0.55f) {
+                /* Cyan-green: good structural participation */
+                float t = (v - 0.35f) / 0.2f;
+                r = (unsigned char)(35 + 60 * t);
+                g = (unsigned char)(155 + 60 * t);
+                b = (unsigned char)(160 - 60 * t);
+            } else if (v < 0.75f) {
+                /* Green-gold: strong correlation */
+                float t = (v - 0.55f) / 0.2f;
+                r = (unsigned char)(95 + 120 * t);
+                g = (unsigned char)(215 + 30 * t);
+                b = (unsigned char)(100 - 70 * t);
+            } else {
+                /* Gold-white: peak structural position */
+                float t = (v - 0.75f) / 0.25f;
+                if (t > 1.0f) t = 1.0f;
+                r = (unsigned char)(215 + 40 * t);
+                g = (unsigned char)(245);
+                b = (unsigned char)(30 + 180 * t);
+            }
+            if (grid[y][x]) {
+                r = (unsigned char)(r < 200 ? r + 55 : 255);
+                g = (unsigned char)(g < 200 ? g + 55 : 255);
+                b = (unsigned char)(b < 200 ? b + 55 : 255);
+            }
+            out->r = r; out->g = g; out->b = b;
+            return grid[y][x] ? 1 : 45; /* 45 = RDF ghost */
         }
         return 0;
     }
@@ -19181,7 +19482,9 @@ static void render(int running, int speed_ms, int draw_mode) {
                     cg = (int)(60 * ar);
                     cb = (int)(60 * ar);
                 }
-                if (cr > 255) cr = 255; if (cg > 255) cg = 255; if (cb > 255) cb = 255;
+                if (cr > 255) cr = 255;
+                if (cg > 255) cg = 255;
+                if (cb > 255) cb = 255;
                 p += sprintf(p, "\033[48;2;%d;%d;%dm  ", cr, cg, cb);
                 p += sprintf(p, "%s", xcbg);
             }
@@ -19452,7 +19755,6 @@ static void render(int running, int speed_ms, int draw_mode) {
                     }
                 }
             }
-            float max_fi = top_val[0] > 0.01f ? top_val[0] : 1.0f;
             int n = sprintf(p, " \033[38;2;160;120;200mSensitive metrics:");
             p += n;
             int used = 19;
@@ -19493,7 +19795,8 @@ static void render(int running, int speed_ms, int draw_mode) {
                 int mr = (int)(120 + 135 * frac);
                 int mg = (int)(40 + 60 * frac);
                 int mb = (int)(180 + 75 * frac);
-                if (mr > 255) mr = 255; if (mb > 255) mb = 255;
+                if (mr > 255) mr = 255;
+                if (mb > 255) mb = 255;
                 p += sprintf(p, "\033[38;2;%d;%d;%dm%-5.5s", mr, mg, mb,
                              pp_metric_table[top_idx[i]].name);
                 for (int b = 0; b < bar_len; b++)
@@ -19566,7 +19869,8 @@ static void render(int running, int speed_ms, int draw_mode) {
                 int sr = (int)(80 + 175 * v);
                 int sg = (int)(40 + 180 * v);
                 int sb = (int)(180 - 80 * v);
-                if (sr > 255) sr = 255; if (sg > 255) sg = 255;
+                if (sr > 255) sr = 255;
+                if (sg > 255) sg = 255;
                 p += sprintf(p, "\033[38;2;%d;%d;%dm%s", sr, sg, sb, spark_chars[bi]);
             }
             for (int i = nsp; i < 32; i++) p += sprintf(p, " ");
@@ -19581,6 +19885,219 @@ static void render(int running, int speed_ms, int draw_mode) {
         for (int i = 0; i < fi_pw; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
         *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
         p += sprintf(p, "%s", first);
+    }
+
+    /* ── Radial Distribution Function overlay panel ────────────────────── */
+    if (rdf_mode) {
+        int rdf_pw = 50;
+        int rdf_col = term_cols - rdf_pw - 2;
+        int rdf_row = 3;
+        /* Stack below other panels */
+        if (entropy_mode)   rdf_row += 8;
+        if (temp_mode)      rdf_row += 9;
+        if (lyapunov_mode)  rdf_row += 8;
+        if (fourier_mode)   rdf_row += 18;
+        if (fractal_mode)   rdf_row += 11;
+        if (wolfram_mode)   rdf_row += 14;
+        if (flow_mode)      rdf_row += 9;
+        if (attractor_mode) rdf_row += 8;
+        if (cone_mode >= 1) rdf_row += 8;
+        if (surp_mode)      rdf_row += 8;
+        if (mi_mode)        rdf_row += 12;
+        if (cplx_mode)      rdf_row += 11;
+        if (topo_mode)      rdf_row += 11;
+        if (rg_mode)        rdf_row += 11;
+        if (kc_mode)        rdf_row += 9;
+        if (corr_mode)      rdf_row += 9;
+        if (eprod_mode)     rdf_row += 9;
+        if (vort_mode)      rdf_row += 9;
+        if (wave_mode)      rdf_row += 9;
+        if (ergo_mode)      rdf_row += 10;
+        if (coh_mode)       rdf_row += 8;
+        if (ce_mode)        rdf_row += 9;
+        if (ew_mode)        rdf_row += 10;
+        if (hr_mode)        rdf_row += 10;
+        if (rd_mode)        rdf_row += 13;
+        if (xc_mode && xc_count >= 20) rdf_row += 28;
+        if (fi_mode && fi_count >= 16) rdf_row += 11;
+        if (rdf_col < 1) rdf_col = 1;
+
+        const char *rdbdr = "\033[38;2;60;200;180;48;2;6;14;12m";  /* teal border */
+        const char *rdbg  = "\033[48;2;6;14;12m";
+        const char *rdrst = "\033[0m";
+
+        /* Top border */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x8c\xe2\x94\x80 \xe2\x97\x89 Radial Distribution g(r) ",
+                     rdf_row, rdf_col, rdbdr);
+        for (int i = 29; i < rdf_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x90';
+        p += sprintf(p, "%s", rdrst);
+
+        /* Row 1: Density + phase classification */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     rdf_row + 1, rdf_col, rdbdr, rdbg);
+        {
+            const char *phase_str, *phase_clr;
+            switch (rdf_phase) {
+                case 0: phase_str = "GAS";       phase_clr = "\033[38;2;120;120;160m"; break;
+                case 1: phase_str = "LIQUID";    phase_clr = "\033[38;2;60;180;220m"; break;
+                case 2: phase_str = "CRYSTAL";   phase_clr = "\033[38;2;255;220;60m"; break;
+                default: phase_str = "AMORPHOUS"; phase_clr = "\033[38;2;180;120;80m"; break;
+            }
+            int n = sprintf(p, " \033[38;2;100;220;200m\xcf\x81=%.3f  %s%s"
+                               " \033[38;2;80;140;120m[^B]exit",
+                            rdf_density, phase_clr, phase_str);
+            p += n;
+            int used = 34;
+            for (int i = used; i < rdf_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", rdbdr, rdrst);
+
+        /* Row 2: Peak positions */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     rdf_row + 2, rdf_col, rdbdr, rdbg);
+        {
+            int n;
+            if (rdf_peak1_val > 1.05f)
+                n = sprintf(p, " \033[38;2;200;240;180mPeak\xe2\x82\x81:r=%.1f g=%.2f"
+                               "  \033[38;2;140;200;160mPeak\xe2\x82\x82:r=%.1f g=%.2f",
+                            rdf_peak1_r, rdf_peak1_val, rdf_peak2_r, rdf_peak2_val);
+            else
+                n = sprintf(p, " \033[38;2;120;140;130mNo significant peaks (uniform)");
+            p += n;
+            int used = 42;
+            for (int i = used; i < rdf_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", rdbdr, rdrst);
+
+        /* Row 3: Order parameter */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     rdf_row + 3, rdf_col, rdbdr, rdbg);
+        {
+            int n = sprintf(p, " \033[38;2;180;220;200mOrder:\033[38;2;255;240;120m%.3f"
+                               "  \033[38;2;120;180;160m\xe2\x9f\xa8g\xe2\x9f\xa9=%.3f",
+                            rdf_order_param, rdf_mean_gr);
+            p += n;
+            int used = 28;
+            for (int i = used; i < rdf_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", rdbdr, rdrst);
+
+        /* Row 4: Separator */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     rdf_row + 4, rdf_col, rdbdr, rdbg);
+        p += sprintf(p, " \033[38;2;40;100;80m");
+        for (int i = 1; i < rdf_pw - 1; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        p += sprintf(p, "%s\xe2\x94\x82%s", rdbdr, rdrst);
+
+        /* Rows 5-7: g(r) bar chart (3 rows high, using block characters) */
+        {
+            float gr_max = 0.0f;
+            for (int b = 0; b < RDF_NBINS && b < rdf_pw - 4; b++)
+                if (rdf_gr[b] > gr_max) gr_max = rdf_gr[b];
+            if (gr_max < 1.5f) gr_max = 1.5f;
+
+            for (int row_i = 0; row_i < 3; row_i++) {
+                p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s ",
+                             rdf_row + 5 + row_i, rdf_col, rdbdr, rdbg);
+                /* Row 0 is top (highest values), row 2 is bottom */
+                float row_lo = gr_max * (2 - row_i) / 3.0f;
+                float row_hi = gr_max * (3 - row_i) / 3.0f;
+                int bars = rdf_pw - 4;
+                if (bars > RDF_NBINS) bars = RDF_NBINS;
+                for (int b = 0; b < bars; b++) {
+                    float v = rdf_gr[b];
+                    if (v >= row_hi) {
+                        /* Full block */
+                        float t = (float)b / RDF_NBINS;
+                        int cr = (int)(30 + 180 * t);
+                        int cg = (int)(200 - 60 * t);
+                        int cb = (int)(180 - 120 * t);
+                        p += sprintf(p, "\033[38;2;%d;%d;%dm\xe2\x96\x88", cr, cg, cb);
+                    } else if (v > row_lo) {
+                        /* Partial: use lower-half or upper-half block */
+                        float frac = (v - row_lo) / (row_hi - row_lo);
+                        float t = (float)b / RDF_NBINS;
+                        int cr = (int)(30 + 180 * t);
+                        int cg = (int)(200 - 60 * t);
+                        int cb = (int)(180 - 120 * t);
+                        if (frac > 0.5f)
+                            p += sprintf(p, "\033[38;2;%d;%d;%dm\xe2\x96\x84", cr, cg, cb);
+                        else
+                            p += sprintf(p, "\033[38;2;%d;%d;%dm\xe2\x96\x81", cr, cg, cb);
+                    } else {
+                        *p++ = ' ';
+                    }
+                }
+                /* g=1 reference line marker on last column */
+                {
+                    float ref = 1.0f;
+                    if (ref >= row_lo && ref < row_hi)
+                        p += sprintf(p, "\033[38;2;100;100;100m\xe2\x94\x80");
+                    else
+                        *p++ = ' ';
+                }
+                /* Pad */
+                int used2 = bars + 3;
+                for (int i = used2; i < rdf_pw - 1; i++) *p++ = ' ';
+                p += sprintf(p, "%s\xe2\x94\x82%s", rdbdr, rdrst);
+            }
+        }
+
+        /* Row 8: Axis labels r */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     rdf_row + 8, rdf_col, rdbdr, rdbg);
+        {
+            int n = sprintf(p, " \033[38;2;80;140;120mr: 0");
+            p += n;
+            int mid = RDF_NBINS / 2;
+            /* space out to mid */
+            for (int i = 5; i < mid + 1; i++) *p++ = ' ';
+            p += sprintf(p, "%d", mid);
+            for (int i = mid + 3; i < RDF_NBINS + 1; i++) *p++ = ' ';
+            p += sprintf(p, "%d", RDF_NBINS);
+            int used = RDF_NBINS + 8;
+            for (int i = used; i < rdf_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", rdbdr, rdrst);
+
+        /* Row 9: Sparkline of order parameter */
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x82%s",
+                     rdf_row + 9, rdf_col, rdbdr, rdbg);
+        {
+            p += sprintf(p, " \033[38;2;120;180;160mOrder:");
+            const char *spark_chars[] = {
+                "\xe2\x96\x81", "\xe2\x96\x82", "\xe2\x96\x83", "\xe2\x96\x84",
+                "\xe2\x96\x85", "\xe2\x96\x86", "\xe2\x96\x87", "\xe2\x96\x88"
+            };
+            int spark_w = rdf_pw - 12;
+            if (spark_w > rdf_hist_count) spark_w = rdf_hist_count;
+            float smin = 1e30f, smax = -1e30f;
+            for (int i = 0; i < spark_w; i++) {
+                int idx = (rdf_hist_idx - spark_w + i + RDF_HIST_LEN) % RDF_HIST_LEN;
+                if (rdf_hist[idx] < smin) smin = rdf_hist[idx];
+                if (rdf_hist[idx] > smax) smax = rdf_hist[idx];
+            }
+            float srange = smax - smin;
+            if (srange < 0.001f) srange = 0.001f;
+            for (int i = 0; i < spark_w; i++) {
+                int idx = (rdf_hist_idx - spark_w + i + RDF_HIST_LEN) % RDF_HIST_LEN;
+                int lvl = (int)((rdf_hist[idx] - smin) / srange * 7.0f);
+                if (lvl < 0) lvl = 0;
+                if (lvl > 7) lvl = 7;
+                p += sprintf(p, "\033[38;2;60;200;180m%s", spark_chars[lvl]);
+            }
+            int used = 8 + spark_w;
+            for (int i = used; i < rdf_pw - 1; i++) *p++ = ' ';
+        }
+        p += sprintf(p, "%s\xe2\x94\x82%s", rdbdr, rdrst);
+
+        /* Bottom border */
+        int rdf_bottom = rdf_row + 10;
+        p += sprintf(p, "\033[%d;%dH%s\xe2\x94\x94", rdf_bottom, rdf_col, rdbdr);
+        for (int i = 0; i < rdf_pw; i++) { *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x80'; }
+        *p++ = '\xe2'; *p++ = '\x94'; *p++ = '\x98';
+        p += sprintf(p, "%s", rdrst);
     }
 
     /* ── Symmetry Group Detection overlay panel ────────────────────────── */
@@ -19616,6 +20133,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (rd_mode)        sg_row += 13;
         if (xc_mode && xc_count >= 20) sg_row += 28;
         if (fi_mode && fi_count >= 16)  sg_row += 12;
+        if (rdf_mode)       sg_row += 11;
         if (sg_col < 1) sg_col = 1;
 
         const char *sgbdr = "\033[38;2;200;220;80;48;2;10;12;6m";  /* gold-green border */
@@ -19790,7 +20308,8 @@ static void render(int running, int speed_ms, int draw_mode) {
                 int sr = (int)(80 + 175 * v);
                 int sg2 = (int)(80 + 160 * v);
                 int sb = (int)(60 + 60 * v);
-                if (sr > 255) sr = 255; if (sg2 > 255) sg2 = 255;
+                if (sr > 255) sr = 255;
+                if (sg2 > 255) sg2 = 255;
                 p += sprintf(p, "\033[38;2;%d;%d;%dm%s", sr, sg2, sb, spark_chars[bi]);
             }
             for (int i = nsp; i < 32; i++) p += sprintf(p, " ");
@@ -19840,6 +20359,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (rd_mode)        td_row += 13;
         if (xc_mode && xc_count >= 20) td_row += 28;
         if (fi_mode && fi_count >= 16)  td_row += 12;
+        if (rdf_mode)       td_row += 11;
         if (sg_mode)        td_row += 12;
         if (td_col < 1) td_col = 1;
 
@@ -19950,7 +20470,8 @@ static void render(int running, int speed_ms, int draw_mode) {
                 if (ch > 0) { sr = 255; sg2 = (int)(100 + 100*(1-v)); sb = 200; }
                 else if (ch < 0) { sr = 80; sg2 = (int)(180 + 60*v); sb = 255; }
                 else { sr = 160; sg2 = 160; sb = 160; }
-                if (sr > 255) sr = 255; if (sg2 > 255) sg2 = 255;
+                if (sr > 255) sr = 255;
+                if (sg2 > 255) sg2 = 255;
                 p += sprintf(p, "\033[38;2;%d;%d;%dm%s", sr, sg2, sb, spark_chars[bi]);
             }
             for (int i = nsp; i < 32; i++) p += sprintf(p, " ");
@@ -19986,7 +20507,8 @@ static void render(int running, int speed_ms, int draw_mode) {
                 int cr = (int)(80 + 175 * v);
                 int cg = (int)(80 + 100 * (1.0f - fabsf(v - 0.5f) * 2.0f));
                 int cb = (int)(200 - 120 * v);
-                if (cr > 255) cr = 255; if (cg > 255) cg = 255;
+                if (cr > 255) cr = 255;
+                if (cg > 255) cg = 255;
                 p += sprintf(p, "\033[38;2;%d;%d;%dm%s", cr, cg, cb, spark_chars[bi]);
             }
             for (int i = nsp; i < 32; i++) p += sprintf(p, " ");
@@ -20036,6 +20558,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (rd_mode)        mf_row += 13;
         if (xc_mode && xc_count >= 20) mf_row += 28;
         if (fi_mode && fi_count >= 16)  mf_row += 12;
+        if (rdf_mode)       mf_row += 11;
         if (sg_mode)        mf_row += 12;
         if (td_mode)        mf_row += 10;
         if (mf_col < 1) mf_col = 1;
@@ -20201,6 +20724,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (rd_mode)        ri_row += 13;
         if (xc_mode && xc_count >= 20) ri_row += 28;
         if (fi_mode && fi_count >= 16)  ri_row += 12;
+        if (rdf_mode)       ri_row += 11;
         if (sg_mode)        ri_row += 12;
         if (td_mode)        ri_row += 10;
         if (mf_mode)        ri_row += 10;
@@ -20446,6 +20970,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (rd_mode)        sg2_row += 13;
         if (xc_mode && xc_count >= 20) sg2_row += 28;
         if (fi_mode && fi_count >= 16)  sg2_row += 12;
+        if (rdf_mode)       sg2_row += 11;
         if (sg_mode)        sg2_row += 12;
         if (td_mode)        sg2_row += 10;
         if (mf_mode)        sg2_row += 10;
@@ -20610,6 +21135,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (rd_mode)        su_row += 13;
         if (xc_mode && xc_count >= 20) su_row += 28;
         if (fi_mode && fi_count >= 16)  su_row += 12;
+        if (rdf_mode)       su_row += 11;
         if (sg_mode)        su_row += 12;
         if (td_mode)        su_row += 10;
         if (mf_mode)        su_row += 10;
@@ -20787,6 +21313,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (rd_mode)        ir_row += 13;
         if (xc_mode && xc_count >= 20) ir_row += 28;
         if (fi_mode && fi_count >= 16)  ir_row += 12;
+        if (rdf_mode)       ir_row += 11;
         if (sg_mode)        ir_row += 12;
         if (td_mode)        ir_row += 10;
         if (mf_mode)        ir_row += 10;
@@ -20973,6 +21500,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (rd_mode)        pr_row += 13;
         if (xc_mode && xc_count >= 20) pr_row += 28;
         if (fi_mode && fi_count >= 16)  pr_row += 12;
+        if (rdf_mode)       pr_row += 11;
         if (sg_mode)        pr_row += 12;
         if (td_mode)        pr_row += 10;
         if (mf_mode)        pr_row += 10;
@@ -21137,6 +21665,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (rd_mode)        mfs_row += 13;
         if (xc_mode && xc_count >= 20) mfs_row += 28;
         if (fi_mode && fi_count >= 16)  mfs_row += 12;
+        if (rdf_mode)       mfs_row += 11;
         if (sg_mode)        mfs_row += 12;
         if (td_mode)        mfs_row += 10;
         if (mf_mode)        mfs_row += 10;
@@ -21301,6 +21830,7 @@ static void render(int running, int speed_ms, int draw_mode) {
         if (rd_mode)        pc_row += 13;
         if (xc_mode && xc_count >= 20) pc_row += 28;
         if (fi_mode && fi_count >= 16) pc_row += 11;
+        if (rdf_mode)       pc_row += 11;
         if (sg2_mode)       pc_row += 9;
         if (su_mode)        pc_row += 9;
         if (ir_mode)        pc_row += 10;
@@ -22058,8 +22588,10 @@ static void render(int running, int speed_ms, int draw_mode) {
             float fy = (pp_hist_y[idx] - ymin) / yrange;
             int dx = (int)(fx * (PP_DW - 1));
             int dy = (int)((1.0f - fy) * (PP_DH - 1)); /* Y inverted: top=max */
-            if (dx < 0) dx = 0; if (dx >= PP_DW) dx = PP_DW - 1;
-            if (dy < 0) dy = 0; if (dy >= PP_DH) dy = PP_DH - 1;
+            if (dx < 0) dx = 0;
+            if (dx >= PP_DW) dx = PP_DW - 1;
+            if (dy < 0) dy = 0;
+            if (dy >= PP_DH) dy = PP_DH - 1;
 
             /* Map dot (dx, dy) to braille char cell */
             int cx = dx / 2;    /* char column */
@@ -22312,9 +22844,12 @@ static void render(int running, int speed_ms, int draw_mode) {
                     cg = (int)(255 * (1.0f - t));
                     cb = 255;
                 }
-                if (cr < 0) cr = 0; if (cr > 255) cr = 255;
-                if (cg < 0) cg = 0; if (cg > 255) cg = 255;
-                if (cb < 0) cb = 0; if (cb > 255) cb = 255;
+                if (cr < 0) cr = 0;
+                if (cr > 255) cr = 255;
+                if (cg < 0) cg = 0;
+                if (cg > 255) cg = 255;
+                if (cb < 0) cb = 0;
+                if (cb > 255) cb = 255;
                 /* Use block char with bg color for heatmap cell (2 chars wide) */
                 p += sprintf(p, "\033[48;2;%d;%d;%dm  ", cr, cg, cb);
                 p += sprintf(p, "%s", cbg);
@@ -22758,9 +23293,12 @@ static void render(int running, int speed_ms, int draw_mode) {
                     if (t > 1.0f) t = 1.0f;
                     tr = (int)(50 + 180 * t); tg = (int)(40 + 100 * t); tb = (int)(60 * (1.0f - t));
                 }
-                if (tr < 0) tr = 0; if (tr > 255) tr = 255;
-                if (tg < 0) tg = 0; if (tg > 255) tg = 255;
-                if (tb < 0) tb = 0; if (tb > 255) tb = 255;
+                if (tr < 0) tr = 0;
+                if (tr > 255) tr = 255;
+                if (tg < 0) tg = 0;
+                if (tg > 255) tg = 255;
+                if (tb < 0) tb = 0;
+                if (tb > 255) tb = 255;
 
                 /* Bottom pixel color */
                 float d_bot = (mi_bot < n) ? rp_dist[mi_bot][mj] : 0.0f;
@@ -22776,9 +23314,12 @@ static void render(int running, int speed_ms, int draw_mode) {
                     if (t > 1.0f) t = 1.0f;
                     br = (int)(50 + 180 * t); bg2 = (int)(40 + 100 * t); bb = (int)(60 * (1.0f - t));
                 }
-                if (br < 0) br = 0; if (br > 255) br = 255;
-                if (bg2 < 0) bg2 = 0; if (bg2 > 255) bg2 = 255;
-                if (bb < 0) bb = 0; if (bb > 255) bb = 255;
+                if (br < 0) br = 0;
+                if (br > 255) br = 255;
+                if (bg2 < 0) bg2 = 0;
+                if (bg2 > 255) bg2 = 255;
+                if (bb < 0) bb = 0;
+                if (bb > 255) bb = 255;
 
                 /* Half-block: fg=top, bg=bottom */
                 p += sprintf(p, "\033[38;2;%d;%d;%d;48;2;%d;%d;%dm\xe2\x96\x80",
@@ -22972,8 +23513,10 @@ static void render(int running, int speed_ms, int draw_mode) {
             /* Map to dot coordinates */
             int dx = (int)((sx2 + 1.0f) * 0.5f * (SA_DW - 1));
             int dy = (int)((1.0f - (sy2 + 1.0f) * 0.5f) * (SA_DH - 1));
-            if (dx < 0) dx = 0; if (dx >= SA_DW) dx = SA_DW - 1;
-            if (dy < 0) dy = 0; if (dy >= SA_DH) dy = SA_DH - 1;
+            if (dx < 0) dx = 0;
+            if (dx >= SA_DW) dx = SA_DW - 1;
+            if (dy < 0) dy = 0;
+            if (dy >= SA_DH) dy = SA_DH - 1;
 
             int cx2 = dx / 2;
             int cy2 = dy / 4;
@@ -24574,6 +25117,19 @@ int main(int argc, char **argv) {
                 }
             }
         }
+        else if (key == 2) { /* Ctrl-B: Radial Distribution Function */
+            if (!ecosystem_mode) {
+                rdf_mode = !rdf_mode;
+                if (rdf_mode) {
+                    rdf_reset();
+                    flash_set("Radial Distribution g(r): pair correlation structure [^B]exit");
+                    printf("\033[2J"); fflush(stdout);
+                } else {
+                    flash_set("Radial Distribution off");
+                    printf("\033[2J"); fflush(stdout);
+                }
+            }
+        }
         else if (key == '2') {
             if (!ecosystem_mode) {
                 xc_mode = !xc_mode;
@@ -25442,6 +25998,13 @@ int main(int argc, char **argv) {
             fi_record();
             if (fi_stale && fi_count >= 16) {
                 fi_compute();
+            }
+        }
+
+        /* Radial Distribution Function: recompute every 4 generations */
+        if (rdf_mode && running && (generation % 4 == 0)) {
+            if (rdf_stale) {
+                rdf_compute();
             }
         }
 
